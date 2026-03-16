@@ -1,0 +1,6 @@
+# Test dictionary for fathom
+"hello"
+"world\n"
+keyword="test_token"
+\x41\x42\x43
+raw_line
