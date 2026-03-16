@@ -13,6 +13,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 FATHOM="$ROOT_DIR/fathom"
 SEED_DIR="$ROOT_DIR/tests/seeds"
 TIMEOUT_SEC=30
+PARALLEL_TIMEOUT_SEC=20
 
 # Counters
 pass=0
@@ -126,6 +127,73 @@ run_target() {
 run_target "heap_overflow"   "$ROOT_DIR/tests/targets/heap_overflow"   0
 run_target "stack_smash"     "$ROOT_DIR/tests/targets/stack_smash"     0
 run_target "format_string"   "$ROOT_DIR/tests/targets/format_string"   1
+
+run_parallel_target() {
+    local name="$1"
+    local binary="$2"
+
+    info "Testing parallel mode: $name ($binary)"
+
+    if [ ! -x "$binary" ]; then
+        fail "$name parallel: binary not found: $binary"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+
+    local outdir
+    outdir=$(mktemp -d "/tmp/fathom-test-${name}-parallel-XXXXXX")
+    TMPDIRS+=("$outdir")
+
+    set +e
+    timeout "$PARALLEL_TIMEOUT_SEC" "$FATHOM" \
+        -i "$SEED_DIR" \
+        -o "$outdir" \
+        -t 500 \
+        -j 2 \
+        -- "$binary" \
+        >/dev/null 2>&1
+    local rc=$?
+    set -e
+
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
+        fail "$name parallel: fathom exited with status $rc"
+        fail_count=$((fail_count + 1))
+        return
+    fi
+
+    local missing_dirs=0
+    for worker in "$outdir"/worker-000 "$outdir"/worker-001; do
+        if [ ! -d "$worker/queue" ] || [ ! -d "$worker/crashes" ]; then
+            missing_dirs=1
+        fi
+    done
+
+    local crash_count=0
+    crash_count=$(find "$outdir" -type f -path '*/crashes/crash_*' | wc -l)
+
+    local orphaned=0
+    if command -v pgrep >/dev/null 2>&1; then
+        if pgrep -f "$outdir" >/dev/null 2>&1; then
+            orphaned=1
+        fi
+    fi
+
+    if [ "$missing_dirs" -ne 0 ]; then
+        fail "$name parallel: missing worker queue/crash directories"
+        fail_count=$((fail_count + 1))
+    elif [ "$crash_count" -le 0 ]; then
+        fail "$name parallel: no crashes found in $PARALLEL_TIMEOUT_SEC seconds"
+        fail_count=$((fail_count + 1))
+    elif [ "$orphaned" -ne 0 ]; then
+        fail "$name parallel: orphan worker processes still running"
+        fail_count=$((fail_count + 1))
+    else
+        ok "$name parallel: worker shards created and found $crash_count crash(es)"
+        pass=$((pass + 1))
+    fi
+}
+
+run_parallel_target "heap_overflow" "$ROOT_DIR/tests/targets/heap_overflow"
 
 # ── Phase 3: Summary ───────────────────────────────────────────────
 

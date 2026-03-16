@@ -82,6 +82,9 @@ make
 mkdir seeds && echo "AAAA" > seeds/seed1
 ./fathom -i seeds/ -o output/ -- /path/to/target
 
+# Run 4 sharded workers
+./fathom -i seeds/ -o output/ -j 4 -- /path/to/target
+
 # Build and fuzz the included test targets
 make targets
 ./fathom -i tests/seeds/ -o output/ -- ./tests/targets/heap_overflow
@@ -96,7 +99,7 @@ Options:
   -i <dir>    Input corpus (seeds)
   -o <dir>    Output directory (default: ./fathom-out)
   -t <ms>     Timeout per exec (default: 1000)
-  -j <n>      Parallel instances (default: 1) [not yet implemented]
+  -j <n>      Parallel instances (default: 1)
   -a          Analysis-only mode (print CFG + scores, no fuzzing)
   -v          Verbose output
   --dict <f>  Extra dictionary file
@@ -105,6 +108,10 @@ Options:
 
 The target binary and its arguments follow the `--` separator. Input is
 delivered to the target via stdin from a temporary file.
+
+For `-j > 1`, Fathom runs isolated worker processes and shards the output
+directory by worker, for example `output/worker-000/queue/` and
+`output/worker-000/crashes/`.
 
 ## Dependencies
 
@@ -259,7 +266,8 @@ decay by 0.95x, preventing starvation while favoring productive strategies.
 
 The corpus manager maintains a priority queue of inputs sorted by coverage
 contribution. New inputs that trigger previously unseen edges are added to the
-queue. Crashes are deduplicated by hash and saved to the output directory.
+queue. Crashes are deduplicated by hash and saved to the output directory. In
+parallel mode, each worker keeps its own queue and crash directory shard.
 
 ## License
 
