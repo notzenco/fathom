@@ -29,12 +29,6 @@
 #define FATHOM_FNV_PRIME   0x100000001b3ULL
 
 /*
- * Name of the temporary file written for each execution.
- * Placed in /tmp so it resides on tmpfs where available.
- */
-#define FATHOM_INPUT_FILE  "/tmp/.fathom-input"
-
-/*
  * Hash a single 64-bit value into an ongoing FNV-1a state.
  */
 static inline uint64_t fathom_fnv_mix(uint64_t hash, uint64_t val)

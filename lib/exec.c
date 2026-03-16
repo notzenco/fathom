@@ -45,7 +45,7 @@ static void sigalrm_handler(int sig)
 
 /* ── Internal helpers (forward declarations) ────────────────────────── */
 
-static int  write_input_file(const uint8_t *data, size_t len);
+static int  create_input_file(const uint8_t *data, size_t len);
 static void setup_timeout(uint32_t timeout_ms);
 static void cancel_timeout(void);
 static uint64_t compute_crash_hash(pid_t pid);
@@ -116,8 +116,6 @@ void fathom_exec_destroy(fathom_exec_t *ex)
     ex->bp_count      = 0;
     ex->bp_capacity   = 0;
 
-    /* Clean up temp input file. */
-    unlink(FATHOM_INPUT_FILE);
 }
 
 /* ── Execution ──────────────────────────────────────────────────────── */
@@ -130,8 +128,9 @@ int fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 
     memset(result, 0, sizeof(*result));
 
-    /* 1. Write the input to the temp file. */
-    if (write_input_file(input, input_len) < 0) {
+    /* 1. Write the input to an unlinked temp file for this execution. */
+    int input_fd = create_input_file(input, input_len);
+    if (input_fd < 0) {
         result->status = FATHOM_EXIT_ERROR;
         return -1;
     }
@@ -146,6 +145,7 @@ int fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     pid_t child = fork();
     if (child < 0) {
         perror("fathom: fork");
+        close(input_fd);
         result->status = FATHOM_EXIT_ERROR;
         return -1;
     }
@@ -153,11 +153,12 @@ int fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     if (child == 0) {
         /* ── Child process ─────────────────────────────────────────── */
 
-        /* Redirect stdin from the input file. */
-        int fd = open(FATHOM_INPUT_FILE, O_RDONLY);
-        if (fd >= 0) {
-            dup2(fd, STDIN_FILENO);
-            close(fd);
+        /* Redirect stdin from the temp input file inherited from parent. */
+        if (input_fd >= 0) {
+            if (dup2(input_fd, STDIN_FILENO) < 0)
+                _exit(127);
+            if (input_fd != STDIN_FILENO)
+                close(input_fd);
         }
 
         /* Suppress stdout/stderr from the target. */
@@ -200,6 +201,7 @@ int fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     }
 
     /* ── Parent process ────────────────────────────────────────────── */
+    close(input_fd);
 
     /* 4. Wait for the child to stop from PTRACE_TRACEME exec. */
     int wstatus = 0;
@@ -398,15 +400,18 @@ int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
 /* ── Internal helpers ───────────────────────────────────────────────── */
 
 /*
- * Write input data to the temp file used as stdin for the target.
+ * Write input data to a per-exec temp file and rewind it for the child.
  */
-static int write_input_file(const uint8_t *data, size_t len)
+static int create_input_file(const uint8_t *data, size_t len)
 {
-    int fd = open(FATHOM_INPUT_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    char path[] = "/tmp/fathom-input-XXXXXX";
+    int fd = mkstemp(path);
     if (fd < 0) {
-        perror("fathom: open input file");
+        perror("fathom: mkstemp");
         return -1;
     }
+
+    unlink(path);
 
     const uint8_t *p   = data;
     size_t         rem = len;
@@ -423,8 +428,13 @@ static int write_input_file(const uint8_t *data, size_t len)
         rem -= (size_t)n;
     }
 
-    close(fd);
-    return 0;
+    if (lseek(fd, 0, SEEK_SET) < 0) {
+        perror("fathom: lseek input file");
+        close(fd);
+        return -1;
+    }
+
+    return fd;
 }
 
 /*
