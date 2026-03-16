@@ -1,0 +1,21 @@
+# Build artifacts
+fathom
+libfathom.a
+*.o
+
+# Test binaries
+tests/test_*
+!tests/test_*.c
+tests/targets/heap_overflow
+tests/targets/stack_smash
+tests/targets/format_string
+
+# Fuzz output
+fathom-out/
+output/
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
