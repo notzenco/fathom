@@ -525,7 +525,8 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     }
 
     res->status = FATHOM_EXIT_OK;
-    bool killed = false;
+    bool killed = false, escalated = false, abandoned = false;
+    uint64_t killed_at = 0;
     arm_timer(pid, ex->timeout_ms);
     tgt_continue(pid, 0);
 
@@ -534,9 +535,28 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
         if (tid < 0) {
             if (errno == EINTR) {
 #if defined(__APPLE__)
+                uint64_t now = fathom_now_us();
                 if (g_timed_out && !killed) {
                     tgt_kill(pid);
                     killed = true;
+                }
+                if (killed && killed_at == 0)
+                    killed_at = now;
+                /*
+                 * A target can occasionally survive PT_KILL (seen only on CI
+                 * runners).  Escalate, then give up on it rather than hang
+                 * the whole fuzzer on one run.
+                 */
+                if (killed && !escalated && now - killed_at > 2000000) {
+                    kill(pid, SIGKILL);
+                    ptrace(PT_CONTINUE, pid, (caddr_t)1, 0);
+                    escalated = true;
+                }
+                if (killed && now - killed_at > 5000000) {
+                    fprintf(stderr, "fathom: target %d did not exit after being "
+                                    "killed; abandoning it\n", (int)pid);
+                    abandoned = true;
+                    break;
                 }
 #endif
                 continue;
@@ -624,15 +644,26 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
             /* Kill rather than deliver the signal: no core dump or crash report. */
             tgt_kill(pid);
             killed = true;
+            killed_at = fathom_now_us();
             continue;
         }
 
         tgt_continue(tid, sig);       /* the target's own signal */
     }
 
-    (void)killed;   /* only consulted on macOS */
+    /* Only consulted on macOS. */
+    (void)killed;
+    (void)escalated;
+    (void)killed_at;
+    (void)abandoned;
     disarm_timer();
 #if defined(__APPLE__)
+    if (abandoned) {
+        if (res->status != FATHOM_EXIT_CRASH)
+            res->status = FATHOM_EXIT_HANG;
+        tgt_detach(&t);
+        return 0;
+    }
     /*
      * When the debugger is also the parent, the first wait reports the
      * exit as the tracer and a second one reaps the zombie.  Skipping it
