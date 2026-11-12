@@ -66,7 +66,7 @@ tests/targets/%: tests/targets/%.c
 
 # ── Test runner ──────────────────────────────────────────────────────
 
-test: $(TEST_BINS)
+test: targets $(TEST_BINS)
 	@failed=0; \
 	for t in $(TEST_BINS); do \
 		echo "=== $$t ==="; \
