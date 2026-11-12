@@ -499,15 +499,25 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
         child_exec(ex);
 
     int st = 0;
-    if (waitpid(pid, &st, 0) < 0)
+    pid_t got;
+    while ((got = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
+        ;
+    if (got < 0) {
+        perror("fathom: waitpid (exec stop)");
         return -1;
+    }
     if (!WIFSTOPPED(st)) {
-        fprintf(stderr, "fathom: target failed to start: %s\n", ex->target_path);
+        fprintf(stderr, "fathom: target failed to start: %s (status 0x%x)\n",
+                ex->target_path, st);
         return -1;
     }
 
-    if (tgt_attach(&t, pid) < 0 || !tgt_slide(&t, ex, &os->slide) ||
-        insert_breakpoints(ex, &t) < 0) {
+    bool ok = tgt_attach(&t, pid) == 0;
+    if (ok && !tgt_slide(&t, ex, &os->slide)) {
+        fprintf(stderr, "fathom: cannot find the target image in memory\n");
+        ok = false;
+    }
+    if (!ok || insert_breakpoints(ex, &t) < 0) {
         tgt_kill(pid);
         waitpid(pid, NULL, 0);
         tgt_detach(&t);
