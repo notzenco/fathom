@@ -1,96 +1,130 @@
 # Fathom
 
-A hybrid coverage-guided fuzzer with static analysis for x86-64 ELF binaries.
+[![CI](https://github.com/notzenco/fathom/actions/workflows/ci.yml/badge.svg)](https://github.com/notzenco/fathom/actions/workflows/ci.yml)
 
-## What is Fathom
+A coverage-guided fuzzer for **uninstrumented** binaries, steered by static
+analysis. Fathom fuzzes ELF, Mach-O and PE executables on Linux, macOS and
+Windows, for x86-64 and arm64, without recompiling the target.
 
-Fathom is a fuzzer that combines static binary analysis with coverage-guided
-mutation testing. Before fuzzing begins, Fathom disassembles the target ELF
-binary, builds a control flow graph, and scores basic blocks by
-interestingness -- calls to dangerous libc functions, loop headers, error
-handling paths, and complex branching. These scores drive breakpoint placement
-and corpus prioritization during the fuzz loop.
+## What it does
 
-Unlike AFL or honggfuzz, Fathom works directly on stripped, unmodified ELF
-binaries. There is no need to recompile with instrumentation. Coverage is
-tracked through an AFL-style shared memory bitmap, and crash deduplication uses
-ptrace register reads and frame-pointer stack walks to produce stable hashes.
-
-Fathom is implemented as a modular C library (`libfathom`) with a thin CLI
-driver. The library exposes a clean API for ELF parsing, disassembly, CFG
-construction, static analysis, mutation, execution, and coverage tracking, so
-individual components can be embedded in other tools.
-
-## Key Features
-
-- **Static analysis-guided fuzzing** -- CFG analysis scores blocks and
-  prioritizes exploration toward dangerous code paths
-- **No recompilation required** -- works on stripped ELF binaries via ptrace
-- **Dynamic breakpoint management** -- inserts and rotates INT3 breakpoints at
-  high-value basic blocks using ptrace POKETEXT/PEEKTEXT
-- **Adaptive mutation engine** -- 7 weighted strategies (bitflip, byteflip,
-  arithmetic, interesting values, dictionary, havoc, splice) with automatic
-  reward-based weight adjustment
-- **Dictionary extraction** -- automatically harvests printable strings from
-  `.rodata` for dictionary-based mutations
-- **AFL-compatible coverage bitmap** -- 64 KB shared memory bitmap with
-  hit-count bucketing
-- **Crash deduplication** -- FNV-1a hashing of crash PC + frame-pointer stack
-  walk
-- **Modular library architecture** -- each subsystem (ELF, disasm, CFG,
-  analysis, mutation, execution, coverage, corpus) is a separate compilation
-  unit with a clean internal API
-
-## Architecture
-
-Fathom's pipeline has three phases:
+Before fuzzing, Fathom disassembles the target, builds a control-flow graph
+and scores every basic block: calls to dangerous functions (`memcpy`,
+`strcpy`, `system`, ...), loop headers, error paths and complex branching.
+It then runs the target under the operating system's debugger API with a
+breakpoint on every reachable block, so each run reports which blocks
+executed. Inputs that reach new blocks join the corpus, and inputs that
+reach high-scoring blocks are fuzzed first.
 
 ```
-ELF binary
-    |
-    v
-[1] Static Analysis
-    ELF parse --> disassemble (.text via Capstone) --> build CFG
-    --> score blocks --> extract .rodata dictionary --> rank targets
-    |
-    v
-[2] Fuzzer Setup
-    init coverage bitmap (SysV shm) --> load seed corpus
-    --> init mutator (with extracted dictionary)
-    --> init executor --> set breakpoints at top-scored blocks
-    |
-    v
-[3] Fuzz Loop
-    pick seed --> mutate --> fork+exec target (ptrace)
-    --> collect coverage --> check for new edges
-    --> save interesting inputs / crashes --> repeat
+binary ──► load ──► disassemble ──► CFG ──► score blocks ──► dictionary
+                                                    │
+         ┌──────────────────────────────────────────┘
+         ▼
+   pick input ──► mutate ──► run under debugger ──► new blocks? ──► corpus
+         ▲                    (one-shot breakpoints)      │
+         └────────────────────────────────────────────────┘
+                                      crash? ──► dedupe ──► crashes/
 ```
 
-The library (`libfathom.a`) contains all analysis and fuzzing logic. The CLI
-driver (`src/main.c`) orchestrates the pipeline and handles argument parsing.
+## Platform support
 
-## Quick Start
+| Host OS | Target format | Architectures | Debugger backend |
+|---------|---------------|---------------|------------------|
+| Linux   | ELF           | x86-64, arm64 | `ptrace`, `/proc/<pid>/mem` |
+| macOS   | Mach-O, incl. universal | x86-64, arm64 | `ptrace` + Mach task port |
+| Windows | PE32+         | x64, ARM64    | Win32 debug API |
+
+Analysis mode (`-a`) reads any of the three formats on any host, so a
+Linux machine can analyze a Windows `.exe`. Fuzzing needs a target that
+runs natively on the host, so emulated targets are not supported
+(x86-64 binaries under Rosetta 2 or Windows ARM64 emulation).
+
+CI builds and tests all six OS and architecture combinations on native
+runners.
+
+## How coverage works without instrumentation
+
+AFL-style fuzzers need the target recompiled with coverage hooks. Fathom
+gets block coverage from the unmodified binary instead:
+
+1. The target is started suspended under the debugger (`PTRACE_TRACEME`
+   on Linux and macOS, `DEBUG_ONLY_THIS_PROCESS` on Windows).
+2. The ASLR slide is read (Linux: `AT_ENTRY` from the aux vector; macOS:
+   the executable's Mach-O header in the task; Windows: the image base in
+   the process-creation event).
+3. Every instrumentable block start is overwritten in one bulk write with
+   a breakpoint instruction (`int3`, or `brk` on arm64).
+4. When a breakpoint fires, its block is marked in the coverage map, the
+   original bytes are restored, and the target resumes. Each breakpoint
+   fires at most once per run, so after warm-up the target runs at native
+   speed.
+
+Breakpoints overwrite code, so they must land on real instruction
+boundaries. Rather than trust every block found by linear sweep (which can
+misread data embedded in code), Fathom only instruments blocks reachable
+from the entry point, function symbols, direct call targets and code
+addresses the program takes (such as `lea rdi, [rip+main]`, which is how
+`_start` reaches `main` in a stripped binary).
+
+## Static analysis
+
+- **Import resolution** across PLT stubs (including `.plt.sec`), Mach-O
+  `__stubs`, MinGW thunks and direct `call [rip+IAT]`, so calls into libc
+  or the CRT are named even in stripped binaries.
+- **Block scoring**, which feeds corpus priority:
+
+  | Signal                          | Score  |
+  |---------------------------------|--------|
+  | Call to dangerous function      | +10.0  |
+  | Loop header (back-edge target)  | +5.0   |
+  | Error handling path             | +3.0   |
+  | High fan-out (per extra edge)   | +2.0   |
+
+- **Dictionary extraction**: printable strings from read-only data, plus
+  the constants the code compares against (`cmp al, 0x46`,
+  `subs w8, w8, #0x46`), which random mutation rarely guesses.
+- **CFG** with back-edge (loop) detection and immediate dominators.
+
+## Fuzzing
+
+- Seven mutation strategies (bitflip, byteflip, arithmetic, interesting
+  values, dictionary, havoc, splice) with adaptive weights: a strategy that
+  finds new coverage is boosted 2x, and all weights decay by 0.95x.
+- Seedable xorshift PRNG (`-s`), so runs are reproducible.
+- Crash deduplication by FNV-1a hash of the crash PC and the frame-pointer
+  return chain, using only link-time addresses inside the main image. The
+  same bug hashes the same way across ASLR runs, and a smashed stack does
+  not turn one bug into hundreds of "unique" crashes.
+- Hangs are detected per run with a timeout (`-t`). Targets run in their
+  own process group, so Ctrl-C and group signals are never miscounted as
+  crashes.
+- Parallel mode (`-j`) runs isolated worker processes with sharded output
+  directories.
+
+## Quick start
 
 ```sh
-# Build
-make
+make                   # build fathom (signs it on macOS, see below)
+make targets           # build the vulnerable test programs
 
-# Analysis-only mode (print CFG scores, no fuzzing)
-./fathom -a -- /path/to/binary
+# Static analysis only
+./fathom -a -- tests/targets/maze
 
-# Fuzz a target
-mkdir seeds && echo "AAAA" > seeds/seed1
-./fathom -i seeds/ -o output/ -- /path/to/target
+# Fuzz for up to two minutes, stopping at the first crash
+mkdir seeds && printf 'AAAA' > seeds/a
+./fathom -i seeds -o out -T 120 --until-crash -- tests/targets/maze
 
-# Run 4 sharded workers
-./fathom -i seeds/ -o output/ -j 4 -- /path/to/target
-
-# Build and fuzz the included test targets
-make targets
-./fathom -i tests/seeds/ -o output/ -- ./tests/targets/heap_overflow
+# Four parallel workers
+./fathom -i seeds -o out -j 4 -- ./my_target
 ```
 
-## CLI Usage
+`tests/targets/maze` crashes only on input starting with `FUZZ`, each
+byte checked in its own branch. Fuzzing from `AAAA`, Fathom solves it one
+byte at a time. Without coverage feedback, all four bytes would have to be
+guessed in a single mutation.
+
+## CLI usage
 
 ```
 Usage: fathom [options] -- /path/to/target [target_args...]
@@ -100,175 +134,114 @@ Options:
   -o <dir>    Output directory (default: ./fathom-out)
   -t <ms>     Timeout per exec (default: 1000)
   -j <n>      Parallel instances (default: 1)
+  -T <secs>   Stop after this many seconds (default: run until Ctrl-C)
+  -s <seed>   Random seed, for reproducible runs
+  --until-crash  Stop after the first unique crash
   -a          Analysis-only mode (print CFG + scores, no fuzzing)
   -v          Verbose output
   --dict <f>  Extra dictionary file
   -h          Show this help
 ```
 
-The target binary and its arguments follow the `--` separator. Input is
-delivered to the target via stdin from a temporary file.
-
-For `-j > 1`, Fathom runs isolated worker processes and shards the output
-directory by worker, for example `output/worker-000/queue/` and
-`output/worker-000/crashes/`.
-
-## Dependencies
-
-- **[Capstone](https://www.capstone-engine.org/)** (>= 4.0) -- disassembly
-  framework (MIT license). Install via your package manager:
-  ```sh
-  # Arch
-  pacman -S capstone
-
-  # Debian/Ubuntu
-  apt install libcapstone-dev
-
-  # Fedora
-  dnf install capstone-devel
-  ```
-- **Linux** -- requires ptrace(2) for execution control and SysV shared memory
-  (`shmget`/`shmat`) for the coverage bitmap
-- **pkg-config** -- used by the Makefile to locate Capstone
+Input reaches the target on stdin. The output directory holds `queue/`
+(inputs that found new coverage), `crashes/` (one file per unique crash)
+and `fuzzer_stats` (executions, coverage, crashes, hangs and time to first
+crash). With `-j`, each worker writes to `out/worker-NNN/`.
 
 ## Building
 
+Fathom is C11 with one dependency,
+[Capstone](https://www.capstone-engine.org/) (4.x, 5.x or 6.x), found
+through `pkg-config`.
+
+**Linux**
+
 ```sh
-# Standard build
+sudo apt install libcapstone-dev pkg-config   # Debian/Ubuntu
 make
-
-# Debug build (no optimization, extra debug info)
-DEBUG=1 make
-
-# Build with AddressSanitizer + UBSan
-ASAN=1 make
-
-# Run unit tests
-make test
-
-# Build vulnerable test targets (compiled without protections)
-make targets
-
-# Install (default prefix: /usr/local)
-make install
-
-# Install to a custom prefix
-PREFIX=/opt/fathom make install
-
-# Clean
-make clean
 ```
 
-The build produces:
-- `fathom` -- CLI binary
-- `libfathom.a` -- static library
-- `include/fathom.h` -- public API header
+**macOS**
 
-## Project Structure
+```sh
+brew install capstone pkg-config
+make
+```
 
+`make` ad-hoc signs `fathom` with the `com.apple.security.cs.debugger`
+entitlement (`macos/fathom.entitlements`), which `task_for_pid()` needs to
+attach to targets. Targets built with the hardened runtime and no
+`get-task-allow` entitlement, which includes Apple's system binaries,
+cannot be debugged.
+
+**Windows** (MSYS2 UCRT64 for x64, CLANGARM64 for ARM64)
+
+```sh
+pacman -S make mingw-w64-ucrt-x86_64-cc mingw-w64-ucrt-x86_64-capstone mingw-w64-ucrt-x86_64-pkgconf
+make
 ```
-fathom/
-  include/
-    fathom.h            Public API: types, constants, function declarations
-  lib/
-    elf.c / elf_internal.h      ELF64 parser (mmap, sections, symbols)
-    disasm.c / disasm.h         x86-64 disassembler (Capstone wrapper)
-    cfg.c / cfg.h               CFG builder (basic blocks, edges, dominators)
-    analyze.c / analyze.h       Static analysis (block scoring, dictionary extraction)
-    mutate.c / mutate.h         Mutation engine (7 strategies, adaptive weights)
-    exec.c / exec.h             Target executor (fork+exec, ptrace, breakpoints)
-    coverage.c / coverage.h     AFL-style shared memory coverage bitmap
-    corpus.c / corpus.h         Seed queue, priority scheduling, crash dedup
-  src/
-    main.c              CLI driver (argument parsing, pipeline orchestration)
-  tests/
-    test_elf.c          Unit tests: ELF parser
-    test_disasm.c       Unit tests: disassembler
-    test_cfg.c          Unit tests: CFG builder
-    test_corpus.c       Unit tests: corpus manager
-    test_coverage.c     Unit tests: coverage bitmap
-    test_mutate.c       Unit tests: mutation engine
-    integration.sh      Integration test runner
-    seeds/              Sample seed inputs for test targets
-    targets/
-      heap_overflow.c   Vulnerable test target: heap buffer overflow
-      stack_smash.c     Vulnerable test target: stack buffer overflow
-      format_string.c   Vulnerable test target: format string bug
-  .gitignore
-  Makefile
-  LICENSE
-  README.md
-```
+
+Other targets: `make test` (unit tests), `make targets` (test programs),
+`DEBUG=1 make`, `ASAN=1 make`, `make install` (`PREFIX=/usr/local`).
+
+The build produces `fathom`, the `libfathom.a` static library and its
+public header `include/fathom.h`.
 
 ## Testing
 
 ```sh
-# Unit tests (62 tests across 6 modules)
-make test
-
-# Integration tests (fuzzes vulnerable targets, verifies crash detection)
-make targets
-bash tests/integration.sh
+make test                  # unit tests
+bash tests/integration.sh  # end-to-end fuzzing
 ```
 
-The unit test suite covers: ELF parsing (9 tests), disassembly (1), CFG
-construction (5), coverage bitmap (7), mutation engine (29), and corpus
-management (11). Integration tests compile three intentionally vulnerable
-binaries and verify Fathom can discover crashes within 30 seconds.
+- **Unit tests** load prebuilt fixtures (`tests/fixtures/`: the same
+  program compiled as ELF, Mach-O, universal Mach-O and PE for both
+  architectures, plus a stripped gcc PIE), so every format is tested on
+  every host. Executor tests run the real debugger backend against the
+  maze and a hanging target.
+- **Integration tests** fuzz from a seed that contains none of the bytes
+  the bugs need. The maze must be solved on every platform. They also check
+  that hangs are not reported as crashes and that parallel workers shard
+  their output and exit cleanly.
 
-## How It Works
+## Project structure
 
-### Phase 1: Static Analysis
+```
+include/fathom.h            Public API
+lib/
+  binary.c                  Format detection, shared loader helpers
+  fmt_elf.c                 ELF64 loader (sections, symbols, PLT/GOT imports)
+  fmt_macho.c               Mach-O loader (universal slices, stubs, indirect symbols)
+  fmt_pe.c                  PE32+ loader (sections, IAT imports, COFF symbols)
+  disasm.c                  Capstone linear sweep, x86-64 + arm64 decoding
+  cfg.c                     Basic blocks, edges, loops, dominators
+  analyze.c                 Import resolution, scoring, dictionary, reachability
+  mutate.c                  Mutation strategies and adaptive weights
+  exec.c                    Breakpoint table, coverage marking, crash hashing
+  exec_posix.c              Linux and macOS debugger backend
+  exec_windows.c            Windows debugger backend
+  coverage.c                Block coverage maps
+  corpus.c                  Queue, scheduling, crash dedup
+  osdep.c                   Small OS helpers (time, temp dir, entropy)
+src/main.c                  CLI driver and parallel supervisor
+tests/                      Unit tests, fixtures, targets, integration script
+macos/fathom.entitlements   Debugger entitlement for task_for_pid
+```
 
-Fathom opens the target ELF binary and memory-maps it. It locates the `.text`,
-`.plt`, and `.rodata` sections and extracts symbols (falling back to `.dynsym`
-for stripped binaries). The `.text` section is disassembled into a linear
-instruction stream using Capstone, then split into basic blocks by identifying
-branch, call, and return boundaries.
+## Limitations
 
-The CFG builder connects blocks via fall-through and branch-target edges,
-detects back-edges (loops), and computes immediate dominators. The analysis
-pass then scores each block:
-
-| Signal                          | Score  |
-|---------------------------------|--------|
-| Call to dangerous function      | +10.0  |
-| Loop header (back-edge target)  | +5.0   |
-| Error handling path             | +3.0   |
-| High fan-out (per extra edge)   | +2.0   |
-
-Dangerous functions include `memcpy`, `strcpy`, `sprintf`, `gets`, `malloc`,
-`system`, `execve`, and others. Error functions include `abort`, `exit`,
-`__assert_fail`, and `__stack_chk_fail`.
-
-Printable strings from `.rodata` (>= 4 bytes) are extracted into a mutation
-dictionary.
-
-### Phase 2: Execution
-
-Each fuzz iteration forks a child process that exec's the target with ptrace
-`TRACEME`. The parent inserts INT3 breakpoints at the top-scored block
-addresses via `PTRACE_POKETEXT`, then resumes the child. On breakpoint hit,
-the parent restores the original byte, single-steps, and re-inserts the
-breakpoint.
-
-Crashes are detected by catching `SIGSEGV`, `SIGABRT`, `SIGFPE`, `SIGBUS`,
-and `SIGILL` via the ptrace stop mechanism. The parent reads registers and
-walks the frame-pointer chain to compute a stable crash hash.
-
-Timeouts are enforced via `setitimer(ITIMER_REAL)` / `SIGALRM`.
-
-### Phase 3: Mutation and Corpus Management
-
-The mutation engine selects from 7 strategies using adaptive weights. When a
-strategy discovers new coverage, its weight is boosted by 2x while all weights
-decay by 0.95x, preventing starvation while favoring productive strategies.
-
-The corpus manager maintains a priority queue of inputs sorted by coverage
-contribution. New inputs that trigger previously unseen edges are added to the
-queue. Crashes are deduplicated by hash and saved to the output directory. In
-parallel mode, each worker keeps its own queue and crash directory shard.
+- **Block coverage, not edge coverage.** One-shot breakpoints record
+  which blocks ran, not how often or in which order.
+- **One process launch per input.** There is no fork server or persistent
+  mode, so throughput is bounded by process creation. On macOS,
+  `task_for_pid()` adds roughly 10 ms per run, which makes it the slowest
+  platform.
+- **Inputs arrive on stdin only.** File-path (`@@`) delivery is not
+  implemented.
+- **64-bit only.** 32-bit x86/ARM and big-endian targets are rejected.
+- Linear-sweep disassembly can miss code reached only through indirect
+  jumps; those blocks are left uninstrumented.
 
 ## License
 
-MIT -- see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
