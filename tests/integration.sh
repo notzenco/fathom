@@ -76,18 +76,20 @@ echo
 
 # ── Coverage feedback: the maze ──────────────────────────────────────
 
-info "maze: needs \"FUZZ\", seeded with \"AAAA...\" (budget ${MAZE_SECS}s)"
+info "maze: needs \"FUZZ\", seeded with \"AAAA\" (budget ${MAZE_SECS}s)"
 out=$(new_outdir maze)
+mkdir -p "$out/seeds"
+printf 'AAAA' > "$out/seeds/a"
 set +e
-"$FATHOM" -i "$SEED_DIR" -o "$out" -t 1000 -T "$MAZE_SECS" -s 1 --until-crash \
+"$FATHOM" -i "$out/seeds" -o "$out/run" -t 1000 -T "$MAZE_SECS" -s 1 --until-crash \
     -- "$TARGETS/maze$EXE" 2>"$out/log"
 rc=$?
 set -e
-crashes=$(count_crashes "$out")
-covered=$(stat_of "$out" covered)
-execs=$(stat_of "$out" execs)
-first_execs=$(stat_of "$out" first_crash_execs)
-first_ms=$(stat_of "$out" first_crash_ms)
+crashes=$(count_crashes "$out/run")
+covered=$(stat_of "$out/run" covered)
+execs=$(stat_of "$out/run" execs)
+first_execs=$(stat_of "$out/run" first_crash_execs)
+first_ms=$(stat_of "$out/run" first_crash_ms)
 if [ "$rc" -ne 0 ]; then
     fail "maze: fathom exited with status $rc"
     tail -5 "$out/log"
