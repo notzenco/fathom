@@ -15,7 +15,7 @@ static void test_init_zeroed(void)
     fathom_coverage_t cov;
     assert(fathom_coverage_init(&cov) == 0);
 
-    /* Both bitmaps should be entirely zero after init. */
+    /* Both maps should be entirely zero after init. */
     for (size_t i = 0; i < FATHOM_MAP_SIZE; i++) {
         assert(cov.local[i] == 0);
         assert(cov.global[i] == 0);
@@ -32,7 +32,7 @@ static void test_has_new_detects_new(void)
     fathom_coverage_t cov;
     assert(fathom_coverage_init(&cov) == 0);
 
-    /* Simulate an edge hit at index 42. */
+    /* Simulate a block hit at slot 42. */
     cov.local[42] = 1;
 
     assert(fathom_coverage_has_new(&cov) == true);
@@ -83,7 +83,7 @@ static void test_same_pattern_not_new(void)
     fathom_coverage_t cov;
     assert(fathom_coverage_init(&cov) == 0);
 
-    /* First execution: hit edges at 10 and 20. */
+    /* First execution: hit blocks at slots 10 and 20. */
     cov.local[10] = 1;
     cov.local[20] = 5;
 
@@ -119,7 +119,7 @@ static void test_new_pattern_is_new(void)
     fathom_coverage_merge(&cov);
     assert(cov.total_blocks == 1);
 
-    /* Second execution: different edge. */
+    /* Second execution: different block. */
     fathom_coverage_reset_local(&cov);
     cov.local[999] = 2;
 
