@@ -56,7 +56,7 @@ jobs:
           msystem: ${{ matrix.msystem }}
           update: true
           install: make
-          pacboys: cc:p capstone:p pkgconf:p
+          pacboy: cc:p capstone:p pkgconf:p
 
       - name: Build
         run: make
