@@ -5,14 +5,7 @@
 #ifndef FATHOM_COVERAGE_INTERNAL_H
 #define FATHOM_COVERAGE_INTERNAL_H
 
-#include <sys/types.h>
 #include "fathom.h"
-
-/*
- * Environment variable name used to pass the shared memory ID
- * to child processes so they can attach to the coverage bitmap.
- */
-#define FATHOM_SHM_ENV  "__FATHOM_SHM_ID"
 
 /*
  * Classify hit counts into buckets (AFL-style).

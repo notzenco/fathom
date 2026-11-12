@@ -22,6 +22,11 @@
 #define RODATA_MIN_STR_LEN     4
 
 /*
+ * Maximum number of comparison constants added to the dictionary.
+ */
+#define CMP_DICT_MAX           256
+
+/*
  * Maximum number of top-scored blocks shown by fathom_analysis_print.
  */
 #define ANALYSIS_TOP_N         20

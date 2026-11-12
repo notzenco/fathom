@@ -1,209 +1,187 @@
 #!/bin/bash
 #
-# integration.sh — Integration tests for Fathom fuzzer.
+# integration.sh — End-to-end tests for the Fathom fuzzer.
 #
-# Builds fathom and the vulnerable test targets, then runs the fuzzer
-# against each target to verify it can discover crashes.
+# Builds fathom and the test targets, then fuzzes them from a seed that
+# contains none of the bytes the bugs need.  The maze target can only
+# be solved with working coverage feedback, so it is the required
+# check on every platform.  Runs on Linux, macOS and Windows (MSYS2).
+#
+# Environment:
+#   MAZE_SECS   time budget for the maze (default 120)
 #
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-FATHOM="$ROOT_DIR/fathom"
 SEED_DIR="$ROOT_DIR/tests/seeds"
-TIMEOUT_SEC=30
-PARALLEL_TIMEOUT_SEC=20
+MAZE_SECS="${MAZE_SECS:-120}"
+OPTIONAL_SECS=20
 
-# Counters
+case "$(uname -s)" in
+    MINGW*|MSYS*) EXE=.exe ;;
+    *)            EXE= ;;
+esac
+FATHOM="$ROOT_DIR/fathom$EXE"
+TARGETS="$ROOT_DIR/tests/targets"
+
 pass=0
 fail_count=0
 skip=0
-
-# Temporary directories to clean up
 TMPDIRS=()
 
 cleanup() {
-    for d in "${TMPDIRS[@]}"; do
+    for d in "${TMPDIRS[@]+"${TMPDIRS[@]}"}"; do
         rm -rf "$d"
     done
 }
 trap cleanup EXIT
 
-# ── Colors (disabled if not a terminal) ──────────────────────────────
-
 if [ -t 1 ]; then
-    GREEN='\033[0;32m'
-    RED='\033[0;31m'
-    YELLOW='\033[0;33m'
-    BOLD='\033[1m'
-    RESET='\033[0m'
+    GREEN='\033[0;32m' RED='\033[0;31m' YELLOW='\033[0;33m' BOLD='\033[1m' RESET='\033[0m'
 else
     GREEN='' RED='' YELLOW='' BOLD='' RESET=''
 fi
 
-info()  { echo -e "${BOLD}[*]${RESET} $*"; }
-ok()    { echo -e "${GREEN}[PASS]${RESET} $*"; }
-fail()  { echo -e "${RED}[FAIL]${RESET} $*"; }
-warn()  { echo -e "${YELLOW}[SKIP]${RESET} $*"; }
+info() { echo -e "${BOLD}[*]${RESET} $*"; }
+ok()   { echo -e "${GREEN}[PASS]${RESET} $*"; pass=$((pass + 1)); }
+fail() { echo -e "${RED}[FAIL]${RESET} $*"; fail_count=$((fail_count + 1)); }
+warn() { echo -e "${YELLOW}[SKIP]${RESET} $*"; skip=$((skip + 1)); }
 
-# ── Phase 1: Build ──────────────────────────────────────────────────
+new_outdir() {
+    local d
+    d=$(mktemp -d "${TMPDIR:-/tmp}/fathom-it-$1-XXXXXX")
+    TMPDIRS+=("$d")
+    echo "$d"
+}
+
+# stat <dir> <key>: read a value from a fuzzer_stats file
+stat_of() {
+    awk -v k="$2" '$1 == k { print $2 }' "$1/fuzzer_stats" 2>/dev/null || true
+}
+
+count_crashes() {
+    find "$1" -type f -path '*crashes/crash_*' 2>/dev/null | wc -l | tr -d ' '
+}
+
+# ── Build ────────────────────────────────────────────────────────────
 
 info "Building fathom and test targets..."
-
 cd "$ROOT_DIR"
-make clean && make && make targets
-
-if [ ! -x "$FATHOM" ]; then
-    fail "fathom binary not found after build"
-    exit 1
-fi
-
-info "Build complete."
+make
+make targets
+[ -x "$FATHOM" ] || { fail "fathom binary not found after build"; exit 1; }
 echo
 
-# ── Phase 2: Run fuzzer against each target ─────────────────────────
+# ── Coverage feedback: the maze ──────────────────────────────────────
 
-# run_target <name> <binary> <optional:1=optional>
-run_target() {
-    local name="$1"
-    local binary="$2"
-    local optional="${3:-0}"
+info "maze: needs \"FUZZ\", seeded with \"AAAA...\" (budget ${MAZE_SECS}s)"
+out=$(new_outdir maze)
+set +e
+"$FATHOM" -i "$SEED_DIR" -o "$out" -t 1000 -T "$MAZE_SECS" -s 1 --until-crash \
+    -- "$TARGETS/maze$EXE" 2>"$out/log"
+rc=$?
+set -e
+crashes=$(count_crashes "$out")
+covered=$(stat_of "$out" covered)
+execs=$(stat_of "$out" execs)
+first_execs=$(stat_of "$out" first_crash_execs)
+first_ms=$(stat_of "$out" first_crash_ms)
+if [ "$rc" -ne 0 ]; then
+    fail "maze: fathom exited with status $rc"
+    tail -5 "$out/log"
+elif [ "$crashes" -gt 0 ]; then
+    ok "maze: solved after $first_execs execs / ${first_ms} ms (covered $covered blocks)"
+else
+    fail "maze: not solved in ${MAZE_SECS}s ($execs execs, covered ${covered:-0} blocks)"
+fi
 
-    info "Testing target: $name ($binary)"
+# ── Classic memory-safety targets (crash behaviour varies by libc) ───
 
-    if [ ! -x "$binary" ]; then
-        fail "$name: binary not found: $binary"
-        fail_count=$((fail_count + 1))
-        return
-    fi
-
-    # Create a temp output directory for this run
-    local outdir
-    outdir=$(mktemp -d "/tmp/fathom-test-${name}-XXXXXX")
-    TMPDIRS+=("$outdir")
-
-    # Run fathom with a timeout. The fuzzer runs until SIGINT or crash,
-    # so we use `timeout` to bound it. Exit code 124 means timeout
-    # expired (expected), 0 means it exited normally (also fine).
+run_optional() {
+    local name="$1" out rc crashes
+    info "$name (optional, ${OPTIONAL_SECS}s)"
+    out=$(new_outdir "$name")
     set +e
-    timeout "$TIMEOUT_SEC" "$FATHOM" \
-        -i "$SEED_DIR" \
-        -o "$outdir" \
-        -t 500 \
-        -- "$binary" \
-        >/dev/null 2>&1
-    local rc=$?
+    "$FATHOM" -i "$SEED_DIR" -o "$out" -t 500 -T "$OPTIONAL_SECS" \
+        -- "$TARGETS/$name$EXE" 2>"$out/log"
+    rc=$?
     set -e
-
-    # rc=124 is normal (timeout killed the fuzzer)
-    # rc=0   is normal (fuzzer stopped on its own)
-    # Other non-zero could indicate build/init errors
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-        # If the fuzzer itself errored out, still check for crashes
-        # (it might have found one before the error)
-        :
-    fi
-
-    # Check for crashes
-    local crash_dir="$outdir/crashes"
-    local crash_count=0
-    if [ -d "$crash_dir" ]; then
-        crash_count=$(find "$crash_dir" -type f -name 'crash_*' | wc -l)
-    fi
-
-    if [ "$crash_count" -gt 0 ]; then
-        ok "$name: found $crash_count crash(es)"
-        pass=$((pass + 1))
-    elif [ "$optional" -eq 1 ]; then
-        warn "$name: no crashes found (optional target, may need longer run)"
-        skip=$((skip + 1))
+    crashes=$(count_crashes "$out")
+    if [ "$rc" -ne 0 ]; then
+        fail "$name: fathom exited with status $rc"
+    elif [ "$crashes" -gt 0 ]; then
+        ok "$name: found $crashes unique crash(es)"
     else
-        fail "$name: no crashes found in $TIMEOUT_SEC seconds"
-        fail_count=$((fail_count + 1))
+        warn "$name: no crash in ${OPTIONAL_SECS}s"
     fi
 }
 
-run_target "heap_overflow"   "$ROOT_DIR/tests/targets/heap_overflow"   0
-run_target "stack_smash"     "$ROOT_DIR/tests/targets/stack_smash"     0
-run_target "format_string"   "$ROOT_DIR/tests/targets/format_string"   1
+run_optional heap_overflow
+run_optional stack_smash
+run_optional format_string
 
-run_parallel_target() {
-    local name="$1"
-    local binary="$2"
+# ── Hangs are not crashes ────────────────────────────────────────────
 
-    info "Testing parallel mode: $name ($binary)"
+info "hang: timeouts must be reported as hangs, never crashes"
+out=$(new_outdir hang)
+mkdir -p "$out/seeds"
+printf 'G' > "$out/seeds/g"
+set +e
+"$FATHOM" -i "$out/seeds" -o "$out/run" -t 200 -T 10 -s 3 \
+    -- "$TARGETS/hang$EXE" 2>"$out/log"
+rc=$?
+set -e
+hangs=$(stat_of "$out/run" hangs)
+crashes=$(stat_of "$out/run" crashes)
+if [ "$rc" -ne 0 ]; then
+    fail "hang: fathom exited with status $rc"
+elif [ "${crashes:-1}" -ne 0 ]; then
+    fail "hang: $crashes run(s) misreported as crashes"
+elif [ "${hangs:-0}" -gt 0 ]; then
+    ok "hang: $hangs hang(s), 0 crashes"
+else
+    warn "hang: no hanging input found in 10s"
+fi
 
-    if [ ! -x "$binary" ]; then
-        fail "$name parallel: binary not found: $binary"
-        fail_count=$((fail_count + 1))
-        return
+# ── Parallel workers ─────────────────────────────────────────────────
+
+info "parallel: 2 workers on the maze"
+out=$(new_outdir parallel)
+set +e
+"$FATHOM" -i "$SEED_DIR" -o "$out" -t 1000 -T 15 -j 2 -s 7 \
+    -- "$TARGETS/maze$EXE" 2>"$out/log"
+rc=$?
+set -e
+missing=0
+for w in worker-000 worker-001; do
+    if [ ! -d "$out/$w/queue" ] || [ ! -d "$out/$w/crashes" ] || [ ! -f "$out/$w/fuzzer_stats" ]; then
+        missing=1
     fi
+done
+orphans=0
+if command -v pgrep >/dev/null 2>&1 && pgrep -f "$out" >/dev/null 2>&1; then
+    orphans=1
+fi
+if [ "$rc" -ne 0 ]; then
+    fail "parallel: fathom exited with status $rc"
+    tail -5 "$out/log"
+elif [ "$missing" -ne 0 ]; then
+    fail "parallel: missing worker queue/crashes/stats"
+elif [ "$orphans" -ne 0 ]; then
+    fail "parallel: worker processes still running"
+else
+    w0=$(stat_of "$out/worker-000" execs)
+    w1=$(stat_of "$out/worker-001" execs)
+    ok "parallel: both workers ran ($w0 + $w1 execs)"
+fi
 
-    local outdir
-    outdir=$(mktemp -d "/tmp/fathom-test-${name}-parallel-XXXXXX")
-    TMPDIRS+=("$outdir")
-
-    set +e
-    timeout "$PARALLEL_TIMEOUT_SEC" "$FATHOM" \
-        -i "$SEED_DIR" \
-        -o "$outdir" \
-        -t 500 \
-        -j 2 \
-        -- "$binary" \
-        >/dev/null 2>&1
-    local rc=$?
-    set -e
-
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]; then
-        fail "$name parallel: fathom exited with status $rc"
-        fail_count=$((fail_count + 1))
-        return
-    fi
-
-    local missing_dirs=0
-    for worker in "$outdir"/worker-000 "$outdir"/worker-001; do
-        if [ ! -d "$worker/queue" ] || [ ! -d "$worker/crashes" ]; then
-            missing_dirs=1
-        fi
-    done
-
-    local crash_count=0
-    crash_count=$(find "$outdir" -type f -path '*/crashes/crash_*' | wc -l)
-
-    local orphaned=0
-    if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f "$outdir" >/dev/null 2>&1; then
-            orphaned=1
-        fi
-    fi
-
-    if [ "$missing_dirs" -ne 0 ]; then
-        fail "$name parallel: missing worker queue/crash directories"
-        fail_count=$((fail_count + 1))
-    elif [ "$crash_count" -le 0 ]; then
-        fail "$name parallel: no crashes found in $PARALLEL_TIMEOUT_SEC seconds"
-        fail_count=$((fail_count + 1))
-    elif [ "$orphaned" -ne 0 ]; then
-        fail "$name parallel: orphan worker processes still running"
-        fail_count=$((fail_count + 1))
-    else
-        ok "$name parallel: worker shards created and found $crash_count crash(es)"
-        pass=$((pass + 1))
-    fi
-}
-
-run_parallel_target "heap_overflow" "$ROOT_DIR/tests/targets/heap_overflow"
-
-# ── Phase 3: Summary ───────────────────────────────────────────────
+# ── Summary ──────────────────────────────────────────────────────────
 
 echo
 echo "========================================"
 info "Results: $pass passed, $fail_count failed, $skip skipped"
 echo "========================================"
 
-if [ "$fail_count" -gt 0 ]; then
-    exit 1
-fi
-
-exit 0
+[ "$fail_count" -eq 0 ]
