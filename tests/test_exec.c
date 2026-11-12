@@ -8,8 +8,12 @@
 #include "fathom.h"
 #include "test_util.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 
 static int tests_run;
 static int tests_passed;
@@ -147,6 +151,22 @@ static void test_detects_hang(target_t *hang)
     END();
 }
 
+static void test_reaps_targets(target_t *maze)
+{
+    BEGIN("leaves_no_unreaped_targets");
+#ifndef _WIN32
+    fathom_exec_result_t res;
+    for (int i = 0; i < 20; i++)
+        CHECK(run(maze, i % 2 ? "FUZZ" : "AAAA", &res) == 0, "exec failed");
+    /* Every target must be reaped, or a long run exhausts the process table. */
+    CHECK(waitpid(-1, NULL, WNOHANG) == -1 && errno == ECHILD,
+          "a finished target was left as a zombie");
+#else
+    (void)maze;
+#endif
+    END();
+}
+
 int main(void)
 {
     target_t maze, hang;
@@ -163,6 +183,7 @@ int main(void)
     test_coverage_is_deterministic(&maze);
     test_detects_crash(&maze);
     test_detects_hang(&hang);
+    test_reaps_targets(&maze);
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

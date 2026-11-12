@@ -632,6 +632,15 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 
     (void)killed;   /* only consulted on macOS */
     disarm_timer();
+#if defined(__APPLE__)
+    /*
+     * When the debugger is also the parent, the first wait reports the
+     * exit as the tracer and a second one reaps the zombie.  Skipping it
+     * leaks a process per run until fork() fails with EAGAIN.
+     */
+    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+        ;
+#endif
     if (g_timed_out && res->status != FATHOM_EXIT_CRASH)
         res->status = FATHOM_EXIT_HANG;
     tgt_detach(&t);
