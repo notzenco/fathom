@@ -316,33 +316,44 @@ static int run_analysis(const fathom_config_t *cfg)
  * Constants compared in covered blocks whose conditional branch still
  * has an uncovered side: the values most likely to unlock new code.
  * Statically linked runtimes (MinGW, musl) bury the target's own
- * comparisons among hundreds of library ones in the static dictionary.
+ * comparisons among hundreds of library ones, and their startup
+ * branches stay open forever without depending on the input.  So
+ * prefer blocks first reached in the latest coverage gains, and only
+ * fall back to the whole frontier when those offer nothing.
  */
+#define FRONTIER_RECENT 2   /* coverage gains that count as "recent" */
+
 static void rebuild_frontier(fathom_dict_t *frontier, const fathom_session_t *s,
                              const fathom_coverage_t *cov, const uint32_t *slot_block,
-                             const int32_t *block_slot, size_t slots)
+                             const int32_t *block_slot, const uint32_t *epoch,
+                             uint32_t now, size_t slots)
 {
-    fathom_dict_destroy(frontier);
-    fathom_dict_init(frontier);
+    for (int pass = 0; pass < 2; pass++) {
+        fathom_dict_destroy(frontier);
+        fathom_dict_init(frontier);
+        uint32_t since = pass == 0 && now > FRONTIER_RECENT ? now - FRONTIER_RECENT + 1 : 1;
 
-    for (size_t slot = 0; slot < slots && frontier->count < 256; slot++) {
-        if (!cov->global[slot])
-            continue;
-        const fathom_block_t *b = &s->cfg_graph.blocks[slot_block[slot]];
-        const fathom_insn_t *insns = &s->dis.insns[b->insn_start];
-        const fathom_insn_t *last = &insns[b->insn_count - 1];
-        if (last->kind != FATHOM_INSN_BRANCH || !last->is_conditional)
-            continue;
+        for (size_t slot = 0; slot < slots && frontier->count < 256; slot++) {
+            if (!cov->global[slot] || epoch[slot] < since)
+                continue;
+            const fathom_block_t *b = &s->cfg_graph.blocks[slot_block[slot]];
+            const fathom_insn_t *insns = &s->dis.insns[b->insn_start];
+            const fathom_insn_t *last = &insns[b->insn_count - 1];
+            if (last->kind != FATHOM_INSN_BRANCH || !last->is_conditional)
+                continue;
 
-        bool open = false;
-        for (size_t i = 0; i < b->succ_count; i++) {
-            int32_t succ = block_slot[b->succs[i]];
-            open |= succ < 0 || !cov->global[succ];
+            bool open = false;
+            for (size_t i = 0; i < b->succ_count; i++) {
+                int32_t succ = block_slot[b->succs[i]];
+                open |= succ < 0 || !cov->global[succ];
+            }
+            for (size_t i = 0; open && i < b->insn_count; i++) {
+                if (insns[i].has_cmp_imm)
+                    fathom_dict_add_constant(frontier, insns[i].cmp_imm);
+            }
         }
-        for (size_t i = 0; open && i < b->insn_count; i++) {
-            if (insns[i].has_cmp_imm)
-                fathom_dict_add_constant(frontier, insns[i].cmp_imm);
-        }
+        if (frontier->count > 0)
+            return;
     }
 }
 
@@ -362,6 +373,8 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     uint8_t *buf = NULL;
     uint32_t *slot_block = NULL;
     int32_t *block_slot = NULL;
+    uint32_t *epoch = NULL;       /* coverage gain in which each slot was first hit */
+    uint32_t gains = 0;
     fathom_dict_t frontier;
     fathom_stats_t stats;
 
@@ -405,7 +418,8 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     /* One breakpoint per instrumentable block; slot i ↔ cov_blocks[i]. */
     slot_block = malloc((session->ana.cov_count + 1) * sizeof(*slot_block));
     block_slot = malloc((session->cfg_graph.block_count + 1) * sizeof(*block_slot));
-    if (!slot_block || !block_slot)
+    epoch = calloc(session->ana.cov_count + 1, sizeof(*epoch));
+    if (!slot_block || !block_slot || !epoch)
         goto cleanup;
     for (size_t i = 0; i < session->cfg_graph.block_count; i++)
         block_slot[i] = -1;
@@ -470,13 +484,17 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         if (fathom_coverage_has_new(&cov)) {
             /* Weight new blocks by their static score before merging. */
             double score = 0.0;
+            gains++;
             for (size_t s = 0; s < ex.bp_count; s++) {
-                if (cov.local[s] && !cov.global[s])
+                if (cov.local[s] && !cov.global[s]) {
                     score += session->cfg_graph.blocks[slot_block[s]].score;
+                    epoch[s] = gains;
+                }
             }
             fathom_coverage_merge(&cov);
             stats.covered = cov.total_blocks;
-            rebuild_frontier(&frontier, session, &cov, slot_block, block_slot, ex.bp_count);
+            rebuild_frontier(&frontier, session, &cov, slot_block, block_slot, epoch, gains,
+                             ex.bp_count);
 
             if (fathom_corpus_add(&corpus, buf, len, cov.new_blocks, score) < 0) {
                 fprintf(stderr, "fathom: failed to add interesting input\n");
@@ -536,6 +554,7 @@ cleanup:
     free(buf);
     free(slot_block);
     free(block_slot);
+    free(epoch);
     fathom_dict_destroy(&frontier);
     if (ex_ready)
         fathom_exec_destroy(&ex);
