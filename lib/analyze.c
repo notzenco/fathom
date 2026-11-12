@@ -330,26 +330,10 @@ static void extract_rodata_strings(fathom_dict_t *dict, const fathom_binary_t *b
  */
 static void extract_cmp_constants(fathom_dict_t *dict, const fathom_disasm_t *dis)
 {
-    size_t first = dict->count, added = 0;
-
+    size_t added = 0;
     for (size_t i = 0; i < dis->count && added < CMP_DICT_MAX; i++) {
-        const fathom_insn_t *insn = &dis->insns[i];
-        int64_t v = insn->cmp_imm;
-        if (!insn->has_cmp_imm || v == 0 || v == 1 || v == -1)
-            continue;
-
-        size_t width = (v >= -128 && v <= 255) ? 1
-                     : (v >= -32768 && v <= 65535) ? 2
-                     : (v >= INT32_MIN && v <= (int64_t)UINT32_MAX) ? 4 : 8;
-        uint8_t bytes[8];
-        for (size_t b = 0; b < width; b++)
-            bytes[b] = (uint8_t)((uint64_t)v >> (8 * b));
-
-        bool dup = false;
-        for (size_t e = first; e < dict->count && !dup; e++)
-            dup = dict->entries[e].len == width &&
-                  memcmp(dict->entries[e].data, bytes, width) == 0;
-        if (!dup && fathom_dict_add(dict, bytes, width) == 0)
+        if (dis->insns[i].has_cmp_imm &&
+            fathom_dict_add_constant(dict, dis->insns[i].cmp_imm) > 0)
             added++;
     }
 }

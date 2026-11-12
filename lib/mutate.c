@@ -509,11 +509,15 @@ int fathom_mutate(fathom_mutator_t *mut, uint8_t *buf, size_t *len,
         return -1;
 
     bool have_splice = (splice != NULL && splice_len > 0);
-    bool have_dict   = (mut->dict != NULL && mut->dict->count > 0);
+    bool have_dict   = (mut->dict != NULL && mut->dict->count > 0) ||
+                       (mut->frontier != NULL && mut->frontier->count > 0);
 
     fathom_mutation_t which = pick_strategy(mut, have_splice, have_dict);
     mut->uses[which]++;
     uint64_t *rng = &mut->rng;
+    fathom_dict_t *dict = mut->dict;
+    if (mut->frontier && mut->frontier->count && rand_below(rng, 2) == 0)
+        dict = mut->frontier;
 
     switch (which) {
     case FATHOM_MUT_BITFLIP:
@@ -529,10 +533,10 @@ int fathom_mutate(fathom_mutator_t *mut, uint8_t *buf, size_t *len,
         mutate_interesting(rng, buf, *len);
         break;
     case FATHOM_MUT_DICTIONARY:
-        mutate_dictionary(rng, buf, len, max_len, mut->dict);
+        mutate_dictionary(rng, buf, len, max_len, dict);
         break;
     case FATHOM_MUT_HAVOC:
-        mutate_havoc(rng, buf, len, max_len, mut->dict);
+        mutate_havoc(rng, buf, len, max_len, dict);
         break;
     case FATHOM_MUT_SPLICE:
         mutate_splice(rng, buf, len, max_len, splice, splice_len);
@@ -564,4 +568,24 @@ void fathom_mutator_reward(fathom_mutator_t *mut, fathom_mutation_t which)
     }
 
     mut->weights[which] *= FATHOM_WEIGHT_BONUS;
+}
+
+int fathom_dict_add_constant(fathom_dict_t *dict, int64_t v)
+{
+    if (v == 0 || v == 1 || v == -1)
+        return 0;   /* already covered by the interesting-values strategy */
+
+    size_t width = (v >= -128 && v <= 255) ? 1
+                 : (v >= -32768 && v <= 65535) ? 2
+                 : (v >= INT32_MIN && v <= (int64_t)UINT32_MAX) ? 4 : 8;
+    uint8_t bytes[8];
+    for (size_t b = 0; b < width; b++)
+        bytes[b] = (uint8_t)((uint64_t)v >> (8 * b));
+
+    for (size_t e = 0; e < dict->count; e++) {
+        if (dict->entries[e].len == width &&
+            memcmp(dict->entries[e].data, bytes, width) == 0)
+            return 0;
+    }
+    return fathom_dict_add(dict, bytes, width) == 0 ? 1 : -1;
 }

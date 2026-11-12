@@ -205,6 +205,12 @@ typedef struct {
     uint64_t hits[FATHOM_MUT_COUNT];   /* new-coverage hits per strategy */
     uint64_t uses[FATHOM_MUT_COUNT];
     fathom_dict_t *dict;
+    /*
+     * Optional tokens from the coverage frontier: constants compared in
+     * covered blocks whose branch still has an uncovered side.  Drawn
+     * from half the time when non-empty.
+     */
+    fathom_dict_t *frontier;
     uint64_t rng;                      /* xorshift64* state, never 0 */
 } fathom_mutator_t;
 
@@ -362,5 +368,8 @@ void fathom_dict_init(fathom_dict_t *dict);
 void fathom_dict_destroy(fathom_dict_t *dict);
 int  fathom_dict_add(fathom_dict_t *dict, const uint8_t *data, size_t len);
 int  fathom_dict_load(fathom_dict_t *dict, const char *path);
+/* Add v as a 1/2/4/8-byte little-endian token unless already present.
+ * Returns 1 if added, 0 if skipped (duplicate or trivial), -1 on error. */
+int  fathom_dict_add_constant(fathom_dict_t *dict, int64_t v);
 
 #endif /* FATHOM_H */
