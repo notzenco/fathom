@@ -41,7 +41,21 @@ runs natively on the host, so emulated targets are not supported
 (x86-64 binaries under Rosetta 2 or Windows ARM64 emulation).
 
 CI builds and tests all six OS and architecture combinations on native
-runners.
+runners. Time for each to solve the maze target (below) from the seed
+`AAAA`, from one CI run with `-s 1`:
+
+| Platform       | Runs to first crash | Time    |
+|----------------|--------------------:|--------:|
+| Linux x86-64   | 383                 | 0.4 s   |
+| Linux arm64    | 203                 | 0.3 s   |
+| macOS arm64    | 203                 | 0.9 s   |
+| macOS x86-64   | 203                 | 2.4 s   |
+| Windows ARM64  | 296                 | 10.0 s  |
+| Windows x64    | 1,739               | 53.7 s  |
+
+Process creation dominates: Linux runs roughly 1,000 targets a second,
+macOS a few hundred, and Windows 30 to 40. On Windows the statically
+linked MinGW runtime also adds about 100 startup blocks to every run.
 
 ## How coverage works without instrumentation
 
@@ -84,6 +98,10 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
 - **Dictionary extraction**: printable strings from read-only data, plus
   the constants the code compares against (`cmp al, 0x46`,
   `subs w8, w8, #0x46`), which random mutation rarely guesses.
+- **Frontier tokens**: during fuzzing, constants compared in covered
+  blocks whose branch still has an uncovered side, favouring blocks
+  reached most recently. This keeps a statically linked runtime's
+  comparisons from drowning out the target's.
 - **CFG** with back-edge (loop) detection and immediate dominators.
 
 ## Fuzzing
@@ -151,8 +169,8 @@ crash). With `-j`, each worker writes to `out/worker-NNN/`.
 ## Building
 
 Fathom is C11 with one dependency,
-[Capstone](https://www.capstone-engine.org/) (4.x, 5.x or 6.x), found
-through `pkg-config`.
+[Capstone](https://www.capstone-engine.org/) (tested with 4.0 and 5.0),
+found through `pkg-config`.
 
 **Linux**
 
@@ -170,7 +188,9 @@ make
 
 `make` ad-hoc signs `fathom` with the `com.apple.security.cs.debugger`
 entitlement (`macos/fathom.entitlements`), which `task_for_pid()` needs to
-attach to targets. Targets built with the hardened runtime and no
+attach to targets. When not root, macOS asks for authorization the first
+time (developer tools access); headless machines such as CI should run
+fathom with `sudo`. Targets built with the hardened runtime and no
 `get-task-allow` entitlement, which includes Apple's system binaries,
 cannot be debugged.
 
@@ -233,9 +253,9 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
 - **Block coverage, not edge coverage.** One-shot breakpoints record
   which blocks ran, not how often or in which order.
 - **One process launch per input.** There is no fork server or persistent
-  mode, so throughput is bounded by process creation. On macOS,
-  `task_for_pid()` adds roughly 10 ms per run, which makes it the slowest
-  platform.
+  mode, so throughput is bounded by process creation, which is slowest on
+  Windows. On macOS, `task_for_pid()` adds roughly 10 ms per run unless
+  fathom runs as root.
 - **Inputs arrive on stdin only.** File-path (`@@`) delivery is not
   implemented.
 - **64-bit only.** 32-bit x86/ARM and big-endian targets are rejected.
