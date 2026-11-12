@@ -97,6 +97,10 @@ elif [ "$crashes" -gt 0 ]; then
     ok "maze: solved after $first_execs execs / ${first_ms} ms (covered $covered blocks)"
 else
     fail "maze: not solved in ${MAZE_SECS}s ($execs execs, covered ${covered:-0} blocks)"
+    cat "$out/run/fuzzer_stats" 2>/dev/null || true
+    for f in "$out"/run/queue/*; do
+        printf '  %s  %s\n' "$(basename "$f")" "$(od -An -tx1 -N8 "$f" | tr -d '\n')"
+    done | head -20
 fi
 
 # ── Classic memory-safety targets (crash behaviour varies by libc) ───
