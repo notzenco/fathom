@@ -162,7 +162,7 @@ static void test_next_unfuzzed_first(void)
     assert(fathom_corpus_init(&corpus, NULL, outdir) == 0);
 
     /* Add three inputs with different priorities.
-     * Edges:  data_a=1, data_b=5, data_c=0
+     * New blocks:  data_a=1, data_b=5, data_c=0
      * Priority: a=11.0, b=51.0, c=1.0
      */
     const uint8_t a[] = "aaa";

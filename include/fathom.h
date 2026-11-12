@@ -19,7 +19,7 @@
 #define FATHOM_VERSION_MINOR 2
 #define FATHOM_VERSION_PATCH 0
 
-/* ── Coverage bitmap ─────────────────────────────────────────────────── */
+/* ── Coverage map ────────────────────────────────────────────────────── */
 
 /* One byte per instrumented basic block; also caps the breakpoint count. */
 #define FATHOM_MAP_SIZE   (1 << 16)
