@@ -2,7 +2,7 @@
  * test_cfg.c — CFG builder unit tests
  *
  * Tests the CFG builder with both a synthetic instruction stream
- * (known control flow) and a real binary (/bin/ls).
+ * (known control flow) and a real binary (the fixture).
  */
 
 #include "fathom.h"
@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
+#include "test_util.h"
 
 static int failures = 0;
 
@@ -24,19 +24,11 @@ static int failures = 0;
 
 /* ── Helper: locate a test binary ────────────────────────────────────── */
 
-static const char *test_binary(void)
-{
-    static const char *candidates[] = {
-        "/usr/bin/ls",
-        "/bin/ls",
-        NULL,
-    };
-    for (const char **p = candidates; *p; p++) {
-        if (access(*p, R_OK) == 0)
-            return *p;
-    }
-    return NULL;
-}
+static const char *const fixtures[] = {
+    FIXTURE("elf-x86_64"), FIXTURE("elf-arm64"), FIXTURE("elf-x86_64-gcc-stripped"),
+    FIXTURE("macho-x86_64"), FIXTURE("macho-arm64"),
+    FIXTURE("pe-x86_64.exe"), FIXTURE("pe-arm64.exe"),
+};
 
 /* ── Test 1: Synthetic instruction stream ────────────────────────────── */
 
@@ -237,28 +229,22 @@ static void test_synthetic_cfg(void)
     printf("  synthetic test done.\n\n");
 }
 
-/* ── Test 2: Real binary (/bin/ls) ───────────────────────────────────── */
+/* ── Test 2: Real binaries (every fixture format) ───────────────────────────────────── */
 
-static void test_real_binary_cfg(void)
+static void test_real_binary_cfg(const char *path)
 {
-    printf("=== test_real_binary_cfg ===\n");
+    printf("=== test_real_binary_cfg (%s) ===\n", path);
 
-    const char *path = test_binary();
-    if (!path) {
-        fprintf(stderr, "SKIP: no test binary found\n");
-        return;
-    }
-
-    fathom_elf_t elf;
-    int rc = fathom_elf_open(&elf, path);
-    CHECK(rc == 0, "fathom_elf_open should succeed");
+    fathom_binary_t elf;
+    int rc = fathom_binary_open(&elf, path);
+    CHECK(rc == 0, "fathom_binary_open should succeed");
     if (rc != 0) return;
 
     fathom_disasm_t dis;
     rc = fathom_disasm_open(&dis, &elf);
     CHECK(rc == 0, "fathom_disasm_open should succeed");
     if (rc != 0) {
-        fathom_elf_close(&elf);
+        fathom_binary_close(&elf);
         return;
     }
 
@@ -269,7 +255,7 @@ static void test_real_binary_cfg(void)
     CHECK(rc == 0, "fathom_cfg_build should succeed on real binary");
     if (rc != 0) {
         fathom_disasm_close(&dis);
-        fathom_elf_close(&elf);
+        fathom_binary_close(&elf);
         return;
     }
 
@@ -279,9 +265,9 @@ static void test_real_binary_cfg(void)
     CHECK(cfg.block_count > 0, "block_count should be > 0");
     CHECK(cfg.edge_count > 0, "edge_count should be > 0");
 
-    /* A binary like /bin/ls should have many blocks */
-    CHECK(cfg.block_count > 10, "block_count should be > 10 for /bin/ls");
-    CHECK(cfg.edge_count > 10, "edge_count should be > 10 for /bin/ls");
+    /* A binary like the fixture should have many blocks */
+    CHECK(cfg.block_count > 10, "block_count should be > 10 for the fixture");
+    CHECK(cfg.edge_count > 10, "edge_count should be > 10 for the fixture");
 
     /* Check that at least some loop headers were detected */
     size_t loop_headers = 0;
@@ -290,7 +276,7 @@ static void test_real_binary_cfg(void)
             loop_headers++;
     }
     printf("  loop headers: %zu\n", loop_headers);
-    CHECK(loop_headers > 0, "should detect at least one loop header in /bin/ls");
+    CHECK(loop_headers > 0, "should detect at least one loop header in the fixture");
 
     /* Check dominator tree: entry block should have idom == -1 */
     CHECK(cfg.blocks[0].idom == -1, "entry block idom should be -1");
@@ -335,7 +321,7 @@ static void test_real_binary_cfg(void)
 
     fathom_cfg_free(&cfg);
     fathom_disasm_close(&dis);
-    fathom_elf_close(&elf);
+    fathom_binary_close(&elf);
 
     printf("  real binary test done.\n\n");
 }
@@ -400,7 +386,8 @@ int main(void)
     printf("test_cfg\n\n");
 
     test_synthetic_cfg();
-    test_real_binary_cfg();
+    for (size_t i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++)
+        test_real_binary_cfg(fixtures[i]);
     test_single_instruction();
     test_empty_disasm();
     test_cfg_free_null();

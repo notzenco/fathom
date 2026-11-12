@@ -15,25 +15,6 @@
 /* ── Internal helpers ────────────────────────────────────────────────── */
 
 /*
- * Binary search for an instruction index by address.
- * Returns the index into dis->insns, or (size_t)-1 if not found.
- */
-static size_t find_insn_index(const fathom_disasm_t *dis, uint64_t addr)
-{
-    size_t lo = 0, hi = dis->count;
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (dis->insns[mid].addr < addr)
-            lo = mid + 1;
-        else if (dis->insns[mid].addr > addr)
-            hi = mid;
-        else
-            return mid;
-    }
-    return (size_t)-1;
-}
-
-/*
  * Binary search for a block by start address.
  * Blocks are sorted by start_addr (they inherit instruction order).
  */
@@ -52,6 +33,16 @@ static uint32_t find_block_by_addr(const fathom_cfg_t *cfg, uint64_t addr)
     return (uint32_t)-1;
 }
 
+static bool contiguous(const fathom_disasm_t *dis, size_t a, size_t b)
+{
+    return dis->insns[a].addr + dis->insns[a].size == dis->insns[b].addr;
+}
+
+static bool is_padding(const fathom_insn_t *insn)
+{
+    return strcmp(insn->mnemonic, "nop") == 0 || strcmp(insn->mnemonic, "int3") == 0;
+}
+
 /* ── Step 1: Identify block leaders ──────────────────────────────────── */
 
 /*
@@ -59,20 +50,31 @@ static uint32_t find_block_by_addr(const fathom_cfg_t *cfg, uint64_t addr)
  *   - The very first instruction (index 0)
  *   - Any instruction that is the target of a branch
  *   - The instruction immediately following a branch, call, or ret
+ *   - The target of a direct call (a function entry)
+ *   - Any instruction not contiguous with the previous one (a section
+ *     boundary or bytes the disassembler skipped)
+ *   - The first instruction after inter-function padding
  *
  * We collect leader indices in a sorted, deduplicated boolean array.
  */
 static bool *mark_leaders(const fathom_disasm_t *dis, size_t *n_leaders)
 {
     bool *is_leader = calloc(dis->count, sizeof(bool));
-    if (!is_leader)
+    bool *is_target = calloc(dis->count, sizeof(bool));
+    if (!is_leader || !is_target) {
+        free(is_leader);
+        free(is_target);
         return NULL;
+    }
 
     /* First instruction is always a leader */
     is_leader[0] = true;
 
     for (size_t i = 0; i < dis->count; i++) {
         const fathom_insn_t *insn = &dis->insns[i];
+
+        if (i > 0 && !contiguous(dis, i - 1, i))
+            is_leader[i] = true;
 
         if (insn->kind == FATHOM_INSN_BRANCH ||
             insn->kind == FATHOM_INSN_RET) {
@@ -83,9 +85,9 @@ static bool *mark_leaders(const fathom_disasm_t *dis, size_t *n_leaders)
             /* Branch target starts a new block */
             if (insn->kind == FATHOM_INSN_BRANCH &&
                 insn->branch_target != 0) {
-                size_t idx = find_insn_index(dis, insn->branch_target);
+                size_t idx = fathom_disasm_find(dis, insn->branch_target);
                 if (idx != (size_t)-1)
-                    is_leader[idx] = true;
+                    is_leader[idx] = is_target[idx] = true;
             }
         } else if (insn->kind == FATHOM_INSN_CALL) {
             /*
@@ -95,8 +97,37 @@ static bool *mark_leaders(const fathom_disasm_t *dis, size_t *n_leaders)
              */
             if (i + 1 < dis->count)
                 is_leader[i + 1] = true;
+            if (insn->branch_target != 0) {
+                size_t idx = fathom_disasm_find(dis, insn->branch_target);
+                if (idx != (size_t)-1)
+                    is_leader[idx] = is_target[idx] = true;
+            }
         }
     }
+
+    /*
+     * Alignment padding between functions would otherwise be glued onto
+     * the next function's first block, hiding its entry point.  Padding
+     * is int3, or a nop that follows a ret/jmp without being a branch
+     * target itself; the block ends where the padding does.
+     */
+    for (size_t i = 1; i < dis->count; i++) {
+        const fathom_insn_t *prev = &dis->insns[i - 1];
+        bool after_end = prev->kind == FATHOM_INSN_RET ||
+                         (prev->kind == FATHOM_INSN_BRANCH && !prev->is_conditional);
+        bool pad = strcmp(dis->insns[i].mnemonic, "int3") == 0 ||
+                   (after_end && strcmp(dis->insns[i].mnemonic, "nop") == 0 &&
+                    !is_target[i]);
+        if (!pad)
+            continue;
+        size_t j = i + 1;
+        while (j < dis->count && is_padding(&dis->insns[j]) && contiguous(dis, j - 1, j))
+            j++;
+        if (j < dis->count)
+            is_leader[j] = true;
+        i = j - 1;
+    }
+    free(is_target);
 
     size_t count = 0;
     for (size_t i = 0; i < dis->count; i++) {
@@ -145,6 +176,12 @@ static int build_blocks(fathom_cfg_t *cfg, const fathom_disasm_t *dis,
     return 0;
 }
 
+static bool falls_into_next(const fathom_cfg_t *cfg, size_t i)
+{
+    return i + 1 < cfg->block_count &&
+           cfg->blocks[i + 1].start_addr == cfg->blocks[i].end_addr;
+}
+
 /* ── Step 3: Build edges ─────────────────────────────────────────────── */
 
 static int build_edges(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
@@ -169,7 +206,7 @@ static int build_edges(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
         case FATHOM_INSN_BRANCH:
             if (last->is_conditional) {
                 /* Fall-through edge to next block */
-                if (i + 1 < cfg->block_count) {
+                if (falls_into_next(cfg, i)) {
                     cfg->edges[edge_idx].from = b->id;
                     cfg->edges[edge_idx].to   = cfg->blocks[i + 1].id;
                     edge_idx++;
@@ -203,7 +240,7 @@ static int build_edges(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
 
         case FATHOM_INSN_CALL:
             /* Calls fall through to the next block */
-            if (i + 1 < cfg->block_count) {
+            if (falls_into_next(cfg, i)) {
                 cfg->edges[edge_idx].from = b->id;
                 cfg->edges[edge_idx].to   = cfg->blocks[i + 1].id;
                 edge_idx++;
@@ -212,7 +249,7 @@ static int build_edges(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
 
         default:
             /* Ordinary instruction: fall through */
-            if (i + 1 < cfg->block_count) {
+            if (falls_into_next(cfg, i)) {
                 cfg->edges[edge_idx].from = b->id;
                 cfg->edges[edge_idx].to   = cfg->blocks[i + 1].id;
                 edge_idx++;

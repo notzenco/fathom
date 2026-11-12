@@ -1,42 +1,84 @@
 /*
  * main.c — CLI driver for Fathom
  *
- * Orchestrates: ELF parse → disassemble → CFG build → analysis → fuzz loop.
+ * Orchestrates: load binary → disassemble → CFG → analysis → fuzz loop.
  *
  * Usage:
  *   fathom [options] -- /path/to/target [target_args...]
  */
 
 #include "fathom.h"
+#include "osdep.h"
 
 #include <errno.h>
 #include <getopt.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
-#include <sys/time.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #include <unistd.h>
-
-/* ── Banner ──────────────────────────────────────────────────────────── */
-
-#define FATHOM_BANNER \
-    "fathom — hybrid coverage-guided fuzzer v%d.%d.%d\n"
+#endif
 
 /* ── Defaults ────────────────────────────────────────────────────────── */
 
+#define FATHOM_BANNER       "fathom — coverage-guided binary fuzzer v%d.%d.%d\n"
 #define DEFAULT_TIMEOUT_MS  1000
 #define DEFAULT_JOBS        1
 #define MAX_INPUT_SIZE      (1 << 20)   /* 1 MB max mutated input */
-#define STATS_INTERVAL_MS   1000        /* status line refresh rate */
-#define MAX_BREAKPOINTS     256         /* top-scored blocks to instrument */
+#define STATS_INTERVAL_US   1000000     /* status line refresh rate */
 #define FATHOM_PATH_MAX     4096
+#define STATS_FILE          "fuzzer_stats"
+#ifdef _WIN32
+#define MAX_WORKERS         MAXIMUM_WAIT_OBJECTS
+#else
+#define MAX_WORKERS         1024
+#endif
 
-/* ── Volatile flags for shutdown ─────────────────────────────────────── */
+/* ── Options ─────────────────────────────────────────────────────────── */
+
+typedef struct {
+    fathom_config_t cfg;
+    uint64_t seed;
+    bool     have_seed;
+    uint32_t max_secs;       /* 0 = run until stopped */
+    bool     until_crash;    /* stop after the first unique crash */
+    int      worker_id;      /* -1 unless launched as a worker (Windows) */
+    char     stop_event[64];
+} fathom_opts_t;
+
+/* ── Shutdown ────────────────────────────────────────────────────────── */
 
 static volatile sig_atomic_t g_stop;
+
+#ifdef _WIN32
+static HANDLE g_stop_event;
+
+static BOOL WINAPI console_handler(DWORD type)
+{
+    (void)type;
+    g_stop = 1;
+    return TRUE;
+}
+
+static int install_stop_handlers(void)
+{
+    return SetConsoleCtrlHandler(console_handler, TRUE) ? 0 : -1;
+}
+
+static bool stop_requested(void)
+{
+    if (!g_stop && g_stop_event && WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0)
+        g_stop = 1;
+    return g_stop;
+}
+#else
 static volatile sig_atomic_t g_stop_signal;
 
 static void stop_handler(int sig)
@@ -45,10 +87,27 @@ static void stop_handler(int sig)
     g_stop_signal = sig;
 }
 
+static int install_stop_handlers(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = stop_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGINT, &sa, NULL) < 0 || sigaction(SIGTERM, &sa, NULL) < 0)
+        return -1;
+    return 0;
+}
+
+static bool stop_requested(void)
+{
+    return g_stop;
+}
+#endif
+
 /* ── Session state ───────────────────────────────────────────────────── */
 
 typedef struct {
-    fathom_elf_t      elf;
+    fathom_binary_t   bin;
     fathom_disasm_t   dis;
     fathom_cfg_t      cfg_graph;
     fathom_analysis_t ana;
@@ -59,221 +118,164 @@ typedef struct {
     uint64_t crashes;
     uint64_t unique_crashes;
     uint64_t hangs;
-    uint64_t last_new_cov_exec;
     size_t   corpus_size;
-    size_t   total_edges;
-    struct timeval start;
+    size_t   covered;
+    size_t   instrumented;
+    uint64_t first_crash_execs;     /* 0 until the first unique crash */
+    uint64_t first_crash_ms;
+    uint64_t start_us;
 } fathom_stats_t;
 
-typedef struct {
-    uint64_t total_execs;
-    uint64_t crashes;
-    uint64_t unique_crashes;
-    uint64_t hangs;
-    size_t   corpus_size;
-    size_t   total_edges;
-    int      exit_code;
-} fathom_worker_report_t;
-
-/* ── Helpers ─────────────────────────────────────────────────────────── */
-
-static int install_stop_handlers(void)
+static void cleanup_session(fathom_session_t *s)
 {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = stop_handler;
-    sigemptyset(&sa.sa_mask);
-
-    if (sigaction(SIGINT, &sa, NULL) < 0)
-        return -1;
-    if (sigaction(SIGTERM, &sa, NULL) < 0)
-        return -1;
-
-    return 0;
-}
-
-static void cleanup_session(fathom_session_t *session)
-{
-    fathom_analysis_free(&session->ana);
-    fathom_cfg_free(&session->cfg_graph);
-    fathom_disasm_close(&session->dis);
-    fathom_elf_close(&session->elf);
-    memset(session, 0, sizeof(*session));
+    fathom_analysis_free(&s->ana);
+    fathom_cfg_free(&s->cfg_graph);
+    fathom_disasm_close(&s->dis);
+    fathom_binary_close(&s->bin);
+    memset(s, 0, sizeof(*s));
 }
 
 static void print_status(const fathom_stats_t *st, const char *prefix,
                          bool overwrite_line)
 {
-    struct timeval now;
-    gettimeofday(&now, NULL);
-    double elapsed = (double)(now.tv_sec - st->start.tv_sec)
-                   + (double)(now.tv_usec - st->start.tv_usec) / 1e6;
+    double elapsed = (double)(fathom_now_us() - st->start_us) / 1e6;
     if (elapsed < 0.001)
         elapsed = 0.001;
-
-    double execs_sec = (double)st->total_execs / elapsed;
-
-    int hrs = (int)elapsed / 3600;
-    int min = ((int)elapsed % 3600) / 60;
-    int sec = (int)elapsed % 60;
+    int secs = (int)elapsed;
 
     if (overwrite_line)
         fprintf(stderr, "\r\033[2K");
-
-    if (prefix && prefix[0] != '\0')
+    if (prefix)
         fprintf(stderr, "%s ", prefix);
 
     fprintf(stderr,
-        "[%02d:%02d:%02d] "
-        "execs: %lu (%.0f/sec) | "
-        "coverage: %zu edges | "
-        "corpus: %zu | "
-        "crashes: %lu (%lu unique) | "
-        "hangs: %lu",
-        hrs, min, sec,
-        (unsigned long)st->total_execs, execs_sec,
-        st->total_edges,
-        st->corpus_size,
-        (unsigned long)st->crashes,
-        (unsigned long)st->unique_crashes,
-        (unsigned long)st->hangs);
+        "[%02d:%02d:%02d] execs: %" PRIu64 " (%.0f/sec) | "
+        "coverage: %zu/%zu blocks | corpus: %zu | "
+        "crashes: %" PRIu64 " (%" PRIu64 " unique) | hangs: %" PRIu64,
+        secs / 3600, (secs % 3600) / 60, secs % 60,
+        st->total_execs, (double)st->total_execs / elapsed,
+        st->covered, st->instrumented, st->corpus_size,
+        st->crashes, st->unique_crashes, st->hangs);
 
     if (!overwrite_line)
         fputc('\n', stderr);
 }
 
+static void describe_crash(char *buf, size_t cap, uint32_t code)
+{
+#ifdef _WIN32
+    snprintf(buf, cap, "exception=0x%08" PRIx32, code);
+#else
+    snprintf(buf, cap, "signal=%" PRIu32, code);
+#endif
+}
+
 static int ensure_dir(const char *path)
 {
     struct stat st;
-
     if (stat(path, &st) == 0) {
-        if (S_ISDIR(st.st_mode))
+        if (st.st_mode & S_IFDIR)
             return 0;
-        fprintf(stderr, "fathom: path exists but is not a directory: %s\n",
-                path);
+        fprintf(stderr, "fathom: path exists but is not a directory: %s\n", path);
         return -1;
     }
-
-    if (mkdir(path, 0755) == 0 || errno == EEXIST)
+    if (fathom_mkdir(path) == 0)
         return 0;
-
     fprintf(stderr, "fathom: mkdir(%s): %s\n", path, strerror(errno));
     return -1;
 }
 
-static int build_worker_output_dir(char *buf, size_t buf_sz,
-                                   const char *base_output_dir,
-                                   uint32_t worker_id)
+static int worker_dir(char *buf, size_t cap, const char *base, uint32_t id)
 {
-    int n = snprintf(buf, buf_sz, "%s/worker-%03u",
-                     base_output_dir, worker_id);
-    if (n < 0 || (size_t)n >= buf_sz) {
+    int n = snprintf(buf, cap, "%s/worker-%03u", base, id);
+    if (n < 0 || (size_t)n >= cap) {
         fprintf(stderr, "fathom: worker output path too long\n");
         return -1;
     }
     return 0;
 }
 
-static ssize_t write_full(int fd, const void *buf, size_t len)
+/* Key/value stats file, read back by the parallel supervisor. */
+static void write_stats(const char *dir, const fathom_stats_t *st)
 {
-    const uint8_t *p = buf;
-    size_t total = 0;
-
-    while (total < len) {
-        ssize_t n = write(fd, p + total, len - total);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        total += (size_t)n;
-    }
-
-    return (ssize_t)total;
+    char path[FATHOM_PATH_MAX + 32];
+    snprintf(path, sizeof(path), "%s/%s", dir, STATS_FILE);
+    FILE *fp = fopen(path, "w");
+    if (!fp)
+        return;
+    fprintf(fp, "execs %" PRIu64 "\ncrashes %" PRIu64 "\nunique_crashes %" PRIu64
+                "\nhangs %" PRIu64 "\ncorpus %zu\ncovered %zu\ninstrumented %zu\n"
+                "first_crash_execs %" PRIu64 "\nfirst_crash_ms %" PRIu64 "\n",
+            st->total_execs, st->crashes, st->unique_crashes, st->hangs,
+            st->corpus_size, st->covered, st->instrumented,
+            st->first_crash_execs, st->first_crash_ms);
+    fclose(fp);
 }
 
-static ssize_t read_full(int fd, void *buf, size_t len)
+static bool read_stats(const char *dir, fathom_stats_t *st)
 {
-    uint8_t *p = buf;
-    size_t total = 0;
+    char path[FATHOM_PATH_MAX + 32], key[32];
+    unsigned long long val;
+    bool any = false;
 
-    while (total < len) {
-        ssize_t n = read(fd, p + total, len - total);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 0)
-            break;
-        total += (size_t)n;
+    memset(st, 0, sizeof(*st));
+    snprintf(path, sizeof(path), "%s/%s", dir, STATS_FILE);
+    FILE *fp = fopen(path, "r");
+    if (!fp)
+        return false;
+    while (fscanf(fp, "%31s %llu", key, &val) == 2) {
+        any = true;
+        if (!strcmp(key, "execs"))               st->total_execs = val;
+        else if (!strcmp(key, "crashes"))        st->crashes = val;
+        else if (!strcmp(key, "unique_crashes")) st->unique_crashes = val;
+        else if (!strcmp(key, "hangs"))          st->hangs = val;
+        else if (!strcmp(key, "corpus"))         st->corpus_size = (size_t)val;
+        else if (!strcmp(key, "covered"))        st->covered = (size_t)val;
+        else if (!strcmp(key, "instrumented"))   st->instrumented = (size_t)val;
     }
-
-    return (ssize_t)total;
+    fclose(fp);
+    return any;
 }
 
-static void forward_stop_to_workers(const pid_t *pids, uint32_t jobs)
+static int prepare_session(const fathom_config_t *cfg, bool quiet,
+                           fathom_session_t *s)
 {
-    int sig = g_stop_signal ? (int)g_stop_signal : SIGTERM;
+    memset(s, 0, sizeof(*s));
 
-    for (uint32_t i = 0; i < jobs; i++) {
-        if (pids[i] > 0)
-            kill(pids[i], sig);
-    }
-}
-
-static int prepare_session(const fathom_config_t *cfg, bool verbose,
-                           fathom_session_t *session)
-{
-    memset(session, 0, sizeof(*session));
-
-    if (fathom_elf_open(&session->elf, cfg->target_path) < 0) {
-        fprintf(stderr, "fathom: failed to parse ELF: %s\n", cfg->target_path);
+    if (fathom_binary_open(&s->bin, cfg->target_path) < 0)
         return -1;
-    }
+    if (!quiet)
+        fprintf(stderr, "  binary: %s %s%s, entry 0x%" PRIx64 "\n",
+                fathom_format_name(s->bin.format), fathom_arch_name(s->bin.arch),
+                s->bin.relocatable ? " (relocatable)" : "", s->bin.entry);
 
-    fprintf(stderr, "  .text: 0x%lx (%lu bytes)\n",
-            (unsigned long)session->elf.text.addr,
-            (unsigned long)session->elf.text.size);
-
-    if (fathom_disasm_open(&session->dis, &session->elf) < 0) {
+    if (fathom_disasm_open(&s->dis, &s->bin) < 0) {
         fprintf(stderr, "fathom: disassembly failed\n");
-        cleanup_session(session);
-        return -1;
+        goto fail;
     }
-    fprintf(stderr, "  instructions: %zu\n", session->dis.count);
-
-    if (fathom_cfg_build(&session->cfg_graph, &session->dis) < 0) {
+    if (fathom_cfg_build(&s->cfg_graph, &s->dis) < 0) {
         fprintf(stderr, "fathom: CFG build failed\n");
-        cleanup_session(session);
-        return -1;
+        goto fail;
     }
-    fprintf(stderr, "  blocks: %zu, edges: %zu\n",
-            session->cfg_graph.block_count, session->cfg_graph.edge_count);
-
-    if (fathom_analyze(&session->ana, &session->cfg_graph,
-                       &session->elf, &session->dis) < 0) {
+    if (fathom_analyze(&s->ana, &s->cfg_graph, &s->bin, &s->dis) < 0) {
         fprintf(stderr, "fathom: analysis failed\n");
-        cleanup_session(session);
-        return -1;
+        goto fail;
     }
-    fprintf(stderr, "  scored blocks: %zu, dictionary: %zu entries\n",
-            session->ana.ranked_count, session->ana.dict.count);
+    if (!quiet)
+        fprintf(stderr, "  instructions: %zu, blocks: %zu (%zu instrumentable), "
+                        "scored: %zu, dictionary: %zu\n",
+                s->dis.count, s->cfg_graph.block_count, s->ana.cov_count,
+                s->ana.ranked_count, s->ana.dict.count);
 
-    if (cfg->dict_file) {
-        if (fathom_dict_load(&session->ana.dict, cfg->dict_file) < 0) {
-            fprintf(stderr, "fathom: failed to load dictionary: %s\n",
-                    cfg->dict_file);
-            cleanup_session(session);
-            return -1;
-        }
-
-        if (verbose)
-            fprintf(stderr, "  dict after load: %zu entries\n",
-                    session->ana.dict.count);
+    if (cfg->dict_file && fathom_dict_load(&s->ana.dict, cfg->dict_file) < 0) {
+        fprintf(stderr, "fathom: failed to load dictionary: %s\n", cfg->dict_file);
+        goto fail;
     }
-
     return 0;
+
+fail:
+    cleanup_session(s);
+    return -1;
 }
 
 /* ── Usage ───────────────────────────────────────────────────────────── */
@@ -288,6 +290,9 @@ static void usage(const char *prog)
         "  -o <dir>    Output directory (default: ./fathom-out)\n"
         "  -t <ms>     Timeout per exec (default: %d)\n"
         "  -j <n>      Parallel instances (default: %d)\n"
+        "  -T <secs>   Stop after this many seconds (default: run until Ctrl-C)\n"
+        "  -s <seed>   Random seed, for reproducible runs\n"
+        "  --until-crash  Stop after the first unique crash\n"
         "  -a          Analysis-only mode (print CFG + scores, no fuzzing)\n"
         "  -v          Verbose output\n"
         "  --dict <f>  Extra dictionary file\n"
@@ -297,98 +302,41 @@ static void usage(const char *prog)
 
 /* ── Analysis-only mode ──────────────────────────────────────────────── */
 
-static int run_analysis(const char *target_path, bool verbose)
+static int run_analysis(const fathom_config_t *cfg)
 {
-    fathom_elf_t elf;
-    if (fathom_elf_open(&elf, target_path) < 0) {
-        fprintf(stderr, "fathom: failed to parse ELF: %s\n", target_path);
+    fathom_session_t s;
+    if (prepare_session(cfg, true, &s) < 0)
         return 1;
-    }
-
-    if (verbose) {
-        fprintf(stderr, "  entry: 0x%lx\n", (unsigned long)elf.entry);
-        fprintf(stderr, "  .text: 0x%lx (%lu bytes)\n",
-                (unsigned long)elf.text.addr, (unsigned long)elf.text.size);
-        fprintf(stderr, "  symbols: %zu%s\n", elf.symbol_count,
-                elf.stripped ? " (stripped, using .dynsym)" : "");
-    }
-
-    fathom_disasm_t dis;
-    if (fathom_disasm_open(&dis, &elf) < 0) {
-        fprintf(stderr, "fathom: disassembly failed\n");
-        fathom_elf_close(&elf);
-        return 1;
-    }
-
-    if (verbose)
-        fprintf(stderr, "  instructions: %zu\n", dis.count);
-
-    fathom_cfg_t cfg;
-    if (fathom_cfg_build(&cfg, &dis) < 0) {
-        fprintf(stderr, "fathom: CFG build failed\n");
-        fathom_disasm_close(&dis);
-        fathom_elf_close(&elf);
-        return 1;
-    }
-
-    fathom_analysis_t ana;
-    if (fathom_analyze(&ana, &cfg, &elf, &dis) < 0) {
-        fprintf(stderr, "fathom: analysis failed\n");
-        fathom_cfg_free(&cfg);
-        fathom_disasm_close(&dis);
-        fathom_elf_close(&elf);
-        return 1;
-    }
-
-    fathom_analysis_print(&ana, &dis);
-
-    fathom_analysis_free(&ana);
-    fathom_cfg_free(&cfg);
-    fathom_disasm_close(&dis);
-    fathom_elf_close(&elf);
-
+    fathom_analysis_print(&s.ana, &s.bin, &s.dis);
+    cleanup_session(&s);
     return 0;
 }
 
 /* ── Worker fuzz loop ────────────────────────────────────────────────── */
 
-static int run_worker(const fathom_config_t *cfg,
-                      fathom_session_t *session,
-                      bool verbose,
-                      int worker_id,
-                      bool multi_worker,
-                      fathom_worker_report_t *report)
+static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
+                      fathom_session_t *session, int worker_id, bool multi)
 {
     int ret = 1;
+    char prefix_buf[16];
     const char *prefix = NULL;
-    char worker_prefix[16];
     fathom_coverage_t cov;
     fathom_corpus_t corpus;
     fathom_exec_t ex;
-    bool cov_ready = false;
-    bool corpus_ready = false;
-    bool ex_ready = false;
+    fathom_mutator_t mut;
+    bool cov_ready = false, corpus_ready = false, ex_ready = false;
     uint8_t *buf = NULL;
+    uint32_t *slot_block = NULL;
+    fathom_stats_t stats;
 
-    memset(report, 0, sizeof(*report));
-    memset(&cov, 0, sizeof(cov));
-    memset(&corpus, 0, sizeof(corpus));
-    memset(&ex, 0, sizeof(ex));
-    cov.shm_id = -1;
-    ex.fork_server_pid = -1;
-    ex.ctl_pipe[0] = ex.ctl_pipe[1] = -1;
-    ex.st_pipe[0] = ex.st_pipe[1] = -1;
-
-    g_stop = 0;
-    g_stop_signal = 0;
-
-    if (multi_worker) {
-        snprintf(worker_prefix, sizeof(worker_prefix), "[w%03d]", worker_id);
-        prefix = worker_prefix;
+    memset(&stats, 0, sizeof(stats));
+    if (multi) {
+        snprintf(prefix_buf, sizeof(prefix_buf), "[w%03d]", worker_id);
+        prefix = prefix_buf;
     }
 
     if (install_stop_handlers() < 0) {
-        perror("fathom: sigaction");
+        fprintf(stderr, "fathom: cannot install stop handlers\n");
         return 1;
     }
 
@@ -403,58 +351,40 @@ static int run_worker(const fathom_config_t *cfg,
         goto cleanup;
     }
     corpus_ready = true;
+    if (corpus.count == 0 && fathom_corpus_add(&corpus, (const uint8_t *)"AAAA", 4, 0, 0) < 0)
+        goto cleanup;
 
-    if (corpus.count == 0) {
-        const uint8_t seed[] = "AAAA";
-        if (fathom_corpus_add(&corpus, seed, sizeof(seed) - 1, 0) < 0) {
-            fprintf(stderr, "fathom: failed to create fallback seed\n");
-            goto cleanup;
-        }
-        if (verbose && !multi_worker)
-            fprintf(stderr, "  no seeds found, using default\n");
-    }
-
-    if (multi_worker && verbose) {
-        fprintf(stderr, "%s seeds: %zu, output: %s\n",
-                prefix, corpus.count, cfg->output_dir);
-    } else if (!multi_worker) {
-        fprintf(stderr, "  seeds: %zu\n", corpus.count);
-    }
-
-    fathom_mutator_t mut;
     fathom_mutator_init(&mut, &session->ana.dict);
+    if (opts->have_seed)
+        fathom_mutator_seed(&mut, opts->seed + (uint64_t)worker_id);
 
-    if (fathom_exec_init(&ex, cfg) < 0) {
+    if (fathom_exec_init(&ex, cfg, &session->bin) < 0) {
         fprintf(stderr, "fathom: executor init failed\n");
         goto cleanup;
     }
     ex_ready = true;
 
-    size_t bp_limit = session->ana.ranked_count < MAX_BREAKPOINTS
-                    ? session->ana.ranked_count : MAX_BREAKPOINTS;
-    for (size_t i = 0; i < bp_limit; i++) {
-        uint32_t bid = session->ana.ranked_blocks[i];
-        if (fathom_exec_add_breakpoint(&ex,
-                session->cfg_graph.blocks[bid].start_addr) < 0) {
+    /* One breakpoint per instrumentable block; slot i ↔ cov_blocks[i]. */
+    slot_block = malloc((session->ana.cov_count + 1) * sizeof(*slot_block));
+    if (!slot_block)
+        goto cleanup;
+    for (size_t i = 0; i < session->ana.cov_count; i++) {
+        uint32_t bid = session->ana.cov_blocks[i];
+        int slot = fathom_exec_add_breakpoint(&ex, session->cfg_graph.blocks[bid].start_addr);
+        if (slot < 0) {
             fprintf(stderr, "fathom: breakpoint setup failed\n");
             goto cleanup;
         }
+        slot_block[slot] = bid;
     }
+    stats.instrumented = ex.bp_count;
 
-    if (verbose) {
-        if (multi_worker)
-            fprintf(stderr, "%s breakpoints: %zu\n", prefix, ex.bp_count);
-        else
-            fprintf(stderr, "  breakpoints: %zu\n", ex.bp_count);
-    }
-
-    if (!multi_worker)
-        fprintf(stderr, "\nfuzzing started (Ctrl-C to stop)...\n\n");
-
-    fathom_stats_t stats;
-    memset(&stats, 0, sizeof(stats));
-    stats.corpus_size = corpus.count;
-    gettimeofday(&stats.start, NULL);
+    if (!multi)
+        fprintf(stderr, "  seeds: %zu, breakpoints: %zu\n\nfuzzing started%s...\n\n",
+                corpus.count, ex.bp_count,
+                opts->max_secs ? "" : " (Ctrl-C to stop)");
+    else if (cfg->verbose)
+        fprintf(stderr, "%s seeds: %zu, output: %s\n", prefix, corpus.count, cfg->output_dir);
 
     buf = malloc(MAX_INPUT_SIZE);
     if (!buf) {
@@ -462,53 +392,54 @@ static int run_worker(const fathom_config_t *cfg,
         goto cleanup;
     }
 
-    struct timeval last_status;
-    gettimeofday(&last_status, NULL);
+    stats.corpus_size = corpus.count;
+    stats.start_us = fathom_now_us();
+    uint64_t last_status = stats.start_us;
+    uint64_t deadline = opts->max_secs
+                      ? stats.start_us + (uint64_t)opts->max_secs * 1000000u : 0;
 
-    while (!g_stop) {
-        fathom_input_t *seed = fathom_corpus_next(&corpus);
-        if (!seed) {
-            const uint8_t fallback[] = "AAAA";
-            if (fathom_corpus_add(&corpus, fallback, sizeof(fallback) - 1, 0) < 0) {
-                fprintf(stderr, "fathom: failed to replenish corpus\n");
-                goto cleanup;
-            }
-            stats.corpus_size = corpus.count;
-            continue;
+    while (!stop_requested()) {
+        uint64_t now = fathom_now_us();
+        if (deadline && now >= deadline)
+            break;
+        if (now - last_status >= STATS_INTERVAL_US) {
+            print_status(&stats, prefix, !multi);
+            last_status = now;
         }
 
-        size_t len = seed->len;
-        if (len > MAX_INPUT_SIZE)
-            len = MAX_INPUT_SIZE;
+        fathom_input_t *seed = fathom_corpus_next(&corpus);
+        size_t len = seed->len < MAX_INPUT_SIZE ? seed->len : MAX_INPUT_SIZE;
         memcpy(buf, seed->data, len);
 
-        int strategy = fathom_mutate(&mut, buf, &len, MAX_INPUT_SIZE, NULL, 0);
+        const fathom_input_t *donor =
+            &corpus.inputs[fathom_rand_below(&mut, (uint32_t)corpus.count)];
+        bool can_splice = corpus.count > 1 && donor != seed;
+        int strategy = fathom_mutate(&mut, buf, &len, MAX_INPUT_SIZE,
+                                     can_splice ? donor->data : NULL,
+                                     can_splice ? donor->len : 0);
 
         fathom_exec_result_t result;
+        stats.total_execs++;
         if (fathom_exec_run(&ex, &cov, buf, len, &result) < 0) {
-            if (verbose) {
-                if (multi_worker)
-                    fprintf(stderr, "%s exec error, continuing...\n", prefix);
-                else
-                    fprintf(stderr, "\nexec error, continuing...\n");
-            }
-            stats.total_execs++;
-            continue;
+            fprintf(stderr, "%sfathom: target execution failed\n", multi ? "" : "\n");
+            goto cleanup;
         }
 
-        stats.total_execs++;
-
         if (fathom_coverage_has_new(&cov)) {
+            /* Weight new blocks by their static score before merging. */
+            double score = 0.0;
+            for (size_t s = 0; s < ex.bp_count; s++) {
+                if (cov.local[s] && !cov.global[s])
+                    score += session->cfg_graph.blocks[slot_block[s]].score;
+            }
             fathom_coverage_merge(&cov);
-            stats.total_edges = cov.total_edges;
-            stats.last_new_cov_exec = stats.total_execs;
+            stats.covered = cov.total_blocks;
 
-            if (fathom_corpus_add(&corpus, buf, len, cov.new_edges) < 0) {
+            if (fathom_corpus_add(&corpus, buf, len, cov.new_blocks, score) < 0) {
                 fprintf(stderr, "fathom: failed to add interesting input\n");
                 goto cleanup;
             }
             stats.corpus_size = corpus.count;
-
             if (strategy >= 0 && strategy < FATHOM_MUT_COUNT)
                 fathom_mutator_reward(&mut, (fathom_mutation_t)strategy);
         }
@@ -516,355 +447,309 @@ static int run_worker(const fathom_config_t *cfg,
         if (result.status == FATHOM_EXIT_CRASH) {
             stats.crashes++;
             size_t prev = corpus.unique_crashes;
-            if (fathom_corpus_save_crash(&corpus, buf, len,
-                                         result.crash_hash) < 0) {
+            if (fathom_corpus_save_crash(&corpus, buf, len, result.crash_hash) < 0) {
                 fprintf(stderr, "fathom: failed to save crash\n");
                 goto cleanup;
             }
             stats.unique_crashes = corpus.unique_crashes;
-
-            if (corpus.unique_crashes > prev) {
-                if (multi_worker) {
-                    fprintf(stderr,
-                            "%s new crash: signal=%d hash=0x%lx\n",
-                            prefix, result.signal,
-                            (unsigned long)result.crash_hash);
-                } else {
-                    fprintf(stderr,
-                            "\n*** NEW CRASH: signal=%d hash=0x%lx ***\n",
-                            result.signal,
-                            (unsigned long)result.crash_hash);
-                }
+            if (corpus.unique_crashes > prev && stats.first_crash_execs == 0) {
+                stats.first_crash_execs = stats.total_execs;
+                stats.first_crash_ms = (fathom_now_us() - stats.start_us) / 1000;
             }
+            if (corpus.unique_crashes > prev) {
+                char what[48];
+                describe_crash(what, sizeof(what), result.crash_code);
+                if (multi)
+                    fprintf(stderr, "%s new crash: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 "\n",
+                            prefix, what, result.crash_pc, result.crash_hash);
+                else
+                    fprintf(stderr, "\n*** NEW CRASH: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 " ***\n",
+                            what, result.crash_pc, result.crash_hash);
+            }
+            if (opts->until_crash && corpus.unique_crashes > 0)
+                break;
         } else if (result.status == FATHOM_EXIT_HANG) {
             stats.hangs++;
         }
-
-        struct timeval now;
-        gettimeofday(&now, NULL);
-        long diff_ms = (now.tv_sec - last_status.tv_sec) * 1000
-                     + (now.tv_usec - last_status.tv_usec) / 1000;
-        if (diff_ms >= STATS_INTERVAL_MS) {
-            print_status(&stats, prefix, !multi_worker);
-            last_status = now;
-        }
     }
 
-    if (!multi_worker) {
-        fprintf(stderr, "\n\n");
-        fprintf(stderr, "=== Fathom session complete ===\n");
-        fprintf(stderr, "  total execs:    %lu\n",
-                (unsigned long)stats.total_execs);
-        fprintf(stderr, "  coverage edges: %zu\n", stats.total_edges);
+    if (!multi) {
+        fprintf(stderr, "\n\n=== Fathom session complete ===\n");
+        fprintf(stderr, "  total execs:    %" PRIu64 "\n", stats.total_execs);
+        fprintf(stderr, "  coverage:       %zu/%zu blocks\n", stats.covered, stats.instrumented);
         fprintf(stderr, "  corpus size:    %zu\n", corpus.count);
-        fprintf(stderr, "  crashes:        %lu (%lu unique)\n",
-                (unsigned long)stats.crashes,
-                (unsigned long)stats.unique_crashes);
-        fprintf(stderr, "  hangs:          %lu\n",
-                (unsigned long)stats.hangs);
+        fprintf(stderr, "  crashes:        %" PRIu64 " (%" PRIu64 " unique)\n",
+                stats.crashes, stats.unique_crashes);
+        fprintf(stderr, "  hangs:          %" PRIu64 "\n", stats.hangs);
         fprintf(stderr, "  output dir:     %s\n", cfg->output_dir);
     }
-
-    report->total_execs = stats.total_execs;
-    report->crashes = stats.crashes;
-    report->unique_crashes = stats.unique_crashes;
-    report->hangs = stats.hangs;
-    report->corpus_size = corpus.count;
-    report->total_edges = stats.total_edges;
-    report->exit_code = 0;
     ret = 0;
 
 cleanup:
+    if (corpus_ready) {
+        stats.corpus_size = corpus.count;
+        write_stats(cfg->output_dir, &stats);
+    }
     free(buf);
+    free(slot_block);
     if (ex_ready)
         fathom_exec_destroy(&ex);
     if (corpus_ready)
         fathom_corpus_destroy(&corpus);
     if (cov_ready)
         fathom_coverage_destroy(&cov);
-
     return ret;
 }
 
 /* ── Parallel supervisor ─────────────────────────────────────────────── */
 
-static int run_parallel_fuzzer(const fathom_config_t *cfg,
-                               fathom_session_t *session,
-                               bool verbose)
+#ifdef _WIN32
+
+/* Windows has no fork: re-run this executable once per worker. */
+static int spawn_workers(const fathom_opts_t *opts, int argc, char **argv,
+                         HANDLE *procs, uint32_t jobs)
 {
-    int ret = 1;
-    pid_t *worker_pids = NULL;
-    int *report_fds = NULL;
-    fathom_worker_report_t *reports = NULL;
-    bool *have_report = NULL;
-    bool forwarded_stop = false;
-    bool unexpected_fail = false;
+    char exe[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, exe, sizeof(exe)))
+        return 0;
+
+    /* exe --worker <id>:<stop event> <original arguments...> */
+    char **wargv = calloc((size_t)argc + 3, sizeof(*wargv));
+    char idarg[96];
+    if (!wargv)
+        return 0;
+    wargv[0] = exe;
+    wargv[1] = "--worker";
+    wargv[2] = idarg;
+    for (int a = 1; a < argc; a++)
+        wargv[a + 2] = argv[a];
+
     uint32_t launched = 0;
-    uint32_t remaining = 0;
+    for (uint32_t i = 0; i < jobs; i++) {
+        snprintf(idarg, sizeof(idarg), "%u:%s", i, opts->stop_event);
+        char *cmd = fathom_win_cmdline(wargv);
+        if (!cmd)
+            break;
 
-    if (ensure_dir(cfg->output_dir) < 0)
-        return 1;
-
-    if (install_stop_handlers() < 0) {
-        perror("fathom: sigaction");
-        return 1;
-    }
-
-    worker_pids = calloc(cfg->jobs, sizeof(*worker_pids));
-    report_fds = malloc(cfg->jobs * sizeof(*report_fds));
-    reports = calloc(cfg->jobs, sizeof(*reports));
-    have_report = calloc(cfg->jobs, sizeof(*have_report));
-    if (!worker_pids || !report_fds || !reports || !have_report) {
-        fprintf(stderr, "fathom: out of memory\n");
-        goto cleanup;
-    }
-
-    for (uint32_t i = 0; i < cfg->jobs; i++)
-        report_fds[i] = -1;
-
-    fprintf(stderr, "  workers: %u\n", cfg->jobs);
-    fprintf(stderr, "\nstarting %u workers (Ctrl-C to stop)...\n\n", cfg->jobs);
-    fflush(stderr);
-
-    for (uint32_t i = 0; i < cfg->jobs; i++) {
-        int pipefd[2];
-        if (pipe(pipefd) < 0) {
-            perror("fathom: pipe");
-            unexpected_fail = true;
+        STARTUPINFOA si = { .cb = sizeof(si) };
+        PROCESS_INFORMATION pi;
+        BOOL started = CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+        free(cmd);
+        if (!started) {
+            fprintf(stderr, "fathom: cannot start worker %u (%lu)\n", i, GetLastError());
             break;
         }
+        CloseHandle(pi.hThread);
+        procs[launched++] = pi.hProcess;
+    }
+    free(wargv);
+    return (int)launched;
+}
 
+static bool supervise(const fathom_opts_t *opts, int argc, char **argv, uint32_t jobs)
+{
+    HANDLE procs[MAX_WORKERS];
+    bool failed = false;
+
+    g_stop_event = CreateEventA(NULL, TRUE, FALSE, opts->stop_event);
+    int launched = spawn_workers(opts, argc, argv, procs, jobs);
+    if ((uint32_t)launched < jobs)
+        failed = true;
+
+    bool signalled = false;
+    for (int alive = launched; alive > 0;) {
+        if ((stop_requested() || failed) && !signalled) {
+            SetEvent(g_stop_event);
+            signalled = true;
+        }
+        DWORD w = WaitForMultipleObjects((DWORD)launched, procs, FALSE, 200);
+        if (w >= WAIT_OBJECT_0 && w < WAIT_OBJECT_0 + (DWORD)launched) {
+            DWORD idx = w - WAIT_OBJECT_0, code = 1;
+            GetExitCodeProcess(procs[idx], &code);
+            failed |= code != 0;
+            CloseHandle(procs[idx]);
+            procs[idx] = procs[--launched];
+            alive--;
+        }
+    }
+    CloseHandle(g_stop_event);
+    return !failed;
+}
+
+#else
+
+static bool supervise(const fathom_opts_t *opts, const fathom_config_t *cfg,
+                      fathom_session_t *session, uint32_t jobs)
+{
+    pid_t pids[MAX_WORKERS];
+    uint32_t launched = 0, alive;
+    bool failed = false, forwarded = false;
+
+    for (uint32_t i = 0; i < jobs; i++) {
         pid_t pid = fork();
         if (pid < 0) {
             perror("fathom: fork");
-            close(pipefd[0]);
-            close(pipefd[1]);
-            unexpected_fail = true;
+            failed = true;
             break;
         }
-
         if (pid == 0) {
-            char worker_output_dir[FATHOM_PATH_MAX];
-            fathom_config_t worker_cfg = *cfg;
-            fathom_worker_report_t report;
-            int exit_code;
-
-            close(pipefd[0]);
-
-            if (build_worker_output_dir(worker_output_dir,
-                                        sizeof(worker_output_dir),
-                                        cfg->output_dir, i) < 0) {
-                close(pipefd[1]);
+            char dir[FATHOM_PATH_MAX];
+            fathom_config_t wcfg = *cfg;
+            if (worker_dir(dir, sizeof(dir), cfg->output_dir, i) < 0)
                 _exit(1);
+            wcfg.output_dir = dir;
+            wcfg.jobs = 1;
+            _exit(run_worker(opts, &wcfg, session, (int)i, true));
+        }
+        pids[launched++] = pid;
+    }
+
+    for (alive = launched; alive > 0;) {
+        if ((g_stop || failed) && !forwarded) {
+            int sig = g_stop_signal ? (int)g_stop_signal : SIGTERM;
+            for (uint32_t i = 0; i < launched; i++) {
+                if (pids[i] > 0)
+                    kill(pids[i], sig);
             }
-
-            worker_cfg.output_dir = worker_output_dir;
-            worker_cfg.jobs = 1;
-            exit_code = run_worker(&worker_cfg, session, verbose,
-                                   (int)i, true, &report);
-            report.exit_code = exit_code;
-
-            if (write_full(pipefd[1], &report, sizeof(report)) < 0) {
-                close(pipefd[1]);
-                _exit(exit_code ? exit_code : 1);
-            }
-
-            close(pipefd[1]);
-            _exit(exit_code);
+            forwarded = true;
         }
 
-        close(pipefd[1]);
-        worker_pids[i] = pid;
-        report_fds[i] = pipefd[0];
-        launched++;
-    }
-
-    remaining = launched;
-
-    if (unexpected_fail && launched > 0 && !forwarded_stop) {
-        forward_stop_to_workers(worker_pids, launched);
-        forwarded_stop = true;
-    }
-
-    while (remaining > 0) {
-        int status = 0;
+        int status;
         pid_t pid = waitpid(-1, &status, 0);
         if (pid < 0) {
-            if (errno == EINTR) {
-                if (g_stop && !forwarded_stop) {
-                    forward_stop_to_workers(worker_pids, launched);
-                    forwarded_stop = true;
-                }
+            if (errno == EINTR)
                 continue;
-            }
-
-            perror("fathom: waitpid");
-            unexpected_fail = true;
             break;
         }
-
-        uint32_t idx;
-        for (idx = 0; idx < launched; idx++) {
-            if (worker_pids[idx] == pid)
-                break;
-        }
-        if (idx == launched)
-            continue;
-
-        worker_pids[idx] = -1;
-        remaining--;
-
-        if (report_fds[idx] >= 0) {
-            ssize_t n = read_full(report_fds[idx], &reports[idx],
-                                  sizeof(reports[idx]));
-            close(report_fds[idx]);
-            report_fds[idx] = -1;
-            if (n == (ssize_t)sizeof(reports[idx]))
-                have_report[idx] = true;
-        }
-
-        if (WIFSIGNALED(status)) {
-            unexpected_fail = true;
-            if (!forwarded_stop && remaining > 0) {
-                forward_stop_to_workers(worker_pids, launched);
-                forwarded_stop = true;
-            }
-            continue;
-        }
-
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            unexpected_fail = true;
-            if (!forwarded_stop && remaining > 0) {
-                forward_stop_to_workers(worker_pids, launched);
-                forwarded_stop = true;
+        for (uint32_t i = 0; i < launched; i++) {
+            if (pids[i] == pid) {
+                pids[i] = -1;
+                alive--;
+                failed |= !WIFEXITED(status) || WEXITSTATUS(status) != 0;
             }
         }
     }
-
-    for (uint32_t i = 0; i < launched; i++) {
-        if (report_fds[i] >= 0) {
-            close(report_fds[i]);
-            report_fds[i] = -1;
-        }
-    }
-
-    if (remaining > 0) {
-        forward_stop_to_workers(worker_pids, launched);
-        while (remaining > 0) {
-            if (waitpid(-1, NULL, 0) > 0)
-                remaining--;
-            else if (errno != EINTR)
-                break;
-        }
-    }
-
-    fprintf(stderr, "\n=== Fathom session complete ===\n");
-    fprintf(stderr, "  workers:        %u\n", cfg->jobs);
-
-    uint64_t total_execs = 0;
-    uint64_t total_crashes = 0;
-    uint64_t total_hangs = 0;
-    for (uint32_t i = 0; i < launched; i++) {
-        if (!have_report[i])
-            continue;
-        total_execs += reports[i].total_execs;
-        total_crashes += reports[i].crashes;
-        total_hangs += reports[i].hangs;
-    }
-
-    fprintf(stderr, "  total execs:    %lu\n", (unsigned long)total_execs);
-    fprintf(stderr, "  crashes:        %lu\n", (unsigned long)total_crashes);
-    fprintf(stderr, "  hangs:          %lu\n", (unsigned long)total_hangs);
-    fprintf(stderr, "  output dir:     %s\n", cfg->output_dir);
-    fprintf(stderr, "  worker stats:\n");
-
-    for (uint32_t i = 0; i < launched; i++) {
-        char worker_output_dir[FATHOM_PATH_MAX];
-        if (build_worker_output_dir(worker_output_dir,
-                                    sizeof(worker_output_dir),
-                                    cfg->output_dir, i) < 0) {
-            strcpy(worker_output_dir, "<path error>");
-        }
-
-        if (!have_report[i]) {
-            fprintf(stderr,
-                    "    worker-%03u: no report (%s)\n",
-                    i, worker_output_dir);
-            continue;
-        }
-
-        fprintf(stderr,
-                "    worker-%03u: coverage=%zu edges | corpus=%zu | output=%s\n",
-                i, reports[i].total_edges, reports[i].corpus_size,
-                worker_output_dir);
-    }
-
-    ret = unexpected_fail ? 1 : 0;
-
-cleanup:
-    free(have_report);
-    free(reports);
-    free(report_fds);
-    free(worker_pids);
-    return ret;
+    return !failed;
 }
 
-/* ── Fuzzer entrypoint ───────────────────────────────────────────────── */
+#endif
 
-static int run_fuzzer(const fathom_config_t *cfg, bool verbose)
+static int run_parallel(const fathom_opts_t *opts, int argc, char **argv,
+                        fathom_session_t *session)
 {
-    int ret;
-    fathom_session_t session;
+    const fathom_config_t *cfg = &opts->cfg;
+    uint32_t jobs = cfg->jobs;
 
-    g_stop = 0;
-    g_stop_signal = 0;
-
-    fprintf(stderr, FATHOM_BANNER,
-            FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR, FATHOM_VERSION_PATCH);
-    fprintf(stderr, "target: %s\n", cfg->target_path);
-
-    if (prepare_session(cfg, verbose, &session) < 0)
+    if (jobs > MAX_WORKERS) {
+        fprintf(stderr, "fathom: at most %d workers are supported\n", MAX_WORKERS);
+        return 1;
+    }
+    if (ensure_dir(cfg->output_dir) < 0 || install_stop_handlers() < 0)
         return 1;
 
-    if (cfg->jobs > 1)
-        ret = run_parallel_fuzzer(cfg, &session, verbose);
-    else {
-        fathom_worker_report_t report;
-        ret = run_worker(cfg, &session, verbose, 0, false, &report);
+    fprintf(stderr, "  workers: %u\n\nstarting %u workers%s...\n\n", jobs, jobs,
+            opts->max_secs ? "" : " (Ctrl-C to stop)");
+    fflush(stderr);
+
+#ifdef _WIN32
+    (void)session;
+    bool ok = supervise(opts, argc, argv, jobs);
+#else
+    (void)argc;
+    (void)argv;
+    bool ok = supervise(opts, cfg, session, jobs);
+#endif
+
+    fathom_stats_t total, w;
+    memset(&total, 0, sizeof(total));
+    fprintf(stderr, "\n=== Fathom session complete ===\n  workers:        %u\n", jobs);
+
+    char lines[MAX_WORKERS][160];
+    for (uint32_t i = 0; i < jobs; i++) {
+        char dir[FATHOM_PATH_MAX];
+        if (worker_dir(dir, sizeof(dir), cfg->output_dir, i) < 0 || !read_stats(dir, &w)) {
+            snprintf(lines[i], sizeof(lines[i]), "    worker-%03u: no report", i);
+            continue;
+        }
+        total.total_execs += w.total_execs;
+        total.crashes += w.crashes;
+        total.hangs += w.hangs;
+        snprintf(lines[i], sizeof(lines[i]),
+                 "    worker-%03u: coverage=%zu/%zu blocks | corpus=%zu | crashes=%" PRIu64,
+                 i, w.covered, w.instrumented, w.corpus_size, w.unique_crashes);
     }
 
-    cleanup_session(&session);
-    return ret;
+    fprintf(stderr, "  total execs:    %" PRIu64 "\n", total.total_execs);
+    fprintf(stderr, "  crashes:        %" PRIu64 "\n", total.crashes);
+    fprintf(stderr, "  hangs:          %" PRIu64 "\n", total.hangs);
+    fprintf(stderr, "  output dir:     %s\n  worker stats:\n", cfg->output_dir);
+    for (uint32_t i = 0; i < jobs; i++)
+        fprintf(stderr, "%s\n", lines[i]);
+
+    return ok ? 0 : 1;
 }
 
 /* ── Main ────────────────────────────────────────────────────────────── */
 
+static uint32_t parse_u32(const char *s, const char *what, bool *ok)
+{
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 0);
+    if (errno || *end || v > UINT32_MAX) {
+        fprintf(stderr, "fathom: invalid %s: %s\n", what, s);
+        *ok = false;
+    }
+    return (uint32_t)v;
+}
+
 int main(int argc, char *argv[])
 {
-    const char *input_dir  = NULL;
-    const char *output_dir = "./fathom-out";
-    const char *dict_file  = NULL;
-    uint32_t    timeout_ms = DEFAULT_TIMEOUT_MS;
-    uint32_t    jobs       = DEFAULT_JOBS;
-    bool        analysis   = false;
-    bool        verbose    = false;
+    fathom_opts_t opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.worker_id = -1;
+    opts.cfg.output_dir = "./fathom-out";
+    opts.cfg.timeout_ms = DEFAULT_TIMEOUT_MS;
+    opts.cfg.jobs = DEFAULT_JOBS;
+    bool ok = true;
 
     static struct option long_opts[] = {
-        {"dict", required_argument, NULL, 'D'},
-        {"help", no_argument,       NULL, 'h'},
+        {"dict",     required_argument, NULL, 'D'},
+        {"help",     no_argument,       NULL, 'h'},
+        {"max-time", required_argument, NULL, 'T'},
+        {"seed",     required_argument, NULL, 's'},
+        {"until-crash", no_argument,    NULL, 'U'},
+        {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
         {NULL, 0, NULL, 0},
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:o:t:j:avh", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "+i:o:t:j:T:s:avh", long_opts, NULL)) != -1) {
         switch (opt) {
-        case 'i': input_dir  = optarg;                 break;
-        case 'o': output_dir = optarg;                 break;
-        case 't': timeout_ms = (uint32_t)atoi(optarg); break;
-        case 'j': jobs       = (uint32_t)atoi(optarg); break;
-        case 'a': analysis   = true;                   break;
-        case 'v': verbose    = true;                   break;
-        case 'D': dict_file  = optarg;                 break;
+        case 'i': opts.cfg.input_dir  = optarg; break;
+        case 'o': opts.cfg.output_dir = optarg; break;
+        case 't': opts.cfg.timeout_ms = parse_u32(optarg, "timeout", &ok); break;
+        case 'j': opts.cfg.jobs       = parse_u32(optarg, "job count", &ok); break;
+        case 'T': opts.max_secs       = parse_u32(optarg, "time limit", &ok); break;
+        case 's':
+            opts.seed = strtoull(optarg, NULL, 0);
+            opts.have_seed = true;
+            break;
+        case 'U': opts.until_crash = true; break;
+        case 'a': opts.cfg.analysis_only = true; break;
+        case 'v': opts.cfg.verbose = true; break;
+        case 'D': opts.cfg.dict_file = optarg; break;
+        case 'W': {
+            unsigned id = 0;
+            char ev[64] = "";
+            if (sscanf(optarg, "%u:%63s", &id, ev) != 2) {
+                ok = false;
+                break;
+            }
+            opts.worker_id = (int)id;
+            snprintf(opts.stop_event, sizeof(opts.stop_event), "%s", ev);
+            break;
+        }
         case 'h':
             usage(argv[0]);
             return 0;
@@ -874,39 +759,59 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (jobs == 0) {
+    if (!ok)
+        return 1;
+    if (opts.cfg.jobs == 0) {
         fprintf(stderr, "fathom: -j must be at least 1\n");
         return 1;
     }
-
-    /* After '--', remaining args are the target command */
     if (optind >= argc) {
         fprintf(stderr, "fathom: no target specified\n\n");
         usage(argv[0]);
         return 1;
     }
 
-    const char *target_path = argv[optind];
+    opts.cfg.target_path = argv[optind];
+    opts.cfg.target_argv = &argv[optind];
 
-    if (analysis) {
+    bool worker = opts.worker_id >= 0;
+    if (!worker) {
         fprintf(stderr, FATHOM_BANNER,
-                FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR,
-                FATHOM_VERSION_PATCH);
-        fprintf(stderr, "analysis mode: %s\n\n", target_path);
-        return run_analysis(target_path, verbose);
+                FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR, FATHOM_VERSION_PATCH);
+        fprintf(stderr, "target: %s\n", opts.cfg.target_path);
+    }
+    if (opts.cfg.analysis_only)
+        return run_analysis(&opts.cfg);
+
+    fathom_session_t session;
+    if (prepare_session(&opts.cfg, worker, &session) < 0)
+        return 1;
+
+    int ret;
+    if (worker) {
+#ifdef _WIN32
+        char dir[FATHOM_PATH_MAX];
+        fathom_config_t wcfg = opts.cfg;
+        g_stop_event = OpenEventA(SYNCHRONIZE, FALSE, opts.stop_event);
+        ret = worker_dir(dir, sizeof(dir), opts.cfg.output_dir, (uint32_t)opts.worker_id);
+        if (ret == 0) {
+            wcfg.output_dir = dir;
+            wcfg.jobs = 1;
+            ret = run_worker(&opts, &wcfg, &session, opts.worker_id, true);
+        }
+#else
+        ret = 1;   /* POSIX workers are forked, never launched by flag */
+#endif
+    } else if (opts.cfg.jobs > 1) {
+#ifdef _WIN32
+        snprintf(opts.stop_event, sizeof(opts.stop_event), "Local\\fathom-stop-%lu",
+                 GetCurrentProcessId());
+#endif
+        ret = run_parallel(&opts, argc, argv, &session);
+    } else {
+        ret = run_worker(&opts, &opts.cfg, &session, 0, false);
     }
 
-    fathom_config_t cfg = {
-        .target_path   = target_path,
-        .target_argv   = &argv[optind],
-        .input_dir     = input_dir,
-        .output_dir    = output_dir,
-        .dict_file     = dict_file,
-        .timeout_ms    = timeout_ms,
-        .jobs          = jobs,
-        .analysis_only = false,
-        .verbose       = verbose,
-    };
-
-    return run_fuzzer(&cfg, verbose);
+    cleanup_session(&session);
+    return ret;
 }

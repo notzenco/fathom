@@ -6,15 +6,13 @@
  */
 
 #include "mutate.h"
+#include "osdep.h"
 
 #include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
 
 /* ── Interesting values ──────────────────────────────────────────────── */
 
@@ -37,57 +35,73 @@ static const int32_t interesting_32[] = {
 
 /* ── Random helpers ──────────────────────────────────────────────────── */
 
-static uint32_t rand_below(uint32_t limit)
+/* xorshift64*: fast, seedable, and identical on every platform. */
+static uint64_t rng_next(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+static uint32_t rand_below(uint64_t *rng, uint32_t limit)
 {
     if (limit <= 1)
         return 0;
-    return (uint32_t)(rand() % limit);
+    return (uint32_t)((rng_next(rng) >> 32) % limit);
+}
+
+uint32_t fathom_rand_below(fathom_mutator_t *mut, uint32_t limit)
+{
+    return rand_below(&mut->rng, limit);
 }
 
 /* ── Strategy: bitflip ───────────────────────────────────────────────── */
 
-static void mutate_bitflip(uint8_t *buf, size_t len)
+static void mutate_bitflip(uint64_t *rng, uint8_t *buf, size_t len)
 {
     if (len == 0)
         return;
 
-    uint32_t count = 1 + rand_below(4);  /* flip 1-4 bits */
+    uint32_t count = 1 + rand_below(rng, 4);  /* flip 1-4 bits */
     for (uint32_t i = 0; i < count; i++) {
-        size_t byte_pos = rand_below((uint32_t)len);
-        uint8_t bit = 1u << rand_below(8);
+        size_t byte_pos = rand_below(rng, (uint32_t)len);
+        uint8_t bit = 1u << rand_below(rng, 8);
         buf[byte_pos] ^= bit;
     }
 }
 
 /* ── Strategy: byteflip ─────────────────────────────────────────────── */
 
-static void mutate_byteflip(uint8_t *buf, size_t len)
+static void mutate_byteflip(uint64_t *rng, uint8_t *buf, size_t len)
 {
     if (len == 0)
         return;
 
-    uint32_t count = 1 + rand_below(4);  /* flip 1-4 bytes */
+    uint32_t count = 1 + rand_below(rng, 4);  /* flip 1-4 bytes */
     for (uint32_t i = 0; i < count; i++) {
-        size_t pos = rand_below((uint32_t)len);
+        size_t pos = rand_below(rng, (uint32_t)len);
         buf[pos] ^= 0xFF;
     }
 }
 
 /* ── Strategy: arithmetic ────────────────────────────────────────────── */
 
-static void mutate_arith(uint8_t *buf, size_t len)
+static void mutate_arith(uint64_t *rng, uint8_t *buf, size_t len)
 {
     if (len == 0)
         return;
 
-    size_t pos = rand_below((uint32_t)len);
-    int32_t delta = (int32_t)(rand_below(FATHOM_ARITH_MAX * 2 + 1))
+    size_t pos = rand_below(rng, (uint32_t)len);
+    int32_t delta = (int32_t)(rand_below(rng, FATHOM_ARITH_MAX * 2 + 1))
                     - FATHOM_ARITH_MAX;
     if (delta == 0)
         delta = 1;
 
     /* Choose byte or word granularity. */
-    uint32_t width = rand_below(3);  /* 0 = byte, 1 = word16, 2 = dword32 */
+    uint32_t width = rand_below(rng, 3);  /* 0 = byte, 1 = word16, 2 = dword32 */
 
     if (width == 0 || len < 2) {
         /* Byte arithmetic. */
@@ -113,51 +127,51 @@ static void mutate_arith(uint8_t *buf, size_t len)
 
 /* ── Strategy: interesting values ────────────────────────────────────── */
 
-static void mutate_interesting(uint8_t *buf, size_t len)
+static void mutate_interesting(uint64_t *rng, uint8_t *buf, size_t len)
 {
     if (len == 0)
         return;
 
-    uint32_t width = rand_below(3);  /* 0 = 8-bit, 1 = 16-bit, 2 = 32-bit */
+    uint32_t width = rand_below(rng, 3);  /* 0 = 8-bit, 1 = 16-bit, 2 = 32-bit */
 
     if (width == 0 || len < 2) {
-        size_t pos = rand_below((uint32_t)len);
-        int8_t val = interesting_8[rand_below(ARRAY_LEN(interesting_8))];
+        size_t pos = rand_below(rng, (uint32_t)len);
+        int8_t val = interesting_8[rand_below(rng, ARRAY_LEN(interesting_8))];
         buf[pos] = (uint8_t)val;
     } else if (width == 1 || len < 4) {
-        size_t pos = rand_below((uint32_t)(len - 1));
-        int16_t val = interesting_16[rand_below(ARRAY_LEN(interesting_16))];
+        size_t pos = rand_below(rng, (uint32_t)(len - 1));
+        int16_t val = interesting_16[rand_below(rng, ARRAY_LEN(interesting_16))];
         memcpy(buf + pos, &val, 2);
     } else {
-        size_t pos = rand_below((uint32_t)(len - 3));
-        int32_t val = interesting_32[rand_below(ARRAY_LEN(interesting_32))];
+        size_t pos = rand_below(rng, (uint32_t)(len - 3));
+        int32_t val = interesting_32[rand_below(rng, ARRAY_LEN(interesting_32))];
         memcpy(buf + pos, &val, 4);
     }
 }
 
 /* ── Strategy: dictionary ────────────────────────────────────────────── */
 
-static void mutate_dictionary(uint8_t *buf, size_t *len, size_t max_len,
+static void mutate_dictionary(uint64_t *rng, uint8_t *buf, size_t *len, size_t max_len,
                               const fathom_dict_t *dict)
 {
     if (!dict || dict->count == 0 || *len == 0)
         return;
 
     const fathom_dict_entry_t *ent =
-        &dict->entries[rand_below((uint32_t)dict->count)];
+        &dict->entries[rand_below(rng, (uint32_t)dict->count)];
 
     if (ent->len == 0)
         return;
 
     /* 50/50: overwrite at random position or insert. */
-    if (rand_below(2) == 0) {
+    if (rand_below(rng, 2) == 0) {
         /* Overwrite mode: place token at a random position. */
         if (ent->len > *len) {
             /* Token bigger than buffer — truncate what we write. */
             size_t copy = *len;
             memcpy(buf, ent->data, copy);
         } else {
-            size_t pos = rand_below((uint32_t)(*len - ent->len + 1));
+            size_t pos = rand_below(rng, (uint32_t)(*len - ent->len + 1));
             memcpy(buf + pos, ent->data, ent->len);
         }
     } else {
@@ -169,12 +183,12 @@ static void mutate_dictionary(uint8_t *buf, size_t *len, size_t max_len,
         if (actual_insert == 0) {
             /* No room to insert; fall back to overwrite. */
             if (ent->len <= *len) {
-                size_t pos = rand_below((uint32_t)(*len - ent->len + 1));
+                size_t pos = rand_below(rng, (uint32_t)(*len - ent->len + 1));
                 memcpy(buf + pos, ent->data, ent->len);
             }
             return;
         }
-        size_t pos = rand_below((uint32_t)(*len + 1));
+        size_t pos = rand_below(rng, (uint32_t)(*len + 1));
         /* Shift tail right. */
         memmove(buf + pos + actual_insert, buf + pos, *len - pos);
         /* Copy as much of the token as fits. */
@@ -186,38 +200,38 @@ static void mutate_dictionary(uint8_t *buf, size_t *len, size_t max_len,
 
 /* ── Strategy: havoc ─────────────────────────────────────────────────── */
 
-static void mutate_havoc(uint8_t *buf, size_t *len, size_t max_len,
+static void mutate_havoc(uint64_t *rng, uint8_t *buf, size_t *len, size_t max_len,
                          const fathom_dict_t *dict)
 {
     uint32_t rounds = FATHOM_HAVOC_MIN +
-                      rand_below(FATHOM_HAVOC_MAX - FATHOM_HAVOC_MIN + 1);
+                      rand_below(rng, FATHOM_HAVOC_MAX - FATHOM_HAVOC_MIN + 1);
 
     for (uint32_t i = 0; i < rounds; i++) {
         /* Pick an atomic mutation (everything except havoc and splice). */
-        uint32_t which = rand_below(5);
+        uint32_t which = rand_below(rng, 5);
         switch (which) {
-        case 0: mutate_bitflip(buf, *len);                    break;
-        case 1: mutate_byteflip(buf, *len);                   break;
-        case 2: mutate_arith(buf, *len);                      break;
-        case 3: mutate_interesting(buf, *len);                 break;
-        case 4: mutate_dictionary(buf, len, max_len, dict);   break;
+        case 0: mutate_bitflip(rng, buf, *len);                    break;
+        case 1: mutate_byteflip(rng, buf, *len);                   break;
+        case 2: mutate_arith(rng, buf, *len);                      break;
+        case 3: mutate_interesting(rng, buf, *len);                 break;
+        case 4: mutate_dictionary(rng, buf, len, max_len, dict);   break;
         }
     }
 }
 
 /* ── Strategy: splice ────────────────────────────────────────────────── */
 
-static void mutate_splice(uint8_t *buf, size_t *len, size_t max_len,
+static void mutate_splice(uint64_t *rng, uint8_t *buf, size_t *len, size_t max_len,
                           const uint8_t *splice, size_t splice_len)
 {
     if (!splice || splice_len == 0 || *len == 0)
         return;
 
     /* Pick a random midpoint in the current buffer. */
-    size_t mid = 1 + rand_below((uint32_t)(*len > 1 ? *len - 1 : 1));
+    size_t mid = 1 + rand_below(rng, (uint32_t)(*len > 1 ? *len - 1 : 1));
 
     /* Pick a random midpoint in the splice donor. */
-    size_t smid = 1 + rand_below((uint32_t)(splice_len > 1 ? splice_len - 1 : 1));
+    size_t smid = 1 + rand_below(rng, (uint32_t)(splice_len > 1 ? splice_len - 1 : 1));
 
     /* Take buf[0..mid) + splice[smid..splice_len). */
     size_t tail = splice_len - smid;
@@ -232,7 +246,7 @@ static void mutate_splice(uint8_t *buf, size_t *len, size_t max_len,
 
 /* ── Weighted selection ──────────────────────────────────────────────── */
 
-static fathom_mutation_t pick_strategy(const fathom_mutator_t *mut,
+static fathom_mutation_t pick_strategy(fathom_mutator_t *mut,
                                        bool have_splice,
                                        bool have_dict)
 {
@@ -254,10 +268,10 @@ static fathom_mutation_t pick_strategy(const fathom_mutator_t *mut,
             if (i == FATHOM_MUT_DICTIONARY && !have_dict) continue;
             valid[n++] = i;
         }
-        return (fathom_mutation_t)valid[rand_below((uint32_t)n)];
+        return (fathom_mutation_t)valid[rand_below(&mut->rng, (uint32_t)n)];
     }
 
-    double r = ((double)rand() / (double)RAND_MAX) * total;
+    double r = (double)(rng_next(&mut->rng) >> 11) / 9007199254740992.0 * total;
     double cum = 0.0;
     for (int i = 0; i < FATHOM_MUT_COUNT; i++) {
         if (i == FATHOM_MUT_SPLICE && !have_splice)
@@ -475,17 +489,17 @@ void fathom_mutator_init(fathom_mutator_t *mut, fathom_dict_t *dict)
     for (int i = 0; i < FATHOM_MUT_COUNT; i++)
         mut->weights[i] = 1.0;
 
-    /* Seed PRNG from /dev/urandom; fall back to time. */
-    unsigned int seed;
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        if (read(fd, &seed, sizeof(seed)) != sizeof(seed))
-            seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
-        close(fd);
-    } else {
-        seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
-    }
-    srand(seed);
+    fathom_mutator_seed(mut, fathom_entropy());
+}
+
+void fathom_mutator_seed(fathom_mutator_t *mut, uint64_t seed)
+{
+    /* splitmix64 scramble so small seeds still give a well-mixed state. */
+    seed += 0x9E3779B97F4A7C15ULL;
+    seed = (seed ^ (seed >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    seed = (seed ^ (seed >> 27)) * 0x94D049BB133111EBULL;
+    seed ^= seed >> 31;
+    mut->rng = seed ? seed : 1;
 }
 
 int fathom_mutate(fathom_mutator_t *mut, uint8_t *buf, size_t *len,
@@ -499,28 +513,29 @@ int fathom_mutate(fathom_mutator_t *mut, uint8_t *buf, size_t *len,
 
     fathom_mutation_t which = pick_strategy(mut, have_splice, have_dict);
     mut->uses[which]++;
+    uint64_t *rng = &mut->rng;
 
     switch (which) {
     case FATHOM_MUT_BITFLIP:
-        mutate_bitflip(buf, *len);
+        mutate_bitflip(rng, buf, *len);
         break;
     case FATHOM_MUT_BYTEFLIP:
-        mutate_byteflip(buf, *len);
+        mutate_byteflip(rng, buf, *len);
         break;
     case FATHOM_MUT_ARITH:
-        mutate_arith(buf, *len);
+        mutate_arith(rng, buf, *len);
         break;
     case FATHOM_MUT_INTERESTING:
-        mutate_interesting(buf, *len);
+        mutate_interesting(rng, buf, *len);
         break;
     case FATHOM_MUT_DICTIONARY:
-        mutate_dictionary(buf, len, max_len, mut->dict);
+        mutate_dictionary(rng, buf, len, max_len, mut->dict);
         break;
     case FATHOM_MUT_HAVOC:
-        mutate_havoc(buf, len, max_len, mut->dict);
+        mutate_havoc(rng, buf, len, max_len, mut->dict);
         break;
     case FATHOM_MUT_SPLICE:
-        mutate_splice(buf, len, max_len, splice, splice_len);
+        mutate_splice(rng, buf, len, max_len, splice, splice_len);
         break;
     case FATHOM_MUT_COUNT:
         /* Not a real strategy. */

@@ -1,14 +1,16 @@
 # Build artifacts
 fathom
+fathom.exe
 libfathom.a
 *.o
+*.dSYM/
 
-# Test binaries
+# Test binaries (sources and headers are tracked)
 tests/test_*
 !tests/test_*.c
-tests/targets/heap_overflow
-tests/targets/stack_smash
-tests/targets/format_string
+!tests/test_*.h
+tests/targets/*
+!tests/targets/*.c
 
 # Fuzz output
 fathom-out/

@@ -7,11 +7,13 @@
  */
 
 #include "corpus.h"
+#include "osdep.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -80,23 +82,6 @@ bool fathom_hashset_contains(const fathom_hashset_t *hs, uint64_t hash)
 }
 
 /* ── File helpers ───────────────────────────────────────────────────── */
-
-/*
- * Create a directory (and parents as needed).  Returns 0 on success or
- * if the directory already exists.
- */
-static int mkdirs(const char *path)
-{
-    struct stat st;
-    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
-        return 0;
-
-    /* Try to create; EEXIST is fine (race with another process). */
-    if (mkdir(path, 0755) == 0 || errno == EEXIST)
-        return 0;
-
-    return -1;
-}
 
 /*
  * Read an entire file into a malloc'd buffer.  Caller frees.
@@ -194,13 +179,13 @@ int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
         char path[4096];
 
         snprintf(path, sizeof(path), "%s", output_dir);
-        mkdirs(path);
+        fathom_mkdir(path);
 
         snprintf(path, sizeof(path), "%s/queue", output_dir);
-        mkdirs(path);
+        fathom_mkdir(path);
 
         snprintf(path, sizeof(path), "%s/crashes", output_dir);
-        mkdirs(path);
+        fathom_mkdir(path);
     }
 
     /* Initialise crash hash set. */
@@ -242,7 +227,7 @@ int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
             if (sz < 0)
                 continue;
 
-            fathom_corpus_add(corpus, data, (size_t)sz, 0);
+            fathom_corpus_add(corpus, data, (size_t)sz, 0, 0);
             free(data);
         }
         closedir(dir);
@@ -277,7 +262,7 @@ void fathom_corpus_destroy(fathom_corpus_t *corpus)
 }
 
 int fathom_corpus_add(fathom_corpus_t *corpus, const uint8_t *data,
-                      size_t len, size_t new_edges)
+                      size_t len, size_t new_blocks, double score)
 {
     /* Grow if needed. */
     if (corpus->count >= corpus->capacity) {
@@ -300,21 +285,23 @@ int fathom_corpus_add(fathom_corpus_t *corpus, const uint8_t *data,
     if (len > 0)
         memcpy(inp->data, data, len);
     inp->len          = len;
-    inp->new_coverage = new_edges;
+    inp->new_coverage = new_blocks;
     inp->was_fuzzed   = false;
     inp->exec_us      = 0;
 
     /*
-     * Priority: inputs that discover more new edges get a higher
-     * priority.  Base priority of 1.0 so even 0-edge seeds are usable.
+     * Priority: inputs that reach more new blocks, and blocks the static
+     * analysis scored as interesting (dangerous calls, loops, error
+     * paths), are fuzzed first.  Base priority of 1.0 keeps seeds usable.
      */
-    inp->priority = 1.0 + (double)new_edges * 10.0;
+    inp->priority = 1.0 + (double)new_blocks * 10.0 + score;
 
     /* Save to queue directory if we have an output dir. */
     if (corpus->out_dir) {
         char path[4096];
-        snprintf(path, sizeof(path), "%s/queue/id:%06zu,edges:%zu",
-                 corpus->out_dir, corpus->count, new_edges);
+        /* AFL uses "id:...", but ':' is not allowed in Windows file names. */
+        snprintf(path, sizeof(path), "%s/queue/id_%06zu_cov_%zu",
+                 corpus->out_dir, corpus->count, new_blocks);
         write_file(path, data, len);
     }
 
@@ -382,8 +369,8 @@ int fathom_corpus_save_crash(fathom_corpus_t *corpus, const uint8_t *data,
 
     if (corpus->out_dir) {
         char path[4096];
-        snprintf(path, sizeof(path), "%s/crashes/crash_%016lx",
-                 corpus->out_dir, (unsigned long)hash);
+        snprintf(path, sizeof(path), "%s/crashes/crash_%016" PRIx64,
+                 corpus->out_dir, hash);
         if (write_file(path, data, len) < 0)
             return -1;
     }

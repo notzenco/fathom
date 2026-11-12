@@ -4,76 +4,28 @@
 
 #include "fathom.h"
 
+#include "test_util.h"
+
+#include <assert.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <assert.h>
-#include <unistd.h>
-#include <limits.h>
-#include <sys/stat.h>
-#include <dirent.h>
-#include <ftw.h>
 
 #define PASS(name) fprintf(stderr, "  PASS  %s\n", (name))
-
-/* ── Helpers ─────────────────────────────────────────────────────────── */
-
-/*
- * nftw callback to remove files and directories.
- */
-static int rm_cb(const char *path, const struct stat *sb,
-                 int typeflag, struct FTW *ftwbuf)
-{
-    (void)sb; (void)typeflag; (void)ftwbuf;
-    return remove(path);
-}
-
-static void rmrf(const char *path)
-{
-    nftw(path, rm_cb, 64, FTW_DEPTH | FTW_PHYS);
-}
+#define PATH_MAX_T 4096
 
 static char g_tmpdir[256];
 
 static void make_tmpdir(void)
 {
-    snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/fathom_test_corpus_XXXXXX");
-    assert(mkdtemp(g_tmpdir) != NULL);
+    assert(tu_make_tmpdir(g_tmpdir, sizeof(g_tmpdir), "corpus") == 0);
 }
 
-static int dir_exists(const char *path)
-{
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
-}
-
-static int file_exists(const char *path)
-{
-    struct stat st;
-    return (stat(path, &st) == 0 && S_ISREG(st.st_mode));
-}
-
-/*
- * Count regular files in a directory (non-recursive).
- */
-static int count_files(const char *dirpath)
-{
-    DIR *d = opendir(dirpath);
-    if (!d) return -1;
-    int n = 0;
-    struct dirent *ent;
-    while ((ent = readdir(d)) != NULL) {
-        if (ent->d_name[0] == '.')
-            continue;
-        char path[PATH_MAX];
-        snprintf(path, sizeof(path), "%s/%s", dirpath, ent->d_name);
-        struct stat st;
-        if (stat(path, &st) == 0 && S_ISREG(st.st_mode))
-            n++;
-    }
-    closedir(d);
-    return n;
-}
+#define rmrf        tu_rm_tree
+#define dir_exists  tu_dir_exists
+#define file_exists tu_file_exists
+#define count_files tu_count_files
 
 /* ── Test: init creates directories ─────────────────────────────────── */
 
@@ -86,7 +38,7 @@ static void test_init_creates_dirs(void)
     fathom_corpus_t corpus;
     assert(fathom_corpus_init(&corpus, NULL, outdir) == 0);
 
-    char qpath[PATH_MAX], cpath[PATH_MAX];
+    char qpath[PATH_MAX_T], cpath[PATH_MAX_T];
     snprintf(qpath, sizeof(qpath), "%s/queue", outdir);
     snprintf(cpath, sizeof(cpath), "%s/crashes", outdir);
 
@@ -109,14 +61,14 @@ static void test_init_reads_seeds(void)
     snprintf(indir,  sizeof(indir),  "%s/in",  g_tmpdir);
     snprintf(outdir, sizeof(outdir), "%s/out", g_tmpdir);
 
-    mkdir(indir, 0755);
+    fathom_mkdir(indir);
 
     /* Create a few seed files of different sizes. */
     const char *seeds[] = {"AAA", "B", "CCCCCC"};
     for (int i = 0; i < 3; i++) {
-        char path[PATH_MAX];
+        char path[PATH_MAX_T];
         snprintf(path, sizeof(path), "%s/seed_%d", indir, i);
-        FILE *fp = fopen(path, "w");
+        FILE *fp = fopen(path, "wb");
         assert(fp);
         fwrite(seeds[i], 1, strlen(seeds[i]), fp);
         fclose(fp);
@@ -149,8 +101,8 @@ static void test_add_and_disk(void)
 
     const uint8_t data1[] = "hello";
     const uint8_t data2[] = "world!!!";
-    assert(fathom_corpus_add(&corpus, data1, 5, 3) == 0);
-    assert(fathom_corpus_add(&corpus, data2, 8, 10) == 0);
+    assert(fathom_corpus_add(&corpus, data1, 5, 3, 0) == 0);
+    assert(fathom_corpus_add(&corpus, data2, 8, 10, 0) == 0);
 
     assert(corpus.count == 2);
 
@@ -160,11 +112,11 @@ static void test_add_and_disk(void)
     assert(corpus.inputs[1].len == 8);
     assert(memcmp(corpus.inputs[1].data, "world!!!", 8) == 0);
 
-    /* Input with more new edges should have higher priority. */
+    /* Input with more new blocks should have higher priority. */
     assert(corpus.inputs[1].priority > corpus.inputs[0].priority);
 
     /* Queue directory should have 2 files. */
-    char qpath[PATH_MAX];
+    char qpath[PATH_MAX_T];
     snprintf(qpath, sizeof(qpath), "%s/queue", outdir);
     assert(count_files(qpath) == 2);
 
@@ -187,7 +139,7 @@ static void test_add_grow(void)
     size_t initial_cap = corpus.capacity;
     for (size_t i = 0; i < initial_cap + 10; i++) {
         uint8_t byte = (uint8_t)(i & 0xFF);
-        assert(fathom_corpus_add(&corpus, &byte, 1, 0) == 0);
+        assert(fathom_corpus_add(&corpus, &byte, 1, 0, 0) == 0);
     }
 
     assert(corpus.count == initial_cap + 10);
@@ -216,23 +168,23 @@ static void test_next_unfuzzed_first(void)
     const uint8_t a[] = "aaa";
     const uint8_t b[] = "bbbbb";
     const uint8_t c[] = "c";
-    fathom_corpus_add(&corpus, a, 3, 1);
-    fathom_corpus_add(&corpus, b, 5, 5);
-    fathom_corpus_add(&corpus, c, 1, 0);
+    fathom_corpus_add(&corpus, a, 3, 1, 0);
+    fathom_corpus_add(&corpus, b, 5, 5, 0);
+    fathom_corpus_add(&corpus, c, 1, 0, 0);
 
-    /* First call: should return highest-priority unfuzzed => b (edges=5). */
+    /* First call: should return highest-priority unfuzzed => b (blocks=5). */
     fathom_input_t *inp1 = fathom_corpus_next(&corpus);
     assert(inp1 != NULL);
     assert(inp1->len == 5);  /* b */
     assert(inp1->was_fuzzed == true);
 
-    /* Second call: next highest unfuzzed => a (edges=1). */
+    /* Second call: next highest unfuzzed => a (blocks=1). */
     fathom_input_t *inp2 = fathom_corpus_next(&corpus);
     assert(inp2 != NULL);
     assert(inp2->len == 3);  /* a */
     assert(inp2->was_fuzzed == true);
 
-    /* Third call: last unfuzzed => c (edges=0). */
+    /* Third call: last unfuzzed => c (blocks=0). */
     fathom_input_t *inp3 = fathom_corpus_next(&corpus);
     assert(inp3 != NULL);
     assert(inp3->len == 1);  /* c */
@@ -299,7 +251,7 @@ static void test_crash_dedup_same_hash(void)
     assert(corpus.unique_crashes == 1);  /* still 1 unique */
 
     /* Crash file should exist on disk. */
-    char cpath[PATH_MAX];
+    char cpath[PATH_MAX_T];
     snprintf(cpath, sizeof(cpath), "%s/crashes", outdir);
     assert(count_files(cpath) == 1);
 
@@ -331,7 +283,7 @@ static void test_crash_dedup_diff_hash(void)
     assert(corpus.unique_crashes == 3);
 
     /* Three crash files on disk. */
-    char cpath[PATH_MAX];
+    char cpath[PATH_MAX_T];
     snprintf(cpath, sizeof(cpath), "%s/crashes", outdir);
     assert(count_files(cpath) == 3);
 
@@ -384,9 +336,8 @@ static void test_crash_file_contents(void)
 
     fathom_corpus_save_crash(&corpus, data, sizeof(data) - 1, hash);
 
-    char fpath[PATH_MAX];
-    snprintf(fpath, sizeof(fpath), "%s/crashes/crash_%016lx",
-             outdir, (unsigned long)hash);
+    char fpath[PATH_MAX_T];
+    snprintf(fpath, sizeof(fpath), "%s/crashes/crash_%016" PRIx64, outdir, hash);
     assert(file_exists(fpath));
 
     /* Read back and verify. */
@@ -416,8 +367,8 @@ static void test_destroy(void)
     assert(fathom_corpus_init(&corpus, NULL, outdir) == 0);
 
     const uint8_t data[] = "test";
-    fathom_corpus_add(&corpus, data, 4, 1);
-    fathom_corpus_add(&corpus, data, 4, 2);
+    fathom_corpus_add(&corpus, data, 4, 1, 0);
+    fathom_corpus_add(&corpus, data, 4, 2, 0);
 
     fathom_corpus_destroy(&corpus);
 
