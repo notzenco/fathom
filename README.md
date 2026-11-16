@@ -41,20 +41,23 @@ runs natively on the host, so emulated targets are not supported
 (x86-64 binaries under Rosetta 2 or Windows ARM64 emulation).
 
 CI builds and tests all six OS and architecture combinations on native
-runners. Time for each to solve the maze target (below) from the seed
-`AAAA`, from one CI run with `-s 1`:
+runners. Runs and time for each to solve the maze target (below) from the
+seed `AAAA`, from one CI run with `-s 1`; seeds and platforms vary, so
+compare these within a row rather than across rows:
 
 | Platform       | Runs to first crash | Time    |
 |----------------|--------------------:|--------:|
-| Linux x86-64   | 383                 | 0.4 s   |
-| Linux arm64    | 203                 | 0.3 s   |
-| macOS arm64    | 203                 | 0.9 s   |
-| macOS x86-64   | 203                 | 2.4 s   |
-| Windows ARM64  | 296                 | 10.0 s  |
-| Windows x64    | 1,739               | 53.7 s  |
+| Linux x86-64   | 140                 | 0.08 s  |
+| Linux arm64    | 598                 | 0.6 s   |
+| macOS arm64    | 210                 | 0.7 s   |
+| macOS x86-64   | 168                 | 1.8 s   |
+| Windows ARM64  | 252                 | 6.7 s   |
+| Windows x64    | 329                 | 5.6 s   |
 
-Process creation dominates: Linux runs roughly 1,000 targets a second,
-macOS a few hundred, and Windows 30 to 40. On Windows the statically
+Process creation dominates: Linux runs a few thousand targets a second
+(more with `--fork-server` when startup is expensive), macOS under a
+hundred without root (`task_for_pid()` costs about 10 ms), and Windows 30
+to 50. On Windows the statically
 linked MinGW runtime also adds about 100 startup blocks to every run.
 
 ## How coverage works without instrumentation
@@ -369,10 +372,12 @@ lib/
   fmt_elf.c                 ELF64 loader (sections, symbols, PLT/GOT imports)
   fmt_macho.c               Mach-O loader (universal slices, stubs, indirect symbols)
   fmt_pe.c                  PE32+ loader (sections, IAT imports, COFF symbols)
-  disasm.c                  Capstone linear sweep, x86-64 + arm64 decoding
+  disasm.c                  Capstone linear sweep, x86-64 + arm64 decoding, compare sites
   cfg.c                     Basic blocks, edges, loops, dominators
-  analyze.c                 Import resolution, scoring, dictionary, reachability
-  mutate.c                  Mutation strategies and adaptive weights
+  analyze.c                 Import resolution, scoring, dictionary, reachability,
+                            steering, frontier tokens
+  mutate.c                  Mutation strategies, adaptive weights, deterministic stage
+  trim.c                    Trimming and crash minimisation
   exec.c                    Breakpoint table, coverage marking, crash hashing
   exec_posix.c              Linux and macOS debugger backend
   exec_windows.c            Windows debugger backend
