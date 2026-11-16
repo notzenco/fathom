@@ -300,6 +300,13 @@ static void test_empty_input(void)
     CHECK(1, "empty input with splice donor does not crash");
 
     fathom_dict_destroy(&dict);
+
+    /* An empty seed must still grow, with or without a dictionary. */
+    fathom_mutator_init(&mut, NULL);
+    fathom_mutator_seed(&mut, 7);
+    len = 0;
+    fathom_mutate(&mut, buf, &len, sizeof(buf), NULL, 0);
+    CHECK(len > 0 && len <= sizeof(buf), "empty input grows");
 }
 
 /* ── Test: mutation respects max_len ─────────────────────────────────── */
