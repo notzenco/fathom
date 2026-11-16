@@ -483,3 +483,54 @@ void fathom_analysis_print(const fathom_analysis_t *ana,
         printf("\n  ... and %zu more scored blocks\n", ana->ranked_count - show);
     printf("\n");
 }
+
+/* ── Directed fuzzing ────────────────────────────────────────────────── */
+
+void fathom_steer(const fathom_cfg_t *cfg, const bool *covered, double *val)
+{
+    size_t n = cfg->block_count;
+    uint32_t *cur = malloc((n ? n : 1) * sizeof(*cur));
+    uint32_t *next = malloc((n ? n : 1) * sizeof(*next));
+    bool *queued = calloc(n ? n : 1, sizeof(*queued));
+    size_t nc = 0;
+
+    for (size_t b = 0; b < n; b++) {
+        val[b] = !covered[b] && cfg->blocks[b].score > 0 ? cfg->blocks[b].score : 0.0;
+        if (val[b] > 0 && cur)
+            cur[nc++] = (uint32_t)b;
+    }
+    if (!cur || !next || !queued) {
+        free(cur);
+        free(next);
+        free(queued);
+        return;   /* targets keep their score; nothing propagates */
+    }
+
+    /* Level by level back along predecessors, keeping each block's best value. */
+    for (int depth = 0; depth < FATHOM_STEER_DEPTH && nc > 0; depth++) {
+        size_t nn = 0;
+        for (size_t i = 0; i < nc; i++) {
+            const fathom_block_t *b = &cfg->blocks[cur[i]];
+            double v = val[cur[i]] / 2;
+            for (size_t p = 0; p < b->pred_count; p++) {
+                uint32_t q = b->preds[p];
+                if (v > val[q]) {
+                    val[q] = v;
+                    if (!queued[q]) {
+                        queued[q] = true;
+                        next[nn++] = q;
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < nn; i++)
+            queued[next[i]] = false;
+        uint32_t *t = cur;
+        cur = next;
+        next = t;
+        nc = nn;
+    }
+    free(cur);
+    free(next);
+    free(queued);
+}
