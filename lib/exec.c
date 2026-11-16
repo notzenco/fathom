@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #define HASH_INIT_CAP  4096   /* power of two; doubles to keep load <= 0.5 */
 
@@ -124,6 +125,12 @@ int fathom_exec_init(fathom_exec_t *ex, const fathom_config_t *cfg,
         goto fail;
 
     struct fathom_exec_os *os = ex->os;
+    os->mods = calloc(1, sizeof(*os->mods));
+    if (!os->mods)
+        goto fail;
+    os->mods[0].base = bin->image_base;
+    os->mods[0].size = bin->image_size;
+    os->n_mods = 1;
     os->hash_cap  = HASH_INIT_CAP;
     os->hash_keys = calloc(HASH_INIT_CAP, sizeof(*os->hash_keys));
     os->hash_vals = calloc(HASH_INIT_CAP, sizeof(*os->hash_vals));
@@ -185,6 +192,9 @@ void fathom_exec_destroy(fathom_exec_t *ex)
         free(ex->os->probe_own);
         free(ex->os->slot_probe);
         free(ex->os->cmp_log);
+        for (size_t i = 0; i < ex->os->n_mods; i++)
+            free(ex->os->mods[i].path);
+        free(ex->os->mods);
         for (size_t i = 0; ex->os->argv && ex->os->argv[i]; i++)
             free(ex->os->argv[i]);
         free(ex->os->argv);
@@ -398,6 +408,84 @@ int fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn)
     return 0;
 }
 
+/* ── Modules ────────────────────────────────────────────────────────── */
+
+#define MODULE_MASK  ((1ull << FATHOM_MODULE_SHIFT) - 1)
+
+static size_t module_of(uint64_t tagged)
+{
+    return (size_t)(tagged >> FATHOM_MODULE_SHIFT);
+}
+
+uint64_t exec_runtime(const struct fathom_exec_os *os, uint64_t tagged)
+{
+    size_t m = module_of(tagged);
+    uint64_t slide = m == 0 ? os->slide : m < os->n_mods ? os->mods[m].slide : 0;
+    return (tagged & MODULE_MASK) + slide;
+}
+
+/* Tagged link-time address of runtime pc, or false if no loaded module has it. */
+static bool tagged_of(const fathom_exec_t *ex, uint64_t pc, uint64_t *tagged)
+{
+    const struct fathom_exec_os *os = ex->os;
+    for (size_t m = 0; m < os->n_mods; m++) {
+        const struct exec_module *mod = &os->mods[m];
+        uint64_t slide = m == 0 ? os->slide : mod->slide;
+        if (m > 0 && !mod->loaded)
+            continue;
+        uint64_t link = pc - slide;
+        /* The target's own range is not always known: it is the fallback. */
+        if ((m == 0 && mod->size == 0) ||
+            (link >= mod->base && link - mod->base < mod->size)) {
+            *tagged = FATHOM_MODULE_ADDR(m, link);
+            return true;
+        }
+    }
+    return false;
+}
+
+int fathom_exec_add_module(fathom_exec_t *ex, const char *path, uint64_t image_base,
+                           uint64_t image_size)
+{
+    struct fathom_exec_os *os = ex->os;
+    if (os->n_mods >= 255)
+        return -1;
+    struct exec_module *m = realloc(os->mods, (os->n_mods + 1) * sizeof(*m));
+    if (!m)
+        return -1;
+    os->mods = m;
+    m = &os->mods[os->n_mods];
+    memset(m, 0, sizeof(*m));
+    m->base = image_base;
+    m->size = image_size;
+    if (!(m->path = strdup(path)))
+        return -1;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, 0, NULL);
+    BY_HANDLE_FILE_INFORMATION fi;
+    bool ok = h != INVALID_HANDLE_VALUE && GetFileInformationByHandle(h, &fi);
+    if (h != INVALID_HANDLE_VALUE)
+        CloseHandle(h);
+    if (!ok) {
+        free(m->path);
+        return -1;
+    }
+    m->volume = fi.dwVolumeSerialNumber;
+    m->index_hi = fi.nFileIndexHigh;
+    m->index_lo = fi.nFileIndexLow;
+#else
+    struct stat st;
+    if (stat(path, &st) < 0) {
+        free(m->path);
+        return -1;
+    }
+    m->dev = (uint64_t)st.st_dev;
+    m->ino = (uint64_t)st.st_ino;
+#endif
+    return (int)os->n_mods++;
+}
+
 /* ── Patching ───────────────────────────────────────────────────────── */
 
 #define CLUSTER_GAP  4096   /* see the cluster note in exec.h */
@@ -475,69 +563,181 @@ static bool is_trap(const struct fathom_exec_os *os, size_t off)
     return memcmp(os->orig + off, os->bp_insn, os->bp_len) == 0;
 }
 
-int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr,
-                            void *ctx)
+/* Read module m's original bytes unless cached for its current slide. */
+static int read_module(fathom_exec_t *ex, size_t m, exec_read_fn rd, void *ctx)
 {
     struct fathom_exec_os *os = ex->os;
-    if (ex->bp_count == 0)
+    struct exec_module *mod = &os->mods[m];
+    uint64_t slide = m == 0 ? os->slide : mod->slide;
+    if (os->patch_ready && mod->read && mod->read_slide == slide)
         return 0;
-    if (!os->clusters && build_clusters(ex) < 0) {
-        fprintf(stderr, "fathom: out of memory for breakpoints\n");
-        return -1;
-    }
-
-    if (!os->patch_ready || os->patch_slide != os->slide) {
-        os->patch_ready = false;
-        for (size_t i = 0; i < os->n_clusters; i++) {
-            const struct exec_cluster *c = &os->clusters[i];
-            if (!rd(ctx, c->lo + os->slide, os->orig + c->off, (size_t)(c->hi - c->lo))) {
-                fprintf(stderr, "fathom: cannot read target code at 0x%llx\n",
-                        (unsigned long long)(c->lo + os->slide));
-                return -1;
-            }
-        }
-        os->patch_ready = true;
-        os->patch_slide = os->slide;
-        os->patch_stale = true;
-    }
-    if (os->patch_stale) {
-        const struct exec_cluster *last = &os->clusters[os->n_clusters - 1];
-        memcpy(os->patched, os->orig, last->off + (size_t)(last->hi - last->lo));
-        for (size_t i = 0; i < ex->bp_count; i++) {
-            bool off = i < os->disarmed_len && os->disarmed[i];
-            if (off && os->probes_armed && i < os->slot_probe_len &&
-                os->slot_probe[i] != UINT32_MAX)
-                off = false;   /* its probe needs the trap */
-            if (!off && !is_trap(os, os->bp_off[i]))
-                memcpy(os->patched + os->bp_off[i], os->bp_insn, os->bp_len);
-        }
-        os->patch_gen++;
-        for (size_t i = 0; os->probes_armed && i < os->n_probes; i++) {
-            if (os->probe_own[i] && !is_trap(os, os->probe_off[i]))
-                memcpy(os->patched + os->probe_off[i], os->bp_insn, os->bp_len);
-        }
-        os->patch_stale = false;
-    }
-
     for (size_t i = 0; i < os->n_clusters; i++) {
         const struct exec_cluster *c = &os->clusters[i];
-        if (!wr(ctx, c->lo + os->slide, os->patched + c->off, (size_t)(c->hi - c->lo))) {
+        if (module_of(c->lo) != m)
+            continue;
+        if (!rd(ctx, exec_runtime(os, c->lo), os->orig + c->off, (size_t)(c->hi - c->lo))) {
+            fprintf(stderr, "fathom: cannot read target code at 0x%llx\n",
+                    (unsigned long long)exec_runtime(os, c->lo));
+            return -1;
+        }
+    }
+    mod->read = true;
+    mod->read_slide = slide;
+    os->patch_stale = true;
+    return 0;
+}
+
+static void rebuild_patch(fathom_exec_t *ex)
+{
+    struct fathom_exec_os *os = ex->os;
+    const struct exec_cluster *last = &os->clusters[os->n_clusters - 1];
+    memcpy(os->patched, os->orig, last->off + (size_t)(last->hi - last->lo));
+    for (size_t i = 0; i < ex->bp_count; i++) {
+        bool off = i < os->disarmed_len && os->disarmed[i];
+        if (off && os->probes_armed && i < os->slot_probe_len &&
+            os->slot_probe[i] != UINT32_MAX)
+            off = false;   /* its probe needs the trap */
+        if (!off && !is_trap(os, os->bp_off[i]))
+            memcpy(os->patched + os->bp_off[i], os->bp_insn, os->bp_len);
+    }
+    for (size_t i = 0; os->probes_armed && i < os->n_probes; i++) {
+        if (os->probe_own[i] && !is_trap(os, os->probe_off[i]))
+            memcpy(os->patched + os->probe_off[i], os->bp_insn, os->bp_len);
+    }
+    os->patch_gen++;
+    os->patch_stale = false;
+}
+
+static int write_module(fathom_exec_t *ex, size_t m, exec_write_fn wr, void *ctx)
+{
+    struct fathom_exec_os *os = ex->os;
+    for (size_t i = 0; i < os->n_clusters; i++) {
+        const struct exec_cluster *c = &os->clusters[i];
+        if (module_of(c->lo) != m)
+            continue;
+        if (!wr(ctx, exec_runtime(os, c->lo), os->patched + c->off, (size_t)(c->hi - c->lo))) {
             fprintf(stderr, "fathom: cannot write breakpoints at 0x%llx\n",
-                    (unsigned long long)(c->lo + os->slide));
+                    (unsigned long long)exec_runtime(os, c->lo));
             return -1;
         }
     }
     return 0;
 }
 
+static int prepare_patch(fathom_exec_t *ex)
+{
+    struct fathom_exec_os *os = ex->os;
+    if (!os->clusters && build_clusters(ex) < 0) {
+        fprintf(stderr, "fathom: out of memory for breakpoints\n");
+        return -1;
+    }
+    if (!os->patch_ready) {
+        for (size_t m = 0; m < os->n_mods; m++)
+            os->mods[m].read = false;
+        os->patch_ready = true;
+    }
+    return 0;
+}
+
+int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr,
+                            void *ctx)
+{
+    struct fathom_exec_os *os = ex->os;
+    if (ex->bp_count == 0)
+        return 0;
+    if (prepare_patch(ex) < 0)
+        return -1;
+    for (size_t m = 0; m < os->n_mods; m++) {
+        if ((m == 0 || os->mods[m].loaded) && read_module(ex, m, rd, ctx) < 0)
+            return -1;
+    }
+    if (os->patch_stale)
+        rebuild_patch(ex);
+    for (size_t m = 0; m < os->n_mods; m++) {
+        if ((m == 0 || os->mods[m].loaded) && write_module(ex, m, wr, ctx) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+int exec_module_loaded(fathom_exec_t *ex, size_t m, uint64_t slide, exec_read_fn rd,
+                       exec_write_fn wr, void *ctx)
+{
+    struct fathom_exec_os *os = ex->os;
+    if (m == 0 || m >= os->n_mods || ex->bp_count == 0)
+        return 0;
+    os->mods[m].slide = slide;
+    os->mods[m].loaded = true;
+    if (prepare_patch(ex) < 0 || read_module(ex, m, rd, ctx) < 0)
+        return -1;
+    if (os->patch_stale)
+        rebuild_patch(ex);
+    return write_module(ex, m, wr, ctx);
+}
+
+int exec_checkpoint(fathom_exec_t *ex, uint64_t pc_bp, exec_find_module_fn find,
+                    exec_read_fn rd, exec_write_fn wr, void *ctx, exec_write_t *w)
+{
+    struct fathom_exec_os *os = ex->os;
+    uint64_t entry = ex->entry + os->slide;
+    if (!os->checkpoint || pc_bp != entry)
+        return -1;
+    os->checkpoint = false;
+    for (size_t m = 1; m < os->n_mods; m++) {
+        uint64_t base;
+        if (find(ctx, &os->mods[m], &base))
+            exec_module_loaded(ex, m, base - os->mods[m].base, rd, wr, ctx);
+    }
+    if (!os->checkpoint_own)
+        return 0;
+    w[0] = (exec_write_t){ entry, os->entry_orig, os->bp_len };
+    return 1;
+}
+
+/*
+ * Before a run: libraries are not mapped yet.  When there are any, put a
+ * breakpoint on the entry point (unless one of ours is there already) to
+ * find them once the loader has mapped them.
+ */
+static int arm_checkpoint(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr, void *ctx)
+{
+    struct fathom_exec_os *os = ex->os;
+    os->checkpoint = os->n_mods > 1;
+    os->checkpoint_own = false;
+    if (!os->checkpoint)
+        return 0;
+    uint64_t entry = ex->entry + os->slide;
+    int slot = exec_bp_lookup(ex, ex->entry);
+    bool armed = slot >= 0 && !((size_t)slot < os->disarmed_len && os->disarmed[slot]) &&
+                 !is_trap(os, os->bp_off[slot]);
+    if (armed)
+        return 0;
+    if (!rd(ctx, entry, os->entry_orig, os->bp_len) ||
+        !wr(ctx, entry, os->bp_insn, os->bp_len))
+        return -1;
+    os->checkpoint_own = slot < 0;   /* a disarmed slot restores itself */
+    return 0;
+}
+
+int exec_begin_run(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr, void *ctx)
+{
+    struct fathom_exec_os *os = ex->os;
+    for (size_t m = 1; m < os->n_mods; m++)
+        os->mods[m].loaded = false;
+    if (exec_insert_breakpoints(ex, rd, wr, ctx) < 0)
+        return -1;
+    return arm_checkpoint(ex, rd, wr, ctx);
+}
+
 size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
                    exec_write_t w[2], uint32_t *probe)
 {
     struct fathom_exec_os *os = ex->os;
-    uint64_t addr = pc_bp - os->slide;
+    uint64_t addr;
     uint32_t v;
     *probe = UINT32_MAX;
-    if (os->foreign_image || !os->patch_ready || !hash_get(os, addr, &v))
+    if (os->foreign_image || !os->patch_ready || !tagged_of(ex, pc_bp, &addr) ||
+        !hash_get(os, addr, &v))
         return 0;
 
     if (v & PROBE_BIT) {
@@ -553,7 +753,7 @@ size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
         /* The counted block's first instruction has run: re-arm it. */
         uint32_t k = v & ~FOLLOW_BIT, slot = os->follow_slot[k];
         w[0] = (exec_write_t){ pc_bp, os->orig + os->follow_off[k], os->bp_len };
-        w[1] = (exec_write_t){ ex->bp_addrs[slot] + os->slide, os->bp_insn, os->bp_len };
+        w[1] = (exec_write_t){ exec_runtime(os, ex->bp_addrs[slot]), os->bp_insn, os->bp_len };
         return 2;
     }
 
@@ -571,7 +771,7 @@ size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
 
     uint32_t k = v < os->bp_follow_len ? os->bp_follow[v] : UINT32_MAX;
     if (k != UINT32_MAX && hits < FATHOM_HIT_LIMIT && !is_trap(os, os->follow_off[k])) {
-        w[1] = (exec_write_t){ os->follow_addrs[k] + os->slide, os->bp_insn, os->bp_len };
+        w[1] = (exec_write_t){ exec_runtime(os, os->follow_addrs[k]), os->bp_insn, os->bp_len };
         return 2;
     }
     return 1;
@@ -584,7 +784,7 @@ static uint64_t reg_value(const exec_regs_t *regs, uint8_t r)
     return r < FATHOM_REG_COUNT ? regs->r[r] : 0;
 }
 
-static bool operand_bytes(const struct fathom_exec_os *os, const fathom_operand_t *op,
+static bool operand_bytes(uint64_t slide, const fathom_operand_t *op,
                           size_t width, const exec_regs_t *regs, exec_read_fn rd,
                           void *ctx, uint8_t *out)
 {
@@ -592,7 +792,7 @@ static bool operand_bytes(const struct fathom_exec_os *os, const fathom_operand_
     if (!op->mem) {
         v = reg_value(regs, op->reg);
     } else {
-        uint64_t addr = op->pc_rel ? (uint64_t)op->disp + os->slide
+        uint64_t addr = op->pc_rel ? (uint64_t)op->disp + slide
                       : reg_value(regs, op->reg) + (uint64_t)op->disp +
                         (op->index == FATHOM_REG_NONE ? 0
                          : reg_value(regs, op->index) * op->scale);
@@ -635,9 +835,10 @@ void exec_probe_log(fathom_exec_t *ex, uint32_t probe, const exec_regs_t *regs,
     memset(e, 0, sizeof(*e));
     e->site = probe;
     if (s->kind == FATHOM_CMP_VALUES) {
+        uint64_t slide = exec_runtime(os, s->addr) - (s->addr & MODULE_MASK);
         e->len = s->width;
-        if (!operand_bytes(os, &s->a, s->width, regs, rd, ctx, e->a) ||
-            !operand_bytes(os, &s->b, s->width, regs, rd, ctx, e->b) ||
+        if (!operand_bytes(slide, &s->a, s->width, regs, rd, ctx, e->a) ||
+            !operand_bytes(slide, &s->b, s->width, regs, rd, ctx, e->b) ||
             !memcmp(e->a, e->b, e->len))
             return;   /* unreadable, or equal: nothing to learn */
     } else {

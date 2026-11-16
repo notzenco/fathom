@@ -56,6 +56,7 @@
 
 #if defined(__linux__)
 #include <elf.h>
+#include <sys/sysmacros.h>
 #include <sys/uio.h>
 #include <sys/user.h>
 #elif defined(__APPLE__)
@@ -306,6 +307,30 @@ static bool module_key(void *ctx, uint64_t addr, uint64_t *key)
     return found;
 }
 
+/* Where the library file m is mapped: the mapping of its first page. */
+static bool find_module(void *ctx, const struct exec_module *m, uint64_t *base)
+{
+    target_t *t = ctx;
+    char path[64], line[4200];
+    snprintf(path, sizeof(path), "/proc/%d/maps", (int)t->pid);
+    FILE *f = fopen(path, "re");
+    if (!f)
+        return false;
+    bool found = false;
+    while (!found && fgets(line, sizeof(line), f)) {
+        unsigned long long lo, hi, off, ino;
+        unsigned maj, mnr;
+        if (sscanf(line, "%llx-%llx %*s %llx %x:%x %llu", &lo, &hi, &off, &maj, &mnr, &ino) == 6 &&
+            off == 0 && ino == m->ino && maj == major((dev_t)m->dev) &&
+            mnr == minor((dev_t)m->dev)) {
+            *base = lo + (m->base & 0xfff);
+            found = true;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
 #elif defined(__APPLE__)
 
 typedef struct {
@@ -545,6 +570,36 @@ static bool module_key(void *ctx, uint64_t addr, uint64_t *key)
     return true;
 }
 
+/* Where the library file m is mapped: the region holding its Mach-O header. */
+static bool find_module(void *ctx, const struct exec_module *m, uint64_t *base)
+{
+    target_t *t = ctx;
+    mach_vm_address_t addr = 0;
+    for (;;) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj;
+        if (mach_vm_region(t->task, &addr, &size, VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&info, &count, &obj) != KERN_SUCCESS)
+            return false;
+        char path[PROC_PIDPATHINFO_MAXSIZE];
+        struct stat st;
+        uint32_t magic = 0;
+        if (proc_regionfilename(t->pid, addr, path, sizeof(path)) > 0 &&
+            stat(path, &st) == 0 && (uint64_t)st.st_dev == m->dev &&
+            (uint64_t)st.st_ino == m->ino && tgt_read(t, addr, &magic, sizeof(magic)) &&
+            magic == MH_MAGIC_64) {
+            *base = addr;
+            return true;
+        }
+        addr += size;
+    }
+}
+
+static bool rd_mem(void *ctx, uint64_t addr, void *buf, size_t len);
+static bool wr_mem(void *ctx, uint64_t addr, const void *buf, size_t len);
+
 /* ── macOS exception server ──────────────────────────────────────────── */
 
 /*
@@ -617,10 +672,17 @@ static kern_return_t exc_handle(const exc_request_t *rq, exc_reply_t *rp)
     fathom_exec_t *ex = g_exc.ex;
     if (ex) {
         exec_write_t w[2];
-        uint32_t probe;
+        uint32_t probe = UINT32_MAX;
         uint64_t bp = STATE_PC(st) - ex->os->pc_adjust;
-        size_t nw = rq->exception == EXC_BREAKPOINT
-                  ? exec_bp_hit(ex, g_exc.cov, bp, w, &probe) : 0;
+        size_t nw = 0;
+        if (rq->exception == EXC_BREAKPOINT) {
+            /* The entry point checkpoint: the target's libraries are mapped now. */
+            target_t tt = { 0, task, (size_t)getpagesize() };
+            pid_for_task(task, &tt.pid);
+            int cp = task == g_exc.root
+                   ? exec_checkpoint(ex, bp, find_module, rd_mem, wr_mem, &tt, w) : -1;
+            nw = cp == 1 ? 1 : exec_bp_hit(ex, g_exc.cov, bp, w, &probe);
+        }
         if (nw && probe != UINT32_MAX) {
             exec_regs_t regs;
             state_regs(&st, &regs);
@@ -1285,6 +1347,14 @@ static int fs_start(fathom_exec_t *ex)
         return -1;
     memcpy(os->fs_regs, &r, sizeof(r));
     os->fs_patch_gen = 0;
+
+    /* The loader has mapped the libraries: every child inherits them there. */
+    for (size_t m = 1; m < os->n_mods; m++) {
+        uint64_t base;
+        os->mods[m].loaded = find_module(&t, &os->mods[m], &base);
+        if (os->mods[m].loaded)
+            os->mods[m].slide = base - os->mods[m].base;
+    }
     return 0;
 }
 
@@ -1363,7 +1433,7 @@ static int on_root_exec(fathom_exec_t *ex, target_t *t)
         return 0;
     }
     os->foreign_image = false;
-    return exec_insert_breakpoints(ex, rd_mem, wr_mem, t);
+    return exec_begin_run(ex, rd_mem, wr_mem, t);
 }
 
 int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
@@ -1446,7 +1516,7 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
             kevent(kq, &kev, 1, NULL, 0, NULL);
     }
 #endif
-    if (!ok || (!forked && exec_insert_breakpoints(ex, rd_mem, wr_mem, &t) < 0)) {
+    if (!ok || (!forked && exec_begin_run(ex, rd_mem, wr_mem, &t) < 0)) {
         tgt_kill(pid);
         waitpid(pid, NULL, 0);
 #if defined(__APPLE__)
@@ -1607,7 +1677,9 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 #endif
             uint64_t bp = pc - os->pc_adjust;
             uint32_t probe = UINT32_MAX;
-            if (have && (nw = exec_bp_hit(ex, cov, bp, w, &probe)) > 0) {
+            int cp = have && tt->pid == pid
+                   ? exec_checkpoint(ex, bp, find_module, rd_mem, wr_mem, tt, w) : -1;
+            if (have && (nw = cp == 1 ? 1 : exec_bp_hit(ex, cov, bp, w, &probe)) > 0) {
                 if (probe != UINT32_MAX) {
                     exec_regs_t regs;
 #if defined(__linux__)

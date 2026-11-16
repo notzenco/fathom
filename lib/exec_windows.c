@@ -389,6 +389,9 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     run.res = res;
     run.proc = pi.hProcess;
 
+    for (size_t m = 1; m < os->n_mods; m++)
+        os->mods[m].loaded = false;   /* found again as each DLL loads */
+
     res->status = FATHOM_EXIT_OK;
     uint64_t deadline = fathom_now_us() + (uint64_t)ex->timeout_ms * 1000u;
     bool killed = false, timed_out = false, failed = false;
@@ -427,8 +430,24 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                 failed = kill_now = true;
             break;
         case LOAD_DLL_DEBUG_EVENT:
-            if (ev.u.LoadDll.hFile)
+            if (ev.u.LoadDll.hFile) {
+                /* A library to instrument: mapped, not yet initialised. */
+                BY_HANDLE_FILE_INFORMATION fi;
+                if (os->n_mods > 1 && GetFileInformationByHandle(ev.u.LoadDll.hFile, &fi)) {
+                    for (size_t m = 1; m < os->n_mods; m++) {
+                        struct exec_module *mod = &os->mods[m];
+                        if (mod->volume != fi.dwVolumeSerialNumber ||
+                            mod->index_hi != fi.nFileIndexHigh ||
+                            mod->index_lo != fi.nFileIndexLow)
+                            continue;
+                        uint64_t base = (uint64_t)(uintptr_t)ev.u.LoadDll.lpBaseOfDll;
+                        if (exec_module_loaded(ex, m, base - mod->base, rd_mem, wr_mem,
+                                               pi.hProcess) < 0)
+                            failed = kill_now = true;
+                    }
+                }
                 CloseHandle(ev.u.LoadDll.hFile);
+            }
             break;
         case EXCEPTION_DEBUG_EVENT:
             if (res->status == FATHOM_EXIT_CRASH)

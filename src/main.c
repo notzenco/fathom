@@ -123,12 +123,20 @@ static bool stop_requested(void)
 
 /* ── Session state ───────────────────────────────────────────────────── */
 
-typedef struct {
+typedef struct fathom_session {
     fathom_binary_t   bin;
     fathom_disasm_t   dis;
     fathom_cfg_t      cfg_graph;
     fathom_analysis_t ana;
+    const char       *path;
+    /* --lib: shared libraries instrumented alongside the target. */
+    struct fathom_session *libs;
+    size_t            n_libs;
 } fathom_session_t;
+
+#define MAX_LIBS 16
+static const char *g_libs[MAX_LIBS];   /* --lib */
+static size_t      g_n_libs;
 
 typedef struct {
     uint64_t total_execs;
@@ -153,6 +161,9 @@ static const char *const strategy_names[FATHOM_MUT_COUNT] = {
 
 static void cleanup_session(fathom_session_t *s)
 {
+    for (size_t i = 0; i < s->n_libs; i++)
+        cleanup_session(&s->libs[i]);
+    free(s->libs);
     fathom_analysis_free(&s->ana);
     fathom_cfg_free(&s->cfg_graph);
     fathom_disasm_close(&s->dis);
@@ -318,12 +329,12 @@ static bool read_stats(const char *dir, fathom_stats_t *st)
     return any;
 }
 
-static int prepare_session(const fathom_config_t *cfg, bool quiet,
-                           fathom_session_t *s)
+/* Load, disassemble and analyse one binary: the target or a library. */
+static int analyse_binary(const char *path, bool quiet, fathom_session_t *s)
 {
     memset(s, 0, sizeof(*s));
-
-    if (fathom_binary_open(&s->bin, cfg->target_path) < 0)
+    s->path = path;
+    if (fathom_binary_open(&s->bin, path) < 0)
         return -1;
     if (!quiet)
         fprintf(stderr, "  binary: %s %s%s, entry 0x%" PRIx64 "\n",
@@ -347,6 +358,38 @@ static int prepare_session(const fathom_config_t *cfg, bool quiet,
                         "scored: %zu, dictionary: %zu\n",
                 s->dis.count, s->cfg_graph.block_count, s->ana.cov_count,
                 s->ana.ranked_count, s->ana.dict.count);
+    return 0;
+
+fail:
+    cleanup_session(s);
+    return -1;
+}
+
+static int prepare_session(const fathom_config_t *cfg, bool quiet,
+                           fathom_session_t *s)
+{
+    if (analyse_binary(cfg->target_path, quiet, s) < 0)
+        return -1;
+
+    if (g_n_libs && !(s->libs = calloc(g_n_libs, sizeof(*s->libs))))
+        goto fail;
+    for (size_t i = 0; i < g_n_libs; i++) {
+        if (!quiet)
+            fprintf(stderr, "  library: %s\n", g_libs[i]);
+        if (analyse_binary(g_libs[i], quiet, &s->libs[i]) < 0) {
+            fprintf(stderr, "fathom: cannot analyse library %s\n", g_libs[i]);
+            goto fail;
+        }
+        s->n_libs++;
+        if (s->libs[i].bin.arch != s->bin.arch || s->libs[i].bin.format != s->bin.format) {
+            fprintf(stderr, "fathom: %s is not a library for this target\n", g_libs[i]);
+            goto fail;
+        }
+        /* Its strings and constants are the target's tokens too. */
+        const fathom_dict_t *d = &s->libs[i].ana.dict;
+        for (size_t k = 0; k < d->count; k++)
+            fathom_dict_add(&s->ana.dict, d->entries[k].data, d->entries[k].len);
+    }
 
     if (cfg->dict_file && fathom_dict_load(&s->ana.dict, cfg->dict_file) < 0) {
         fprintf(stderr, "fathom: failed to load dictionary: %s\n", cfg->dict_file);
@@ -384,6 +427,8 @@ static void usage(const char *prog)
         "  --max-input <n> Largest input to generate, in bytes (default: %d)\n"
         "  --fail-on-crash Exit with status 2 if any unique crash was found\n"
         "  --no-cmplog Skip comparison logging (input-to-state) on new inputs\n"
+        "  --lib <so>  Also instrument this shared library (.so, .dylib, .dll)\n"
+        "              the target loads at startup; repeatable\n"
         "  --det       Try every deterministic edit (bit flips, small arithmetic,\n"
         "              interesting values) of each new input up to 256 bytes\n"
         "  --fork-server   Linux: fork each run from the target stopped at its\n"
@@ -396,6 +441,69 @@ static void usage(const char *prog)
         "  --dict <f>  Extra dictionary file\n"
         "  -h          Show this help\n",
         prog, DEFAULT_TIMEOUT_MS, DEFAULT_JOBS, DEFAULT_MAX_INPUT);
+}
+
+/* ── Instrumentation ─────────────────────────────────────────────────── */
+
+/*
+ * One breakpoint per instrumentable block of the target, then of each
+ * library: slots 0..n-1 are the target's cov_blocks in order, the
+ * libraries' follow.  slot_block maps a target slot to its CFG block
+ * (UINT32_MAX for library slots), slot_score gives every slot its
+ * block's static score and counted marks loop headers counting their
+ * iterations; each may be NULL.
+ */
+static int instrument(fathom_exec_t *ex, const fathom_session_t *s, uint32_t *slot_block,
+                      double *slot_score, bool *counted, bool cmplog, long *n_cmp)
+{
+    for (size_t li = 0; li <= s->n_libs; li++) {
+        const fathom_session_t *b = li == 0 ? s : &s->libs[li - 1];
+        int m = 0;
+        if (li > 0 &&
+            (m = fathom_exec_add_module(ex, b->path, b->bin.image_base, b->bin.image_size)) < 0) {
+            fprintf(stderr, "fathom: cannot instrument library %s\n", b->path);
+            return -1;
+        }
+        size_t first = ex->bp_count;
+        for (size_t i = 0; i < b->ana.cov_count; i++) {
+            const fathom_block_t *blk = &b->cfg_graph.blocks[b->ana.cov_blocks[i]];
+            int slot = fathom_exec_add_breakpoint(ex, FATHOM_MODULE_ADDR(m, blk->start_addr));
+            if (slot < 0) {
+                fprintf(stderr, "fathom: breakpoint setup failed\n");
+                return -1;
+            }
+            if (slot_block)
+                slot_block[slot] = li == 0 ? b->ana.cov_blocks[i] : UINT32_MAX;
+            if (slot_score)
+                slot_score[slot] = blk->score;
+        }
+        /* Loop headers count their iterations, so a different trip count is new coverage. */
+        for (size_t i = 0; counted && i < b->ana.cov_count; i++) {
+            const fathom_block_t *blk = &b->cfg_graph.blocks[b->ana.cov_blocks[i]];
+            if (blk->is_loop_header && blk->insn_count > 1)
+                counted[first + i] = fathom_exec_count_hits(ex, (int)(first + i),
+                    FATHOM_MODULE_ADDR(m, b->dis.insns[blk->insn_start + 1].addr)) == 0;
+        }
+        if (!cmplog)
+            continue;
+        fathom_cmp_site_t *sites = NULL;
+        long n = fathom_cmp_sites(&b->bin, &b->dis, &b->cfg_graph, b->ana.cov_blocks,
+                                  b->ana.cov_count, &sites);
+        for (long i = 0; i < n; i++) {
+            sites[i].addr = FATHOM_MODULE_ADDR(m, sites[i].addr);
+            *n_cmp += fathom_exec_add_cmp_site(ex, &sites[i]) >= 0;
+        }
+        free(sites);
+    }
+    return 0;
+}
+
+static size_t total_blocks(const fathom_session_t *s)
+{
+    size_t n = s->ana.cov_count;
+    for (size_t i = 0; i < s->n_libs; i++)
+        n += s->libs[i].ana.cov_count;
+    return n;
 }
 
 /* ── Replay and minimise ─────────────────────────────────────────────── */
@@ -437,10 +545,8 @@ static int run_replay(const fathom_opts_t *opts, const char *path, bool minimize
     if (fathom_exec_init(&ex, cfg, &s.bin) < 0)
         goto done;
     ex_ready = true;
-    for (size_t i = 0; i < s.ana.cov_count; i++) {
-        if (fathom_exec_add_breakpoint(&ex, s.cfg_graph.blocks[s.ana.cov_blocks[i]].start_addr) < 0)
-            goto done;
-    }
+    if (instrument(&ex, &s, NULL, NULL, NULL, false, NULL) < 0)
+        goto done;
     if (fathom_coverage_init(&cov, ex.bp_count) < 0)
         goto done;
     cov_ready = true;
@@ -538,8 +644,9 @@ typedef struct {
     fathom_dict_t          frontier;
     fathom_stats_t         stats;
 
-    uint32_t              *slot_block;
+    uint32_t              *slot_block;  /* target slots only; UINT32_MAX for libraries */
     int32_t               *block_slot;
+    double                *slot_score;
     uint32_t              *epoch;       /* coverage gain in which each slot was first hit */
     bool                  *counted;     /* slot counts loop iterations, so stays armed */
     bool                  *block_covered;
@@ -580,7 +687,7 @@ static double take_coverage(worker_t *w)
     w->gains++;
     for (size_t s = 0; s < w->cov.size; s++) {
         if (w->cov.local[s] && !w->cov.global[s]) {
-            score += w->session->cfg_graph.blocks[w->slot_block[s]].score;
+            score += w->slot_score[s];
             w->epoch[s] = w->gains;
         }
     }
@@ -588,7 +695,8 @@ static double take_coverage(worker_t *w)
     w->stats.covered = w->cov.total_blocks;
     w->stats.last_gain_us = fathom_now_us();
     fathom_frontier(&w->frontier, &w->session->cfg_graph, &w->session->dis, w->cov.global,
-                    w->cov.size, w->slot_block, w->block_slot, w->epoch, w->gains);
+                    w->session->ana.cov_count, w->slot_block, w->block_slot, w->epoch,
+                    w->gains);
     return score;
 }
 
@@ -622,7 +730,8 @@ static void update_steer(worker_t *w)
         fathom_input_t *inp = &w->corpus.inputs[i];
         inp->steer = 0;
         for (size_t k = 0; k < inp->slot_count; k++) {
-            double v = w->block_steer[w->slot_block[inp->slots[k]]];
+            uint32_t blk = w->slot_block[inp->slots[k]];
+            double v = blk == UINT32_MAX ? 0 : w->block_steer[blk];
             if (v > inp->steer)
                 inp->steer = v;
         }
@@ -1096,7 +1205,8 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         goto cleanup;
     }
 
-    if (fathom_coverage_init(&w->cov, session->ana.cov_count) < 0) {
+    size_t nslots = total_blocks(session);
+    if (fathom_coverage_init(&w->cov, nslots) < 0) {
         fprintf(stderr, "fathom: coverage init failed\n");
         goto cleanup;
     }
@@ -1126,49 +1236,29 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     }
     ex_ready = true;
 
-    /* One breakpoint per instrumentable block; slot i ↔ cov_blocks[i]. */
-    w->slot_block = malloc((session->ana.cov_count + 1) * sizeof(*w->slot_block));
+    /* One breakpoint per instrumentable block of the target and its libraries. */
+    w->slot_block = malloc((nslots + 1) * sizeof(*w->slot_block));
+    w->slot_score = calloc(nslots + 1, sizeof(*w->slot_score));
     w->block_slot = malloc((session->cfg_graph.block_count + 1) * sizeof(*w->block_slot));
-    w->epoch = calloc(session->ana.cov_count + 1, sizeof(*w->epoch));
+    w->epoch = calloc(nslots + 1, sizeof(*w->epoch));
+    w->peer_next = calloc(opts->cfg.jobs + 1, sizeof(*w->peer_next));
+    w->counted = calloc(nslots + 1, sizeof(*w->counted));
+    w->block_covered = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_covered));
+    w->block_steer = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_steer));
     buf = malloc(g_max_input);
-    if (!w->slot_block || !w->block_slot || !w->epoch || !buf) {
+    if (!w->slot_block || !w->slot_score || !w->block_slot || !w->epoch || !buf ||
+        !w->counted || !w->block_covered || !w->block_steer || !w->peer_next) {
         fprintf(stderr, "fathom: out of memory\n");
         goto cleanup;
     }
+    if (instrument(&w->ex, session, w->slot_block, w->slot_score, w->counted,
+                   !opts->no_cmplog, &w->n_cmp_sites) < 0)
+        goto cleanup;
     for (size_t i = 0; i < session->cfg_graph.block_count; i++)
         w->block_slot[i] = -1;
-    for (size_t i = 0; i < session->ana.cov_count; i++) {
-        uint32_t bid = session->ana.cov_blocks[i];
-        int slot = fathom_exec_add_breakpoint(&w->ex, session->cfg_graph.blocks[bid].start_addr);
-        if (slot < 0) {
-            fprintf(stderr, "fathom: breakpoint setup failed\n");
-            goto cleanup;
-        }
-        w->slot_block[slot] = bid;
-        w->block_slot[bid] = slot;
-    }
-    /* Loop headers count their iterations, so a different trip count is new coverage. */
-    w->peer_next = calloc(opts->cfg.jobs + 1, sizeof(*w->peer_next));
-    w->counted = calloc(session->ana.cov_count + 1, sizeof(*w->counted));
-    w->block_covered = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_covered));
-    w->block_steer = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_steer));
-    if (!w->counted || !w->block_covered || !w->block_steer || !w->peer_next)
-        goto cleanup;
-    for (size_t i = 0; i < session->ana.cov_count; i++) {
-        const fathom_block_t *b = &session->cfg_graph.blocks[session->ana.cov_blocks[i]];
-        if (b->is_loop_header && b->insn_count > 1)
-            w->counted[i] = fathom_exec_count_hits(&w->ex, (int)i,
-                                session->dis.insns[b->insn_start + 1].addr) == 0;
-    }
+    for (size_t i = 0; i < session->ana.cov_count; i++)
+        w->block_slot[w->slot_block[i]] = (int32_t)i;
     w->stats.instrumented = w->ex.bp_count;
-
-    fathom_cmp_site_t *sites = NULL;
-    long nsites = opts->no_cmplog ? 0
-                : fathom_cmp_sites(&session->bin, &session->dis, &session->cfg_graph,
-                                   session->ana.cov_blocks, session->ana.cov_count, &sites);
-    for (long i = 0; i < nsites; i++)
-        w->n_cmp_sites += fathom_exec_add_cmp_site(&w->ex, &sites[i]) >= 0;
-    free(sites);
 
     if (w->corpus.resumed)
         fprintf(stderr, "%s%sresuming %s: %zu queue entries, %zu unique crashes\n",
@@ -1260,6 +1350,7 @@ cleanup:
     }
     free(buf);
     free(w->slot_block);
+    free(w->slot_score);
     free(w->block_slot);
     free(w->epoch);
     free(w->counted);
@@ -1509,6 +1600,7 @@ int main(int argc, char *argv[])
         {"no-cmplog", no_argument,      NULL, 'C'},
         {"fork-server", no_argument,    NULL, 'K'},
         {"det",      no_argument,       NULL, 'X'},
+        {"lib",      required_argument, NULL, 'L'},
         {"version",  no_argument,       NULL, 'V'},
         {"minimize", required_argument, NULL, 'M'},
         {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
@@ -1542,6 +1634,14 @@ int main(int argc, char *argv[])
         case 'C': opts.no_cmplog = true; break;
         case 'K': opts.cfg.fork_server = true; break;
         case 'X': opts.det = true; break;
+        case 'L':
+            if (g_n_libs == MAX_LIBS) {
+                fprintf(stderr, "fathom: at most %d --lib options\n", MAX_LIBS);
+                ok = false;
+                break;
+            }
+            g_libs[g_n_libs++] = optarg;
+            break;
         case 'V':
             printf("fathom %d.%d.%d\n", FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR,
                    FATHOM_VERSION_PATCH);

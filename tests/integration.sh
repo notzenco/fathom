@@ -257,6 +257,29 @@ else
     diff <(digest "$out/a") <(digest "$out/b") | head -5
 fi
 
+info "library: a maze inside a shared library is solved with --lib"
+case "$(uname -s)" in
+    Linux) LIBMAZE="$TARGETS/libmaze.so" ;;
+    Darwin) LIBMAZE="$TARGETS/libmaze.dylib" ;;
+    *) LIBMAZE="$TARGETS/libmaze.dll" ;;
+esac
+out=$(new_outdir library)
+mkdir -p "$out/seeds"
+printf 'AAAA' > "$out/seeds/a"
+set +e
+"$FATHOM" --lib "$LIBMAZE" -i "$out/seeds" -o "$out/run" -t 1000 -T "$MAZE_SECS" -s 1 \
+    --until-crash -- "$TARGETS/lib_user$EXE" 2>"$out/log"
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+    fail "library: fathom exited with status $rc"
+    tail -5 "$out/log"
+elif [ "$(count_crashes "$out/run")" -eq 0 ]; then
+    fail "library: maze in the library not solved"
+else
+    ok "library: solved after $(stat_of "$out/run" first_crash_execs) execs"
+fi
+
 if [ "$(uname -s)" = Linux ]; then
     info "fork server: the maze is solved with --fork-server"
     out=$(new_outdir forkserver)

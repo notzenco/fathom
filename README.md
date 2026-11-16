@@ -190,6 +190,14 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
   against 1,304 runs a second), while for a trivial target the extra
   ptrace round trips cost about as much as they save. It falls back to a
   fresh process per run if the template cannot be set up.
+- **Shared libraries** (`--lib <path>`, repeatable). The library is
+  analysed like the target and its blocks become extra coverage slots,
+  with loop counts, comparison logging and dictionary tokens. Its
+  breakpoints go in once it is mapped: on Linux and macOS when the
+  target reaches its entry point (the loader has mapped its dependencies
+  by then), on Windows as the DLL loads. A maze inside `libmaze` is
+  solved in a few hundred runs with `--lib` and not at all without it.
+  Libraries loaded later with `dlopen` are not covered.
 - Parallel mode (`-j`) runs worker processes with sharded output
   directories. Every 10 seconds each worker runs the queue entries its
   peers added and keeps those that reach something new for it; a crash a
@@ -241,6 +249,8 @@ Options:
   --max-input <n> Largest input to generate, in bytes (default: 1048576)
   --fail-on-crash Exit with status 2 if any unique crash was found
   --no-cmplog Skip comparison logging (input-to-state) on new inputs
+  --lib <so>  Also instrument this shared library (.so, .dylib, .dll)
+              the target loads at startup; repeatable
   --det       Try every deterministic edit (bit flips, small arithmetic,
               interesting values) of each new input up to 256 bytes
   --fork-server   Linux: fork each run from the target stopped at its
