@@ -253,7 +253,7 @@ static int prepare_session(const fathom_config_t *cfg, bool quiet,
         fprintf(stderr, "fathom: disassembly failed\n");
         goto fail;
     }
-    if (fathom_cfg_build(&s->cfg_graph, &s->dis) < 0) {
+    if (fathom_cfg_build(&s->cfg_graph, &s->dis, &s->bin) < 0) {
         fprintf(stderr, "fathom: CFG build failed\n");
         goto fail;
     }
