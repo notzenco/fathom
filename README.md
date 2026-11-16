@@ -332,7 +332,8 @@ bash tests/bench.sh 30 5   # time to crash per target: 30 s budget, 5 seeds
   the median time, executions, execution rate and coverage. Besides the
   test targets it covers known hard cases: a `memcmp` magic string, a
   big-endian length field, and an `-O2` comparison against a magic value
-  kept in data, so it is never an immediate operand. Run it on two builds to compare them.
+  kept in data, so it is never an immediate operand. Run it on two builds
+  to compare them.
 - **Integration tests** fuzz from a seed that contains none of the bytes
   the bugs need. The maze must be solved on every platform. They also check
   that hangs are not reported as crashes and that parallel workers shard
