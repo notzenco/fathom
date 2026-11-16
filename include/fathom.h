@@ -273,6 +273,7 @@ typedef struct {
     bool            cull_dirty;   /* favored set needs recomputing */
     uint64_t        rng;          /* scheduling randomness, see fathom_corpus_seed */
     bool            resumed;      /* loaded an existing queue instead of the seeds */
+    size_t          unique_hangs;
 } fathom_corpus_t;
 
 /* ── Executor types ──────────────────────────────────────────────────── */
@@ -331,6 +332,8 @@ typedef struct {
 
 /* Binary images */
 int  fathom_binary_open(fathom_binary_t *bin, const char *path);
+/* Function symbol at or before addr, with addr's offset into it, or NULL. */
+const char *fathom_symbol_near(const fathom_binary_t *bin, uint64_t addr, uint64_t *off);
 void fathom_binary_close(fathom_binary_t *bin);
 const fathom_section_t *fathom_binary_find_section(const fathom_binary_t *bin,
                                                    const char *name);
@@ -420,6 +423,14 @@ int  fathom_trim(fathom_exec_t *ex, fathom_coverage_t *cov, uint8_t *buf,
                  size_t *len, uint64_t want_hash, uint32_t max_execs,
                  uint64_t *execs);
 
+/*
+ * Shrink a crashing input while it still crashes with crash_hash, first
+ * by deleting chunks and then bytes.  Same budget rules as fathom_trim.
+ */
+int  fathom_minimize(fathom_exec_t *ex, fathom_coverage_t *cov, uint8_t *buf,
+                     size_t *len, uint64_t crash_hash, uint32_t max_execs,
+                     uint64_t *execs);
+
 /* Corpus */
 int  fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
                         const char *output_dir);
@@ -450,6 +461,16 @@ void fathom_corpus_remove(fathom_corpus_t *corpus, size_t idx);
 uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx);
 int  fathom_corpus_save_crash(fathom_corpus_t *corpus, const uint8_t *data,
                               size_t len, uint64_t hash);
+/* Write text as crashes/crash_<hash>.txt, next to the crash's input. */
+int  fathom_corpus_describe_crash(fathom_corpus_t *corpus, uint64_t hash, const char *text);
+/*
+ * Save a timed-out input as hangs/hang_<hash> unless that hash was seen
+ * (hash: the path it took, see fathom_coverage_hash).  At most
+ * FATHOM_MAX_HANGS are kept.  Returns 1 if saved, 0 if not, -1 on error.
+ */
+#define FATHOM_MAX_HANGS 256
+int  fathom_corpus_save_hang(fathom_corpus_t *corpus, const uint8_t *data,
+                             size_t len, uint64_t hash);
 
 /* Dictionary */
 void fathom_dict_init(fathom_dict_t *dict);

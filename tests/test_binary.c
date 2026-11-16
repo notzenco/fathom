@@ -94,10 +94,20 @@ static void test_fixture(const fixture_t *fx)
     CHECK(has_import(&bin, fx->copy_name), "%s import", fx->copy_name);
     if (!fx->stripped) {
         bool main_found = false;
-        for (size_t i = 0; i < bin.symbol_count; i++)
-            main_found |= strcmp(bin.symbols[i].name, "main") == 0 &&
-                          bin.symbols[i].type == FATHOM_SYM_FUNC;
+        uint64_t main_addr = 0;
+        for (size_t i = 0; i < bin.symbol_count; i++) {
+            if (strcmp(bin.symbols[i].name, "main") == 0 &&
+                bin.symbols[i].type == FATHOM_SYM_FUNC) {
+                main_found = true;
+                main_addr = bin.symbols[i].addr;
+            }
+        }
         CHECK(main_found, "main symbol");
+
+        /* Crash reports name the function a PC is in. */
+        uint64_t off = 99;
+        const char *near = fathom_symbol_near(&bin, main_addr + 4, &off);
+        CHECK(near && strcmp(near, "main") == 0 && off == 4, "symbol near main+4");
     }
 
     if (fathom_disasm_open(&dis, &bin) != 0) {

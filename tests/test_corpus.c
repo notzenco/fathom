@@ -514,6 +514,35 @@ static void test_resume(void)
     PASS("resume");
 }
 
+/* Hangs are kept like crashes, deduplicated, and crashes get a report. */
+static void test_hangs_and_reports(void)
+{
+    make_tmpdir();
+    char outdir[512], path[PATH_MAX_T];
+    snprintf(outdir, sizeof(outdir), "%s/out", g_tmpdir);
+    fathom_corpus_t corpus;
+    assert(fathom_corpus_init(&corpus, NULL, outdir) == 0);
+
+    assert(fathom_corpus_save_hang(&corpus, (const uint8_t *)"slow", 4, 7) == 1);
+    assert(fathom_corpus_save_hang(&corpus, (const uint8_t *)"slow2", 5, 7) == 0);
+    assert(corpus.unique_hangs == 1);
+    snprintf(path, sizeof(path), "%s/hangs", outdir);
+    assert(count_files(path) == 1);
+
+    assert(fathom_corpus_save_crash(&corpus, (const uint8_t *)"boom", 4, 0x55) == 1);
+    assert(fathom_corpus_describe_crash(&corpus, 0x55, "signal: SIGSEGV\n") == 0);
+    snprintf(path, sizeof(path), "%s/crashes/crash_%016x.txt", outdir, 0x55);
+    assert(file_exists(path));
+    fathom_corpus_destroy(&corpus);
+
+    /* The report is not mistaken for a crash input on resume. */
+    assert(fathom_corpus_init(&corpus, NULL, outdir) == 0);
+    assert(corpus.unique_crashes == 1 && corpus.unique_hangs == 1);
+    fathom_corpus_destroy(&corpus);
+    rmrf(g_tmpdir);
+    PASS("hangs_and_reports");
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -534,6 +563,7 @@ int main(void)
     test_destroy();
     test_favored();
     test_resume();
+    test_hangs_and_reports();
 
     fprintf(stderr, "All corpus tests passed.\n");
     return 0;
