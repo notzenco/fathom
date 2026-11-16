@@ -87,6 +87,15 @@ struct fathom_exec_os {
     size_t    pc_adjust;
 
     uint64_t  slide;         /* runtime address - link-time address */
+
+    /*
+     * Input by path: target_argv contains "@@", so the backend keeps the
+     * input file at input_path (stdin is then empty) and argv is a copy
+     * with "@@" replaced by that path.
+     */
+    bool      input_by_path;
+    char      input_path[1100];
+    char    **argv;
     /*
      * The target has exec'd a different program, so no address is in our
      * image any more: breakpoints and link-time crash PCs no longer apply.

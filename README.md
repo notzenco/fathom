@@ -193,6 +193,9 @@ guessed in a single mutation.
 ```
 Usage: fathom [options] -- /path/to/target [target_args...]
 
+Input reaches the target on stdin, or as a file whose path replaces
+every @@ in target_args (then stdin is empty).
+
 Options:
   -i <dir>    Input corpus (seeds)
   -o <dir>    Output directory (default: ./fathom-out)
@@ -209,7 +212,15 @@ Options:
   -h          Show this help
 ```
 
-Input reaches the target on stdin. The output directory holds `queue/`
+Input reaches the target on stdin, or as a file: every `@@` in the
+target's arguments (also inside one, as in `--input=@@`) is replaced by
+the path of a file holding the input, and stdin is then empty:
+
+```sh
+./fathom -i seeds -o out -- ./parser --strict @@
+```
+
+The output directory holds `queue/`
 (inputs that found new coverage), `crashes/` (one file per unique crash)
 and `fuzzer_stats` (executions, coverage, crashes, hangs and time to first
 crash). With `-j`, each worker writes to `out/worker-NNN/`.
@@ -306,8 +317,6 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
   mode, so throughput is bounded by process creation, which is slowest on
   Windows. On macOS, `task_for_pid()` adds roughly 10 ms per run unless
   fathom runs as root.
-- **Inputs arrive on stdin only.** File-path (`@@`) delivery is not
-  implemented.
 - **64-bit only.** 32-bit x86/ARM and big-endian targets are rejected.
 - Code reached only through indirect jumps other than recognised jump
   tables (function pointers stored in data, computed gotos) is left

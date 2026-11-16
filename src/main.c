@@ -292,6 +292,9 @@ static void usage(const char *prog)
     fprintf(stderr,
         "Usage: %s [options] -- /path/to/target [target_args...]\n"
         "\n"
+        "Input reaches the target on stdin, or as a file whose path replaces\n"
+        "every @@ in target_args (then stdin is empty).\n"
+        "\n"
         "Options:\n"
         "  -i <dir>    Input corpus (seeds)\n"
         "  -o <dir>    Output directory (default: ./fathom-out)\n"
