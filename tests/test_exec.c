@@ -233,6 +233,32 @@ static void test_recovered_fault(void)
     END();
 }
 
+/* Loop headers count iterations, so a different trip count is new coverage. */
+static void test_loop_counts(void)
+{
+    BEGIN("loop_iterations_are_coverage");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("loop_count")) == 0, "load failed");
+    for (size_t i = 0; i < t.ana.cov_count; i++) {
+        const fathom_block_t *b = &t.cfg.blocks[t.ana.cov_blocks[i]];
+        if (b->is_loop_header && b->insn_count > 1)
+            fathom_exec_count_hits(&t.ex, (int)i, t.dis.insns[b->insn_start + 1].addr);
+    }
+    CHECK(run_cov(&t, &cov, "1", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    fathom_coverage_merge(&cov);
+    CHECK(run_cov(&t, &cov, "1", &res) == 0, "exec failed");
+    CHECK(!fathom_coverage_has_new(&cov), "same trip count is not new");
+    CHECK(run_cov(&t, &cov, "5", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    CHECK(fathom_coverage_has_new(&cov), "a longer loop should be new coverage");
+    fathom_coverage_merge(&cov);
+    CHECK(run_cov(&t, &cov, "9", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    CHECK(fathom_coverage_has_new(&cov), "past the 4-7 bucket should be new coverage");
+    unload(&t, &cov);
+    END();
+}
+
 /* Trimming drops bytes that do not change the path. */
 static void test_trim(void)
 {
@@ -345,6 +371,7 @@ int main(void)
     test_original_trap();
     test_recovered_fault();
     test_trim();
+    test_loop_counts();
 #ifndef _WIN32
     test_reexec();
     test_forked_children();

@@ -59,6 +59,18 @@ struct fathom_exec_os {
     uint8_t  *orig;          /* launch-time bytes of every cluster */
     uint8_t  *patched;       /* the same with breakpoints written in */
     size_t   *bp_off;        /* slot -> offset of its bytes in orig */
+
+    /*
+     * Hit counting (fathom_exec_count_hits): a counted block's breakpoint
+     * is restored as usual, and a temporary one on the block's second
+     * instruction ("follow") re-arms it once the first has run.
+     */
+    uint64_t *follow_addrs;
+    uint32_t *follow_slot;   /* follow -> slot it re-arms */
+    size_t   *follow_off;    /* follow -> offset of its bytes in orig */
+    size_t    n_follow;
+    uint32_t *bp_follow;     /* slot -> follow, or UINT32_MAX */
+    size_t    bp_follow_len;
     /*
      * orig and patched were read at patch_slide.  Code bytes only change
      * with the load address, so they are reused while it stays the same.
@@ -88,18 +100,29 @@ struct fathom_exec_os {
 #endif
 };
 
-/* Slot for link-time address addr, or -1. */
+/* Slot for link-time address addr, or -1 (also for follow breakpoints). */
 int exec_bp_lookup(const fathom_exec_t *ex, uint64_t addr);
+/* Whether link-time address addr holds any of our breakpoints. */
+bool exec_is_ours(const fathom_exec_t *ex, uint64_t addr);
+
+/* A write into the target at a runtime address. */
+typedef struct {
+    uint64_t       addr;
+    const uint8_t *bytes;
+    size_t         len;
+} exec_write_t;
 
 /*
  * Handle a breakpoint trap at runtime address pc_bp (already adjusted
- * to the breakpoint's own address).  Marks coverage and tells the
- * caller which original bytes to write back.  Returns false if pc_bp is
- * not one of ours, including a block whose own first instruction is a
- * trap: that one was never patched and belongs to the target.
+ * to the breakpoint's own address).  Marks coverage and fills w with
+ * the writes to make before resuming at pc_bp: the original bytes back,
+ * and for counted blocks the breakpoint that comes next.  Returns the
+ * number of writes, or 0 if pc_bp is not one of ours, including a block
+ * whose own first instruction is a trap: that one was never patched and
+ * belongs to the target.
  */
-bool exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
-                 const uint8_t **orig, size_t *len);
+size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
+                   exec_write_t w[2]);
 
 /*
  * Hash a crash from its PC and frame-pointer chain, so the same bug

@@ -253,17 +253,20 @@ static DWORD on_exception(run_t *r, const DEBUG_EVENT *ev, bool *kill_now)
     CONTEXT ctx;
 
     if (code == EXCEPTION_BREAKPOINT && first) {
-        const uint8_t *orig;
-        size_t len;
+        exec_write_t w[2];
+        size_t nw;
         HANDLE th = open_thread(ev->dwThreadId, &ctx);
         if (!th) {
             r->failed = *kill_now = true;
             return DBG_CONTINUE;
         }
         DWORD cont = DBG_CONTINUE;
-        if (exec_bp_hit(r->ex, r->cov, addr, &orig, &len)) {
+        if ((nw = exec_bp_hit(r->ex, r->cov, addr, w)) > 0) {
+            bool ok = true;
+            for (size_t i = 0; i < nw; i++)
+                ok = ok && write_code(r->proc, w[i].addr, w[i].bytes, w[i].len);
             CTX_PC(ctx) = addr;
-            if (!write_code(r->proc, addr, orig, len) || !SetThreadContext(th, &ctx)) {
+            if (!ok || !SetThreadContext(th, &ctx)) {
                 fprintf(stderr, "fathom: cannot restore code under the breakpoint "
                                 "at 0x%llx (%lu)\n", (unsigned long long)addr,
                         GetLastError());

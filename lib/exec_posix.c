@@ -414,7 +414,7 @@ static bool find_thread(target_t *t, fathom_exec_t *ex, bool want_bp, regs_t *ou
         regs_t r;
         if (!found && thread_regs(threads[i], &r) &&
             (!want_bp ||
-             exec_bp_lookup(ex, r.pc - ex->os->pc_adjust - ex->os->slide) >= 0)) {
+             exec_is_ours(ex, r.pc - ex->os->pc_adjust - ex->os->slide))) {
             *out = r;
             found = true;
             continue;   /* keep this thread's port */
@@ -574,12 +574,15 @@ static kern_return_t exc_handle(const exc_request_t *rq, exc_reply_t *rp)
     pthread_mutex_lock(&g_exc.lock);
     fathom_exec_t *ex = g_exc.ex;
     if (ex) {
-        const uint8_t *orig;
-        size_t len;
+        exec_write_t w[2];
         uint64_t bp = STATE_PC(st) - ex->os->pc_adjust;
-        if (rq->exception == EXC_BREAKPOINT &&
-            exec_bp_hit(ex, g_exc.cov, bp, &orig, &len)) {
-            if (task_write(task, bp, orig, len)) {
+        size_t nw = rq->exception == EXC_BREAKPOINT
+                  ? exec_bp_hit(ex, g_exc.cov, bp, w) : 0;
+        if (nw) {
+            bool ok = true;
+            for (size_t i = 0; i < nw; i++)
+                ok = ok && task_write(task, w[i].addr, w[i].bytes, w[i].len);
+            if (ok) {
                 STATE_SET_PC(st, bp);
                 ret = KERN_SUCCESS;
             } else {
@@ -1178,8 +1181,8 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 
         if (sig == SIGTRAP) {
             regs_t r;
-            const uint8_t *orig;
-            size_t len;
+            exec_write_t w[2];
+            size_t nw = 0;
 #if defined(__linux__)
             bool have = tgt_get_regs(&t, tid, &r);
             uint64_t pc = have ? REG_PC(r) : 0;
@@ -1188,8 +1191,10 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
             uint64_t pc = have ? r.pc : 0;
 #endif
             uint64_t bp = pc - os->pc_adjust;
-            if (have && exec_bp_hit(ex, cov, bp, &orig, &len)) {
-                bool restored = tgt_write(&t, bp, orig, len);
+            if (have && (nw = exec_bp_hit(ex, cov, bp, w)) > 0) {
+                bool restored = true;
+                for (size_t i = 0; i < nw; i++)
+                    restored = restored && tgt_write(&t, w[i].addr, w[i].bytes, w[i].len);
 #if defined(__linux__)
                 REG_PC(r) = bp;
                 restored = restored && tgt_set_regs(&t, tid, &r);
