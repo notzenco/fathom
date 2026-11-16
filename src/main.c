@@ -974,6 +974,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     if (opts->have_seed) {
         fathom_mutator_seed(&w->mut, opts->seed + (uint64_t)worker_id);
         fathom_corpus_seed(&w->corpus, ~(opts->seed + (uint64_t)worker_id));
+        w->corpus.deterministic = true;
     }
 
     if (fathom_exec_init(&w->ex, cfg, &session->bin) < 0) {

@@ -500,9 +500,10 @@ void fathom_corpus_remove(fathom_corpus_t *corpus, size_t idx)
     corpus->cull_dirty = true;
 }
 
-static double input_cost(const fathom_input_t *inp)
+static double input_cost(const fathom_corpus_t *corpus, const fathom_input_t *inp)
 {
-    return (double)(inp->exec_us + 1) * (double)(inp->len + 1);
+    double us = corpus->deterministic ? 1.0 : (double)(inp->exec_us + 1);
+    return us * (double)(inp->len + 1);
 }
 
 /*
@@ -535,7 +536,8 @@ static void cull(fathom_corpus_t *corpus)
         for (size_t k = 0; k < inp->slot_count; k++) {
             size_t s = inp->slots[k];
             if (s < m && (top[s] == SIZE_MAX ||
-                          input_cost(inp) < input_cost(&corpus->inputs[top[s]])))
+                          input_cost(corpus, inp) <
+                              input_cost(corpus, &corpus->inputs[top[s]])))
                 top[s] = i;
         }
     }
@@ -566,9 +568,12 @@ uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx)
         }
     }
 
-    /* AFL's calculate_score, in spirit: speed and coverage relative to the queue. */
+    /*
+     * AFL's calculate_score, in spirit: speed and coverage relative to the
+     * queue.  Speed is left out of deterministic runs.
+     */
     double e = FATHOM_ENERGY_BASE;
-    if (inp->slots && traced) {
+    if (inp->slots && traced && !corpus->deterministic) {
         double us = (double)inp->exec_us, avg_us = sum_us / (double)traced;
         if (us * 0.1 > avg_us)       e *= 0.1;
         else if (us * 0.25 > avg_us) e *= 0.25;
@@ -577,7 +582,8 @@ uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx)
         else if (us * 4 < avg_us)    e *= 3;
         else if (us * 3 < avg_us)    e *= 2;
         else if (us * 2 < avg_us)    e *= 1.5;
-
+    }
+    if (inp->slots && traced) {
         double c = (double)inp->slot_count, avg_c = sum_cov / (double)traced;
         if (c * 0.3 > avg_c)         e *= 3;
         else if (c * 0.5 > avg_c)    e *= 2;
