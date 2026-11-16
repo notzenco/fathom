@@ -18,8 +18,7 @@
 #define FATHOM_CORPUS_GROW      2
 
 /*
- * Maximum number of unique crash hashes tracked for dedup.
- * Must be a power of two for the open-addressing hash set.
+ * Initial slot count of the crash dedup hash set; it doubles as it fills.
  */
 #define FATHOM_CRASH_HASHSET_CAP  4096
 
@@ -45,7 +44,7 @@ void fathom_hashset_destroy(fathom_hashset_t *hs);
 
 /*
  * Insert a hash.  Returns 1 if newly inserted, 0 if already present,
- * -1 on error (full).  Hash value 0 is reserved as the empty sentinel;
+ * -1 on allocation failure.  Hash value 0 is reserved as the empty sentinel;
  * if the caller provides 0 it is silently mapped to 1.
  */
 int  fathom_hashset_insert(fathom_hashset_t *hs, uint64_t hash);
