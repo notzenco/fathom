@@ -14,7 +14,9 @@ and scores every basic block: calls to dangerous functions (`memcpy`,
 It then runs the target under the operating system's debugger API with a
 breakpoint on every reachable block, so each run reports which blocks
 executed. Inputs that reach new blocks join the corpus, and inputs that
-reach high-scoring blocks are fuzzed first.
+reach, or come close to, high-scoring blocks are fuzzed hardest. Values the
+target compares its input against are read at run time and written back
+into the input, which gets past magic numbers and string checks.
 
 ```
 binary ──► load ──► disassemble ──► CFG ──► score blocks ──► dictionary
@@ -32,7 +34,7 @@ binary ──► load ──► disassemble ──► CFG ──► score blocks
 | Host OS | Target format | Architectures | Debugger backend |
 |---------|---------------|---------------|------------------|
 | Linux   | ELF           | x86-64, arm64 | `ptrace`, `/proc/<pid>/mem` |
-| macOS   | Mach-O, incl. universal | x86-64, arm64 | `ptrace` + Mach task port |
+| macOS   | Mach-O, incl. universal | x86-64, arm64 | `ptrace`, Mach task and exception ports |
 | Windows | PE32+         | x64, ARM64    | Win32 debug API |
 
 Analysis mode (`-a`) reads any of the three formats on any host, so a
@@ -57,8 +59,8 @@ compare these within a row rather than across rows:
 Process creation dominates: Linux runs a few thousand targets a second
 (more with `--fork-server` when startup is expensive), macOS under a
 hundred without root (`task_for_pid()` costs about 10 ms), and Windows 30
-to 50. On Windows the statically
-linked MinGW runtime also adds about 100 startup blocks to every run.
+to 50. On Windows the statically linked MinGW runtime also adds about 100
+startup blocks to every run.
 
 ## How coverage works without instrumentation
 
@@ -172,7 +174,8 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
   weights decay by 0.95x. Arithmetic and interesting values use 8- to
   64-bit widths in either byte order, insert and delete change the length,
   and havoc stacks all of them.
-- Seedable xorshift PRNG (`-s`), so runs are reproducible.
+- Seedable xorshift PRNG (`-s`), so runs are reproducible: with a seed,
+  scheduling also ignores run times, which vary from run to run.
 - Crash deduplication by FNV-1a hash of the crash PC and the frame-pointer
   return chain. Main-image addresses count at their link-time value and
   library addresses as module path plus offset, so the same bug hashes the
@@ -222,6 +225,9 @@ mkdir seeds && printf 'AAAA' > seeds/a
 
 # Four parallel workers
 ./fathom -i seeds -o out -j 4 -- ./my_target
+
+# A target that takes a file name, with its parser in a shared library
+./fathom -i seeds -o out --lib ./libparse.so -- ./my_target --input @@
 ```
 
 `tests/targets/maze` crashes only on input starting with `FUZZ`, each
@@ -237,60 +243,71 @@ Usage: fathom [options] -- /path/to/target [target_args...]
 Input reaches the target on stdin, or as a file whose path replaces
 every @@ in target_args (then stdin is empty).
 
-Options:
-  -i <dir>    Input corpus (seeds)
-  -o <dir>    Output directory (default: ./fathom-out)
-  -t <ms>     Timeout per exec (default: 1000)
-  -j <n>      Parallel instances (default: 1)
-  -T <secs>   Stop after this many seconds (default: run until Ctrl-C)
-  -s <seed>   Random seed, for reproducible runs
-  --until-crash  Stop after the first unique crash
-  --trim      Shrink queue inputs that keep the same blocks (off by
-              default: coverage cannot see loop counts)
-  -a          Analysis-only mode (print CFG + scores, no fuzzing)
-  --max-execs <n> Stop after n target runs
-  --max-input <n> Largest input to generate, in bytes (default: 1048576)
-  --fail-on-crash Exit with status 2 if any unique crash was found
-  --no-cmplog Skip comparison logging (input-to-state) on new inputs
-  --lib <so>  Also instrument this shared library (.so, .dylib, .dll)
-              the target loads at startup; repeatable
-  --det       Try every deterministic edit (bit flips, small arithmetic,
-              interesting values) of each new input up to 256 bytes
-  --fork-server   Linux: fork each run from the target stopped at its
-                  entry point instead of starting it afresh
-  --version   Show the version
-  --replay <f>    Run input f once and report the outcome (exit
-                  status 0 ok, 2 crash, 3 hang)
-  --minimize <f>  Shrink crashing input f to f.min, keeping the crash
-  -v          Verbose output
-  --dict <f>  Extra dictionary file
-  -h          Show this help
+Input and output:
+  -i <dir>           Seed inputs
+  -o <dir>           Output directory, resumed if it already has a queue
+                     (default: ./fathom-out)
+  --dict <file>      Extra dictionary file
+  --lib <path>       Also instrument this shared library the target loads
+                     at startup (.so, .dylib, .dll); repeatable
+
+Running:
+  -t <ms>            Timeout per run (default: 1000)
+  -j <n>             Parallel workers (default: 1)
+  -T <secs>          Stop after this many seconds (default: until Ctrl-C)
+  --max-execs <n>    Stop after n target runs
+  --until-crash      Stop at the first unique crash
+  --fail-on-crash    Exit with status 2 if any unique crash was found
+  --fork-server      Linux: fork each run from the target stopped at its
+                     entry point instead of starting it afresh
+
+Fuzzing:
+  -s <seed>          Random seed, for reproducible runs
+  --max-input <n>    Largest input to generate, in bytes (default: 1048576)
+  --no-cmplog        Skip comparison logging (input-to-state)
+  --det              Try every deterministic edit (bit flips, small
+                     arithmetic, interesting values) of new inputs up to
+                     256 bytes
+  --trim             Shrink queue inputs that keep the same blocks (off by
+                     default: coverage cannot see loop counts)
+
+Other modes:
+  -a                 Analysis only: print the CFG summary and top blocks
+  --replay <file>    Run one input and report the outcome (exit status
+                     0 ok, 2 crash, 3 hang)
+  --minimize <file>  Shrink a crashing input to <file>.min, keeping the crash
+  -v                 Verbose: print every coverage gain
+  --version          Show the version
+  -h                 Show this help
 ```
 
-Input reaches the target on stdin, or as a file: every `@@` in the
-target's arguments (also inside one, as in `--input=@@`) is replaced by
-the path of a file holding the input, and stdin is then empty:
+Every `@@` in the target's arguments, also inside one as in
+`--input=@@`, is replaced by the path of a file holding the input:
 
 ```sh
 ./fathom -i seeds -o out -- ./parser --strict @@
 ```
 
-The output directory holds `queue/`
-(inputs that found new coverage), `crashes/` (one file per unique crash,
-plus a `.txt` report naming the signal or exception, the function it
-happened in and the command that replays it), `hangs/` (inputs that
-timed out, one per distinct path, at most 256) and `fuzzer_stats`,
-rewritten every second: executions and their rate, coverage, crashes,
-hangs, time to first crash and to the last coverage gain, and how often
-each mutation strategy ran and found new coverage. `-v` also prints each
-coverage gain as it happens.
+The output directory holds:
+
+- `queue/`: inputs that found new coverage;
+- `crashes/`: one input per unique crash, with a `.txt` report naming
+  the signal or exception, the function it happened in, when it was found
+  and the command that replays it;
+- `hangs/`: inputs that timed out, one per distinct path, at most 256;
+- `fuzzer_stats`, rewritten every second: executions and their rate,
+  coverage, crashes, hangs, time to the first crash and to the last
+  coverage gain, and how often each mutation strategy ran and found new
+  coverage.
 
 To look at a crash again, or shrink it to the bytes that matter:
 
 ```sh
 ./fathom --replay out/crashes/crash_<hash> -- ./target     # exit status 2: crashed
 ./fathom --minimize out/crashes/crash_<hash> -- ./target   # writes crash_<hash>.min
-``` With `-j`, each worker writes to `out/worker-NNN/`.
+```
+
+With `-j`, each worker writes to `out/worker-NNN/`.
 
 Running again with the same `-o` resumes: the existing queue replaces the
 seeds from `-i`, new queue entries are numbered after it, and crashes
@@ -348,9 +365,14 @@ bash tests/bench.sh 30 5   # time to crash per target: 30 s budget, 5 seeds
 - **Unit tests** load prebuilt fixtures (`tests/fixtures/`: the same
   program compiled as ELF, Mach-O, universal Mach-O and PE for both
   architectures, plus a stripped gcc PIE), so every format is tested on
-  every host. Executor tests run the real debugger backend against the
-  maze, a hanging target, and targets that fork, re-exec themselves,
-  recover from a fault, or start a block with a trap instruction.
+  every host. Analysis tests check jump tables, steering and frontier
+  tokens on synthetic and compiled code. Executor tests run the real
+  debugger backend against the maze, a hanging target, and targets that
+  fork, `setsid`, re-exec themselves, recover from a fault, start a block
+  with a trap instruction, read their input from a file, run a loop
+  input-dependent times, compare against hidden magic values, or keep
+  their logic in a shared library, and compare fork-server runs with
+  fresh ones.
 - **Benchmark** (`tests/bench.sh`): fuzzes each benchmark target from
   `AAAA` with several seeds and prints how many runs found the crash and
   the median time, executions, execution rate and coverage. Besides the
@@ -359,9 +381,12 @@ bash tests/bench.sh 30 5   # time to crash per target: 30 s budget, 5 seeds
   kept in data, so it is never an immediate operand. Run it on two builds
   to compare them.
 - **Integration tests** fuzz from a seed that contains none of the bytes
-  the bugs need. The maze must be solved on every platform. They also check
-  that hangs are not reported as crashes and that parallel workers shard
-  their output and exit cleanly.
+  the bugs need. The maze and the maze inside a shared library (`--lib`)
+  must be solved on every platform, and with `--fork-server` on Linux.
+  They also check replay and minimisation of the crash found, its report,
+  `--fail-on-crash`, that hangs are not reported as crashes, that
+  parallel workers shard their output, stop together and save a crash
+  once, and that two runs with the same `-s` produce identical queues.
 
 ## Project structure
 
@@ -385,7 +410,8 @@ lib/
   corpus.c                  Queue, scheduling, crash dedup
   osdep.c                   Small OS helpers (time, temp dir, entropy)
 src/main.c                  CLI driver and parallel supervisor
-tests/                      Unit tests, fixtures, targets, integration script
+tests/                      Unit tests, fixtures, targets, integration and
+                            benchmark scripts
 macos/fathom.entitlements   Debugger entitlement for task_for_pid
 ```
 
@@ -403,6 +429,9 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
   tables (function pointers stored in data, computed gotos) is left
   uninstrumented.
 - Coverage of forked children stops at an exec into another program.
+- Only the target and the libraries named with `--lib` are instrumented,
+  and only libraries loaded at startup; ones loaded later with `dlopen`
+  are not covered.
 
 ## License
 
