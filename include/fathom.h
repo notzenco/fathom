@@ -369,6 +369,20 @@ void fathom_analysis_free(fathom_analysis_t *ana);
  * blocks already reached.
  */
 #define FATHOM_STEER_DEPTH 8
+/*
+ * Frontier tokens: constants compared in covered blocks whose
+ * conditional branch still has an uncovered side, the values most likely
+ * to unlock new code.  Statically linked runtimes (MinGW, musl) bury the
+ * target's own comparisons among hundreds of library ones whose startup
+ * branches stay open forever, so blocks first reached in the latest two
+ * coverage gains (epoch[slot] vs now) come first, and the whole frontier
+ * only when those offer nothing.  global is the cumulative coverage map;
+ * slot_block and block_slot map slots to CFG blocks and back (-1: none).
+ */
+void fathom_frontier(fathom_dict_t *out, const fathom_cfg_t *cfg,
+                     const fathom_disasm_t *dis, const uint8_t *global, size_t slots,
+                     const uint32_t *slot_block, const int32_t *block_slot,
+                     const uint32_t *epoch, uint32_t now);
 void fathom_steer(const fathom_cfg_t *cfg, const bool *covered, double *val);
 void fathom_analysis_print(const fathom_analysis_t *ana,
                            const fathom_binary_t *bin,
