@@ -245,6 +245,46 @@ static void test_steer(void)
     fathom_cfg_free(&cfg);
 }
 
+/* A compared constant is a token while its branch still has an uncovered side. */
+static void test_frontier(void)
+{
+    printf("=== test_frontier ===\n");
+    /* 0x1000: cmp al, 0x46 / 0x1002: je 0x1010 / 0x1004: ret / 0x1010: ret */
+    fathom_insn_t insns[] = {
+        INSN(0x1000, 2, FATHOM_INSN_OTHER,  "cmp"),
+        INSN(0x1002, 2, FATHOM_INSN_BRANCH, "je"),
+        INSN(0x1004, 1, FATHOM_INSN_RET,    "ret"),
+        INSN(0x1010, 1, FATHOM_INSN_RET,    "ret"),
+    };
+    insns[0].has_cmp_imm = true;
+    insns[0].cmp_imm = 0x46;
+    insns[1].is_conditional = true;
+    insns[1].branch_target = 0x1010;
+    fathom_binary_t bin = make_bin(0x1000);
+    fathom_cfg_t cfg;
+    fathom_analysis_t ana;
+    fathom_disasm_t dis = { .arch = FATHOM_ARCH_X86_64, .insns = insns, .count = 4 };
+    CHECK(analyze(insns, 4, &bin, &cfg, &ana) == 0 && cfg.block_count == 3, "three blocks");
+
+    uint32_t slot_block[3] = { 0, 1, 2 };
+    int32_t block_slot[3] = { 0, 1, 2 };
+    uint32_t epoch[3] = { 1, 1, 0 };
+    uint8_t global[3] = { 1, 1, 0 };
+    fathom_dict_t out;
+    fathom_dict_init(&out);
+    fathom_frontier(&out, &cfg, &dis, global, 3, slot_block, block_slot, epoch, 1);
+    CHECK(out.count == 1 && out.entries[0].len == 1 && out.entries[0].data[0] == 0x46,
+          "the open comparison's constant is a token");
+
+    global[2] = 1;
+    epoch[2] = 2;
+    fathom_frontier(&out, &cfg, &dis, global, 3, slot_block, block_slot, epoch, 2);
+    CHECK(out.count == 0, "a branch with both sides covered gives no token");
+    fathom_dict_destroy(&out);
+    fathom_analysis_free(&ana);
+    fathom_cfg_free(&cfg);
+}
+
 int main(void)
 {
     test_data_load_not_a_root();
@@ -257,6 +297,7 @@ int main(void)
     test_jump_table("tests/targets/switch_table");
 #endif
     test_steer();
+    test_frontier();
 
     if (failures) {
         printf("%d check(s) failed\n", failures);
