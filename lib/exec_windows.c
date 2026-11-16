@@ -7,10 +7,18 @@
  * event arrives, before the target's first instruction; the image base
  * in that event gives the ASLR slide.
  *
- * Faults are counted as crashes on first chance: by then the target has
- * done something invalid, and waiting for the second chance would let a
- * handler mask it.  Other first-chance exceptions (C++ throws, debug
- * prints) are passed back to the target.
+ * Faults are passed back to the target on first chance, so its own
+ * handlers (SEH, vectored handlers) can recover, and count as crashes on
+ * second chance, when nothing handled them.  A fault also counts when it
+ * repeats at the same place on first chance (a handler that did not fix
+ * it) or the target then exits non-zero.  Fail-fast exceptions (heap
+ * corruption, /GS stack checks) cannot be handled and count at once.
+ *
+ * Breakpoint exceptions that are not ours are the target's, except the
+ * loader's single initial break, which is skipped.
+ *
+ * Each target runs in a job object that is terminated after the run, so
+ * no process it starts outlives the run.
  */
 
 #if defined(_WIN32)
@@ -22,6 +30,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define PSAPI_VERSION 2   /* GetMappedFileName from kernel32 */
+#include <psapi.h>
+
 #ifndef STATUS_HEAP_CORRUPTION
 #define STATUS_HEAP_CORRUPTION      ((DWORD)0xC0000374)
 #endif
@@ -31,6 +42,12 @@
 #ifndef STATUS_FAIL_FAST_EXCEPTION
 #define STATUS_FAIL_FAST_EXCEPTION  ((DWORD)0xC0000602)
 #endif
+
+static bool is_fail_fast(DWORD code)
+{
+    return code == STATUS_HEAP_CORRUPTION || code == STATUS_STACK_BUFFER_OVERRUN ||
+           code == STATUS_FAIL_FAST_EXCEPTION;
+}
 
 static bool is_crash_code(DWORD code)
 {
@@ -74,6 +91,30 @@ static bool write_code(HANDLE proc, uint64_t addr, const void *buf, size_t len)
 static bool read_word(void *ctx, uint64_t addr, uint64_t *out)
 {
     return read_mem((HANDLE)ctx, addr, out, sizeof(*out));
+}
+
+static bool rd_mem(void *ctx, uint64_t addr, void *buf, size_t len)
+{
+    return read_mem((HANDLE)ctx, addr, buf, len);
+}
+
+static bool wr_mem(void *ctx, uint64_t addr, const void *buf, size_t len)
+{
+    return write_code((HANDLE)ctx, addr, buf, len);
+}
+
+/* Stable key for an address inside a mapped image (a DLL). */
+static bool module_key(void *ctx, uint64_t addr, uint64_t *key)
+{
+    HANDLE proc = (HANDLE)ctx;
+    MEMORY_BASIC_INFORMATION mbi;
+    char path[MAX_PATH];
+    if (!VirtualQueryEx(proc, (LPCVOID)(uintptr_t)addr, &mbi, sizeof(mbi)) ||
+        mbi.Type != MEM_IMAGE ||
+        !GetMappedFileNameA(proc, mbi.AllocationBase, path, sizeof(path)))
+        return false;
+    *key = exec_module_key(path, addr - (uint64_t)(uintptr_t)mbi.AllocationBase);
+    return true;
 }
 
 #if defined(_M_ARM64) || defined(__aarch64__)
@@ -122,6 +163,14 @@ int exec_os_init(fathom_exec_t *ex)
     os->devnull = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                               &sa, OPEN_EXISTING, 0, NULL);
     os->cmdline = fathom_win_cmdline(ex->target_argv);
+    os->job = CreateJobObjectA(NULL, NULL);
+    if (os->job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION lim;
+        memset(&lim, 0, sizeof(lim));
+        lim.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(os->job, JobObjectExtendedLimitInformation,
+                                &lim, sizeof(lim));
+    }
     if (os->input == INVALID_HANDLE_VALUE || os->devnull == INVALID_HANDLE_VALUE ||
         !os->cmdline) {
         fprintf(stderr, "fathom: cannot set up target I/O (%lu)\n", GetLastError());
@@ -137,7 +186,10 @@ void exec_os_destroy(fathom_exec_t *ex)
         CloseHandle(os->input);
     if (os->devnull && os->devnull != INVALID_HANDLE_VALUE)
         CloseHandle(os->devnull);
+    if (os->job)
+        CloseHandle(os->job);
     free(os->cmdline);
+    os->job = NULL;
     os->input = os->devnull = NULL;
     os->cmdline = NULL;
 }
@@ -155,73 +207,108 @@ int exec_os_write_input(fathom_exec_t *ex, const uint8_t *data, size_t len)
     return 0;
 }
 
-static int insert_breakpoints(fathom_exec_t *ex, HANDLE proc)
-{
-    struct fathom_exec_os *os = ex->os;
-    if (ex->bp_count == 0)
-        return 0;
+typedef struct {
+    bool     set;
+    DWORD    code;
+    uint64_t pc;
+    uint64_t link_pc;
+    uint64_t hash;
+} fault_t;
 
-    uint64_t at = os->lo + os->slide;
-    size_t span = (size_t)(os->hi - os->lo);
-    if (!read_mem(proc, at, os->orig, span)) {
-        fprintf(stderr, "fathom: cannot read target code (%lu)\n", GetLastError());
-        return -1;
-    }
-    exec_build_patch(ex);
-    if (!write_code(proc, at, os->patched, span)) {
-        fprintf(stderr, "fathom: cannot write breakpoints (%lu)\n", GetLastError());
-        return -1;
-    }
-    return 0;
+typedef struct {
+    fathom_exec_t        *ex;
+    fathom_coverage_t    *cov;
+    fathom_exec_result_t *res;
+    HANDLE                proc;
+    bool                  seen_loader_break;
+    bool                  failed;
+    fault_t               pending;
+} run_t;
+
+static void record_fault(run_t *r, DWORD code, uint64_t pc, uint64_t fp, fault_t *f)
+{
+    f->set = true;
+    f->code = code;
+    f->pc = pc;
+    f->link_pc = exec_link_addr(r->ex, pc);
+    f->hash = fathom_fnv_mix(exec_crash_hash(r->ex, pc, fp, read_word, module_key, r->proc),
+                             code);
+}
+
+static void report_crash(fathom_exec_result_t *res, const fault_t *f)
+{
+    res->status = FATHOM_EXIT_CRASH;
+    res->crash_code = f->code;
+    res->crash_pc = f->link_pc;
+    res->crash_hash = f->hash;
 }
 
 /* Returns the ContinueDebugEvent status for an exception event. */
-static DWORD on_exception(fathom_exec_t *ex, fathom_coverage_t *cov,
-                          fathom_exec_result_t *res, HANDLE proc,
-                          const DEBUG_EVENT *ev, bool *kill_now)
+static DWORD on_exception(run_t *r, const DEBUG_EVENT *ev, bool *kill_now)
 {
     const EXCEPTION_RECORD *er = &ev->u.Exception.ExceptionRecord;
+    DWORD code = er->ExceptionCode;
+    bool first = ev->u.Exception.dwFirstChance != 0;
     uint64_t addr = (uint64_t)(uintptr_t)er->ExceptionAddress;
     CONTEXT ctx;
 
-    if (er->ExceptionCode == EXCEPTION_BREAKPOINT) {
+    if (code == EXCEPTION_BREAKPOINT && first) {
         const uint8_t *orig;
         size_t len;
         HANDLE th = open_thread(ev->dwThreadId, &ctx);
-        if (!th)
+        if (!th) {
+            r->failed = *kill_now = true;
             return DBG_CONTINUE;
-
-        if (exec_bp_hit(ex, cov, addr, &orig, &len)) {
-            write_code(proc, addr, orig, len);
+        }
+        DWORD cont = DBG_CONTINUE;
+        if (exec_bp_hit(r->ex, r->cov, addr, &orig, &len)) {
             CTX_PC(ctx) = addr;
-            SetThreadContext(th, &ctx);
-        } else if (ex->arch == FATHOM_ARCH_ARM64 && CTX_PC(ctx) == addr) {
-            /* Not ours (e.g. the loader's initial break): step past the brk. */
-            CTX_PC(ctx) += 4;
-            SetThreadContext(th, &ctx);
+            if (!write_code(r->proc, addr, orig, len) || !SetThreadContext(th, &ctx)) {
+                fprintf(stderr, "fathom: cannot restore code under the breakpoint "
+                                "at 0x%llx (%lu)\n", (unsigned long long)addr,
+                        GetLastError());
+                r->failed = *kill_now = true;
+            }
+        } else if (!r->seen_loader_break) {
+            /* The loader's initial break: step past it on ARM64, where PC stays on the brk. */
+            r->seen_loader_break = true;
+            if (r->ex->arch == FATHOM_ARCH_ARM64 && CTX_PC(ctx) == addr) {
+                CTX_PC(ctx) += 4;
+                SetThreadContext(th, &ctx);
+            }
+        } else {
+            record_fault(r, code, CTX_PC(ctx), CTX_FP(ctx), &r->pending);
+            cont = DBG_EXCEPTION_NOT_HANDLED;   /* the target's own trap */
         }
         CloseHandle(th);
-        return DBG_CONTINUE;
+        return cont;
     }
 
-    if (is_crash_code(er->ExceptionCode) || !ev->u.Exception.dwFirstChance) {
-        uint64_t pc = addr, fp = 0;
-        HANDLE th = open_thread(ev->dwThreadId, &ctx);
-        if (th) {
-            pc = CTX_PC(ctx);
-            fp = CTX_FP(ctx);
-            CloseHandle(th);
-        }
-        res->status = FATHOM_EXIT_CRASH;
-        res->crash_code = er->ExceptionCode;
-        res->crash_pc = exec_link_addr(ex, pc);
-        res->crash_hash = fathom_fnv_mix(exec_crash_hash(ex, pc, fp, read_word, proc),
-                                         er->ExceptionCode);
-        *kill_now = true;
-        return DBG_CONTINUE;
+    bool fatal = !first || is_fail_fast(code);
+    if (!fatal && !is_crash_code(code))
+        return DBG_EXCEPTION_NOT_HANDLED;   /* C++ throws, debug prints, ... */
+
+    uint64_t pc = addr, fp = 0;
+    HANDLE th = open_thread(ev->dwThreadId, &ctx);
+    if (th) {
+        pc = CTX_PC(ctx);
+        fp = CTX_FP(ctx);
+        CloseHandle(th);
     }
 
-    return DBG_EXCEPTION_NOT_HANDLED;
+    fault_t f;
+    record_fault(r, code, pc, fp, &f);
+    bool repeat = r->pending.set && r->pending.code == code && r->pending.pc == pc;
+    if (!fatal && !repeat) {
+        r->pending = f;
+        return DBG_EXCEPTION_NOT_HANDLED;   /* let the target's handlers try */
+    }
+
+    if (!first && r->pending.set && r->pending.code == code)
+        f = r->pending;   /* the context where the fault first happened */
+    report_crash(r->res, &f);
+    *kill_now = true;
+    return DBG_CONTINUE;
 }
 
 int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
@@ -252,6 +339,17 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                 ex->target_path, GetLastError());
         return -1;
     }
+
+    /* Children join the job, so terminating it ends them too. */
+    if (os->job)
+        AssignProcessToJobObject(os->job, pi.hProcess);
+
+    run_t run;
+    memset(&run, 0, sizeof(run));
+    run.ex = ex;
+    run.cov = cov;
+    run.res = res;
+    run.proc = pi.hProcess;
 
     res->status = FATHOM_EXIT_OK;
     uint64_t deadline = fathom_now_us() + (uint64_t)ex->timeout_ms * 1000u;
@@ -287,9 +385,8 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                 CloseHandle(ev.u.CreateProcessInfo.hFile);
             os->slide = (uint64_t)(uintptr_t)ev.u.CreateProcessInfo.lpBaseOfImage -
                         ex->image_base;
-            if (insert_breakpoints(ex, pi.hProcess) < 0) {
+            if (exec_insert_breakpoints(ex, rd_mem, wr_mem, pi.hProcess) < 0)
                 failed = kill_now = true;
-            }
             break;
         case LOAD_DLL_DEBUG_EVENT:
             if (ev.u.LoadDll.hFile)
@@ -298,9 +395,14 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
         case EXCEPTION_DEBUG_EVENT:
             if (res->status == FATHOM_EXIT_CRASH)
                 break;
-            cont = on_exception(ex, cov, res, pi.hProcess, &ev, &kill_now);
+            cont = on_exception(&run, &ev, &kill_now);
+            failed |= run.failed;
             break;
         case EXIT_PROCESS_DEBUG_EVENT:
+            /* A fault handler that bailed out with an error still hit the fault. */
+            if (res->status == FATHOM_EXIT_OK && !killed && run.pending.set &&
+                ev.u.ExitProcess.dwExitCode != 0)
+                report_crash(res, &run.pending);
             done = true;
             break;
         default:
@@ -316,6 +418,8 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
             break;
     }
 
+    if (os->job)
+        TerminateJobObject(os->job, 1);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
