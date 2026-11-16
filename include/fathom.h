@@ -119,6 +119,9 @@ typedef struct {
     bool               ref_is_addr;
     /* x86 `jmp [table + index*8]`: the table of absolute targets, else 0. */
     uint64_t           jt_table;
+    /* arm64: shift and sign extension applied to the last register operand. */
+    uint8_t            op_shift;
+    bool               op_sext;
     int64_t            cmp_imm;        /* constant compared against, if has_cmp_imm */
     bool               has_cmp_imm;
     bool               is_conditional;

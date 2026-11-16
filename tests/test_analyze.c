@@ -153,14 +153,9 @@ static void test_no_block_cap(void)
  * A dense switch compiles to a jump table: its cases are successors of
  * the indirect jump, so they are reachable and instrumented.
  */
-static void test_jump_table(void)
+static void test_jump_table(const char *path)
 {
-    printf("=== test_jump_table ===\n");
-#ifdef _WIN32
-    const char *path = "tests/targets/switch_table.exe";
-#else
-    const char *path = "tests/targets/switch_table";
-#endif
+    printf("=== test_jump_table %s ===\n", path);
     fathom_binary_t bin;
     fathom_disasm_t dis;
     fathom_cfg_t cfg;
@@ -183,9 +178,14 @@ static void test_jump_table(void)
     }
     CHECK(fan >= 12, "the switch block should have a successor per case");
     CHECK(sw && sw->score > 0, "fan-out should score");
-    for (size_t k = 0; sw && k < sw->succ_count; k++)
-        CHECK(instrumented(&ana, &cfg, cfg.blocks[sw->succs[k]].start_addr),
-              "every case should be instrumented");
+    size_t calls = 0;
+    for (size_t k = 0; sw && k < sw->succ_count; k++) {
+        const fathom_block_t *c = &cfg.blocks[sw->succs[k]];
+        CHECK(instrumented(&ana, &cfg, c->start_addr), "every case should be instrumented");
+        calls += dis.insns[c->insn_start].kind == FATHOM_INSN_CALL;
+    }
+    /* Every case starts by calling its case_N function: wrong targets would not. */
+    CHECK(calls >= 12, "jump table targets should be the case blocks");
 
     fathom_analysis_free(&ana);
     fathom_cfg_free(&cfg);
@@ -235,7 +235,11 @@ int main(void)
     test_lea_is_a_root();
     test_mid_block_entry();
     test_no_block_cap();
-    test_jump_table();
+#ifdef _WIN32
+    test_jump_table("tests/targets/switch_table.exe");
+#else
+    test_jump_table("tests/targets/switch_table");
+#endif
     test_steer();
 
     if (failures) {

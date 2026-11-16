@@ -188,6 +188,12 @@ static void decode_arm64(const cs_insn *ci, fathom_insn_t *fi,
             }
         }
     }
+    if (a->op_count >= 3 && a->operands[a->op_count - 1].type == ARM64_OP_REG) {
+        const cs_arm64_op *last = &a->operands[a->op_count - 1];
+        fi->op_shift = (uint8_t)last->shift.value;
+        fi->op_sext = last->ext == ARM64_EXT_SXTB || last->ext == ARM64_EXT_SXTH ||
+                      last->ext == ARM64_EXT_SXTW;
+    }
     if (a->op_count < 2 || a->operands[0].type != ARM64_OP_REG)
         return;
 

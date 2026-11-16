@@ -53,12 +53,13 @@ static bool is_padding(const fathom_insn_t *insn)
  *                   (int32 entries relative to T)
  *   x86-64, no-PIE  jmp [T + i*8]                 (absolute entries)
  *   arm64           adrp+add T; ldr{b,h,,sb,sh,sw} e, [T, i];
- *                   adr L; add r, L, e, lsl #2; br r
- *                   (entries are instruction counts from L)
+ *                   adr L; add r, L, e[, lsl/sxt* #s]; br r
+ *                   (entries are offsets from L, shifted by s)
  *
- * The entry count comes from the bounds check (`cmp i, #N`) just before.
- * Every target must be a decoded instruction; entries are read up to the
- * bound, or until the first that is not, and at least two are needed.
+ * The entry count comes from the bounds check (`cmp i, #N`) just before;
+ * with it, every entry must lead to a decoded instruction.  Without it,
+ * entries are read until the first that does not.  At least two are
+ * needed.
  */
 #define JT_LOOKBACK   12     /* instructions before the jump holding the table setup */
 #define JT_BOUND_BACK 24     /* instructions before the jump to find the bounds check */
@@ -128,20 +129,25 @@ static size_t decode_table(const fathom_disasm_t *dis, const fathom_binary_t *bi
 {
     const fathom_insn_t *jmp = &dis->insns[j];
     size_t max = JT_MAX;
+    bool bounded = false;
     for (size_t k = 1; k <= JT_BOUND_BACK && k <= j; k++) {
         const fathom_insn_t *c = &dis->insns[j - k];
         if (c->has_cmp_imm && strcmp(c->mnemonic, "cmp") == 0) {
-            if (c->cmp_imm >= 1 && c->cmp_imm < JT_MAX)
+            if (c->cmp_imm >= 1 && c->cmp_imm < JT_MAX) {
                 max = (size_t)c->cmp_imm + 1;
+                bounded = true;
+            }
             break;
         }
     }
 
-    if (jmp->jt_table)
-        return read_table(dis, bin, jmp->jt_table, 8, false, 0, 0, true, max, out);
+    if (jmp->jt_table) {
+        size_t n = read_table(dis, bin, jmp->jt_table, 8, false, 0, 0, true, max, out);
+        return bounded && n < max ? 0 : n;
+    }
 
     uint64_t table = 0, label = 0;
-    const char *load = NULL;
+    const fathom_insn_t *load = NULL, *add = NULL;
     for (size_t k = 1; k <= JT_LOOKBACK && k <= j; k++) {
         const fathom_insn_t *p = &dis->insns[j - k];
         if (p->kind != FATHOM_INSN_OTHER)
@@ -150,31 +156,27 @@ static size_t decode_table(const fathom_disasm_t *dis, const fathom_binary_t *bi
             label = p->ref_target;
         else if (p->ref_is_addr && !table)
             table = p->ref_target;
+        else if (!add && strcmp(p->mnemonic, "add") == 0)
+            add = p;
         else if (!load && (has_prefix(p->mnemonic, "ldr") || has_prefix(p->mnemonic, "movs")))
-            load = p->mnemonic;
+            load = p;
     }
     if (!table || !load)
         return 0;
 
-    if (dis->arch == FATHOM_ARCH_X86_64)
-        return read_table(dis, bin, table, 4, true, table, 0, false, max, out);
-    if (!label)
-        return 0;
-
-    size_t width = strstr(load, "b") ? 1 : strstr(load, "h") ? 2 : 4;
-    bool sign = has_prefix(load, "ldrs");
-    size_t n = read_table(dis, bin, table, width, sign, label, 2, false, max, out);
-    if (!sign && width < 4 && n < max) {
-        /* gcc sign-extends byte and halfword entries when it adds them. */
-        uint64_t *alt = malloc(max * sizeof(*alt));
-        size_t m = alt ? read_table(dis, bin, table, width, true, label, 2, false, max, alt) : 0;
-        if (m > n) {
-            memcpy(out, alt, m * sizeof(*out));
-            n = m;
-        }
-        free(alt);
+    size_t n;
+    if (dis->arch == FATHOM_ARCH_X86_64) {
+        n = read_table(dis, bin, table, 4, true, table, 0, false, max, out);
+    } else {
+        if (!label || !add)
+            return 0;
+        /* The add that applies the entry says how it is scaled and extended. */
+        const char *m = load->mnemonic;
+        size_t width = strchr(m + 3, 'b') ? 1 : strchr(m + 3, 'h') ? 2 : 4;
+        bool sign = has_prefix(m, "ldrs") || add->op_sext;
+        n = read_table(dis, bin, table, width, sign, label, add->op_shift, false, max, out);
     }
-    return n;
+    return bounded && n < max ? 0 : n;
 }
 
 static int cmp_u64(const void *a, const void *b)
