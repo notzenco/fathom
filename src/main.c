@@ -383,6 +383,8 @@ static void usage(const char *prog)
         "  --max-input <n> Largest input to generate, in bytes (default: %d)\n"
         "  --fail-on-crash Exit with status 2 if any unique crash was found\n"
         "  --no-cmplog Skip comparison logging (input-to-state) on new inputs\n"
+        "  --fork-server   Linux: fork each run from the target stopped at its\n"
+        "                  entry point instead of starting it afresh\n"
         "  --version   Show the version\n"
         "  --replay <f>    Run input f once and report the outcome (exit\n"
         "                  status 0 ok, 2 crash, 3 hang)\n"
@@ -1473,6 +1475,7 @@ int main(int argc, char *argv[])
         {"max-input", required_argument, NULL, 'I'},
         {"fail-on-crash", no_argument,  NULL, 'F'},
         {"no-cmplog", no_argument,      NULL, 'C'},
+        {"fork-server", no_argument,    NULL, 'K'},
         {"version",  no_argument,       NULL, 'V'},
         {"minimize", required_argument, NULL, 'M'},
         {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
@@ -1504,6 +1507,7 @@ int main(int argc, char *argv[])
             break;
         case 'F': opts.fail_on_crash = true; break;
         case 'C': opts.no_cmplog = true; break;
+        case 'K': opts.cfg.fork_server = true; break;
         case 'V':
             printf("fathom %d.%d.%d\n", FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR,
                    FATHOM_VERSION_PATCH);

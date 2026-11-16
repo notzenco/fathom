@@ -7,6 +7,7 @@
 
 #include "fathom.h"
 #include "test_util.h"
+#include "exec.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -422,6 +423,43 @@ static void test_trim(void)
     END();
 }
 
+#if defined(__linux__)
+/* Runs forked from the fork server behave exactly like fresh processes. */
+static void test_fork_server(void)
+{
+    BEGIN("fork_server_matches_fresh_runs");
+    target_t fresh, fs;
+    fathom_coverage_t cov_fresh, cov_fs;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&fresh, &cov_fresh, TARGET("maze")) == 0, "load failed");
+    CHECK(load_cov(&fs, &cov_fs, TARGET("maze")) == 0, "load failed");
+    fs.ex.os->fs_wanted = true;
+
+    const char *inputs[] = { "AAAA", "FUZA", "FU", "FUZZ", "FUZA", "AAAA" };
+    for (int i = 0; i < 6; i++) {
+        fathom_exec_result_t want;
+        CHECK(run_cov(&fresh, &cov_fresh, inputs[i], &want) == 0, "fresh exec failed");
+        CHECK(run_cov(&fs, &cov_fs, inputs[i], &res) == 0, "fork server exec failed");
+        CHECK(fs.ex.os->fs_pid > 0 && !fs.ex.os->fs_failed, "fork server not in use");
+        CHECK(res.status == want.status, "different outcome");
+        CHECK(res.crash_hash == want.crash_hash, "different crash hash");
+        CHECK(memcmp(cov_fs.local, cov_fresh.local, cov_fs.size) == 0, "different coverage");
+    }
+    unload(&fresh, &cov_fresh);
+    unload(&fs, &cov_fs);
+
+    /* Hangs are killed and the server keeps working. */
+    CHECK(load(&fs, TARGET("hang"), 300) == 0, "load failed");
+    fs.ex.os->fs_wanted = true;
+    CHECK(fathom_exec_run(&fs.ex, NULL, (const uint8_t *)"H", 1, &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_HANG, "hang not detected");
+    CHECK(fathom_exec_run(&fs.ex, NULL, (const uint8_t *)"A", 1, &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_OK, "server broken after a hang");
+    free_target(&fs);
+    END();
+}
+#endif
+
 #ifndef _WIN32
 /* Coverage and crash attribution continue after the target re-executes itself. */
 static void test_reexec(void)
@@ -516,6 +554,9 @@ int main(void)
     test_file_input();
     test_minimize();
     test_cmp_log();
+#if defined(__linux__)
+    test_fork_server();
+#endif
 #ifndef _WIN32
     test_reexec();
     test_forked_children();

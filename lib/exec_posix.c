@@ -816,8 +816,15 @@ int exec_os_init(fathom_exec_t *ex)
     return 0;
 }
 
+#if defined(__linux__)
+static void fs_stop(struct fathom_exec_os *os);
+#endif
+
 void exec_os_destroy(fathom_exec_t *ex)
 {
+#if defined(__linux__)
+    fs_stop(ex->os);
+#endif
     if (ex->os->input_fd > 0)
         close(ex->os->input_fd);
     ex->os->input_fd = -1;
@@ -1024,6 +1031,228 @@ static void kids_reap(kids_t *ks)
 
 #endif
 
+/* ── Fork server (Linux) ─────────────────────────────────────────────── */
+
+#if defined(__linux__)
+
+/*
+ * The template is the target stopped at its entry point, after the
+ * dynamic loader ran.  Each run injects a fork into it: the child starts
+ * from the entry point with the template's registers, memory (patched
+ * with breakpoints) and file descriptors, so execve and dynamic linking
+ * happen once.  The template's stdin shares its file offset with our
+ * input descriptor, which is rewound before each fork.  A finished child
+ * is reaped by an injected wait4, since the template is its parent.
+ *
+ * Code is injected at the entry point: a system call, then a trap.
+ */
+#if defined(__x86_64__)
+static const uint8_t fs_stub[8] = { 0x0f, 0x05, 0xcc };   /* syscall; int3 */
+#define FS_STUB_LEN  3
+#define FS_NR_FORK   57
+#define FS_NR_WAIT4  61
+#else
+static const uint8_t fs_stub[8] = { 0x01, 0x00, 0x00, 0xd4,    /* svc #0 */
+                                    0x00, 0x00, 0x20, 0xd4 };  /* brk #0 */
+#define FS_STUB_LEN  8
+#define FS_NR_CLONE  220
+#define FS_NR_WAIT4  260
+#endif
+
+static void fs_set_call(regs_t *r, uint64_t pc, long nr, const uint64_t a[4])
+{
+#if defined(__x86_64__)
+    r->rip = pc;
+    r->rax = (unsigned long long)nr;
+    r->orig_rax = (unsigned long long)-1;   /* not inside a syscall: no restart */
+    r->rdi = a[0];
+    r->rsi = a[1];
+    r->rdx = a[2];
+    r->r10 = a[3];
+#else
+    r->pc = pc;
+    r->regs[8] = (unsigned long long)nr;
+    for (int i = 0; i < 4; i++)
+        r->regs[i] = a[i];
+    r->regs[4] = 0;
+#endif
+}
+
+static long fs_result(const regs_t *r)
+{
+#if defined(__x86_64__)
+    return (long)r->rax;
+#else
+    return (long)r->regs[0];
+#endif
+}
+
+/* Wait for the template's next stop, swallowing signals sent to it. */
+static int fs_wait(pid_t pid, int *st)
+{
+    for (;;) {
+        pid_t got = waitpid(pid, st, __WALL);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got < 0 || !WIFSTOPPED(*st))
+            return -1;
+        int event = *st >> 16;
+        if (event || WSTOPSIG(*st) == SIGTRAP)
+            return 0;
+        tgt_continue(pid, 0);   /* e.g. SIGCHLD from a finished child */
+    }
+}
+
+/*
+ * Run system call nr in the template and return its result.  For a fork,
+ * *child gets the new process, stopped at its first instruction.
+ */
+static long fs_inject(struct fathom_exec_os *os, long nr, const uint64_t a[4], pid_t *child,
+                      uint8_t saved[FS_STUB_LEN])
+{
+    pid_t pid = os->fs_pid;
+    regs_t r, entry;
+    memcpy(&entry, os->fs_regs, sizeof(entry));
+    if (pread(os->fs_mem, saved, FS_STUB_LEN, (off_t)os->fs_entry) != FS_STUB_LEN ||
+        pwrite(os->fs_mem, fs_stub, FS_STUB_LEN, (off_t)os->fs_entry) != FS_STUB_LEN)
+        return -1;
+    r = entry;
+    fs_set_call(&r, os->fs_entry, nr, a);
+    long rc = -1;
+    int st;
+    target_t t = { pid, os->fs_mem };
+    if (!tgt_set_regs(&t, pid, &r))
+        goto restore;
+    tgt_continue(pid, 0);
+    if (fs_wait(pid, &st) < 0)
+        goto restore;
+    if (child && (st >> 16) != 0) {
+        unsigned long msg = 0;
+        ptrace(PTRACE_GETEVENTMSG, pid, NULL, &msg);
+        *child = (pid_t)msg;
+        tgt_continue(pid, 0);
+        if (fs_wait(pid, &st) < 0)
+            goto restore;
+    }
+    if (tgt_get_regs(&t, pid, &r))
+        rc = fs_result(&r);
+restore:
+    if (pwrite(os->fs_mem, saved, FS_STUB_LEN, (off_t)os->fs_entry) != FS_STUB_LEN ||
+        !tgt_set_regs(&t, pid, &entry))
+        rc = -1;
+    return rc;
+}
+
+static void fs_stop(struct fathom_exec_os *os)
+{
+    if (os->fs_pid > 0) {
+        kill(os->fs_pid, SIGKILL);
+        while (waitpid(os->fs_pid, NULL, __WALL) < 0 && errno == EINTR)
+            ;
+    }
+    if (os->fs_mem >= 0)
+        close(os->fs_mem);
+    os->fs_pid = 0;
+    os->fs_mem = -1;
+}
+
+/* Start the target and stop it at its entry point as the template. */
+static int fs_start(fathom_exec_t *ex)
+{
+    struct fathom_exec_os *os = ex->os;
+    pid_t pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0)
+        child_exec(ex);
+    int st;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
+    target_t t = { pid, -1 };
+    os->fs_pid = pid;
+    if (!WIFSTOPPED(st) || tgt_attach(&t, pid) < 0)
+        return -1;
+    os->fs_mem = t.mem_fd;
+    if (!tgt_slide(&t, ex, &os->slide))
+        return -1;
+
+    /* Run the loader up to the entry point. */
+    os->fs_entry = ex->entry + os->slide;
+    uint8_t saved[4];
+    if (!tgt_read(&t, os->fs_entry, saved, os->bp_len) ||
+        !tgt_write(&t, os->fs_entry, os->bp_insn, os->bp_len))
+        return -1;
+    tgt_continue(pid, 0);
+    if (fs_wait(pid, &st) < 0 || (st >> 16) != 0)
+        return -1;
+    regs_t r;
+    if (!tgt_write(&t, os->fs_entry, saved, os->bp_len) || !tgt_get_regs(&t, pid, &r))
+        return -1;
+    REG_PC(r) = os->fs_entry;
+    if (!tgt_set_regs(&t, pid, &r))
+        return -1;
+    memcpy(os->fs_regs, &r, sizeof(r));
+    os->fs_patch_gen = 0;
+    return 0;
+}
+
+/* Fork a child from the template, ready to run from the entry point. */
+static pid_t fs_spawn(fathom_exec_t *ex)
+{
+    struct fathom_exec_os *os = ex->os;
+    if (!os->fs_pid && fs_start(ex) < 0) {
+        fs_stop(os);
+        return -1;
+    }
+    target_t t = { os->fs_pid, os->fs_mem };
+    if (exec_insert_breakpoints(ex, rd_mem, wr_mem, &t) < 0)
+        return -1;
+    if (!ex->os->input_by_path && lseek(os->input_fd, 0, SEEK_SET) < 0)
+        return -1;
+
+    pid_t child = 0;
+#if defined(__x86_64__)
+    const uint64_t args[4] = { 0, 0, 0, 0 };
+    uint8_t saved[FS_STUB_LEN];
+    long rc = fs_inject(os, FS_NR_FORK, args, &child, saved);
+#else
+    const uint64_t args[4] = { SIGCHLD, 0, 0, 0 };
+    uint8_t saved[FS_STUB_LEN];
+    long rc = fs_inject(os, FS_NR_CLONE, args, &child, saved);
+#endif
+    if (rc <= 0 || child <= 0)
+        return -1;
+
+    /* Its first stop, then the entry state: registers and the code under the stub. */
+    int st;
+    while (waitpid(child, &st, __WALL) < 0 && errno == EINTR)
+        ;
+    regs_t r;
+    memcpy(&r, os->fs_regs, sizeof(r));
+    target_t c = { child, -1 };
+    /* It was forked with the stub at the entry point: put the code back. */
+    bool ok = WIFSTOPPED(st) && open_mem(child, &c.mem_fd) &&
+              tgt_write(&c, os->fs_entry, saved, FS_STUB_LEN) &&
+              tgt_set_regs(&c, child, &r);
+    if (c.mem_fd >= 0)
+        close(c.mem_fd);
+    if (!ok) {
+        kill(child, SIGKILL);
+        return -1;
+    }
+    return child;
+}
+
+/* Reap a finished child: its parent is the template. */
+static void fs_reap(struct fathom_exec_os *os, pid_t child)
+{
+    const uint64_t args[4] = { (uint64_t)child, 0, __WALL, 0 };
+    uint8_t saved[FS_STUB_LEN];
+    fs_inject(os, FS_NR_WAIT4, args, NULL, saved);
+}
+
+#endif
+
 /* ── Run ─────────────────────────────────────────────────────────────── */
 
 /*
@@ -1057,33 +1286,58 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     kids.n = 0;
 #endif
     os->foreign_image = false;
-
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fathom: fork");
-        return -1;
-    }
-    if (pid == 0)
-        child_exec(ex);
-
     int st = 0;
-    pid_t got;
-    while ((got = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
-        ;
-    if (got < 0) {
-        perror("fathom: waitpid (exec stop)");
-        return -1;
-    }
-    if (!WIFSTOPPED(st)) {
-        fprintf(stderr, "fathom: target failed to start: %s (status 0x%x)\n",
-                ex->target_path, st);
-        return -1;
-    }
+    pid_t pid = 0;
+    bool forked = false;   /* from the fork server: already patched, own process group */
+    bool ok;
 
-    bool ok = tgt_attach(&t, pid) == 0;
-    if (ok && !tgt_slide(&t, ex, &os->slide)) {
-        fprintf(stderr, "fathom: cannot find the target image in memory\n");
+#if defined(__linux__)
+    if (os->fs_wanted && !os->fs_failed) {
+        pid = fs_spawn(ex);
+        if (pid > 0) {
+            forked = true;
+        } else {
+            fprintf(stderr, "fathom: fork server unavailable; starting the target "
+                            "for every run\n");
+            os->fs_failed = true;
+            fs_stop(os);
+        }
+    }
+#endif
+    if (forked) {
+        t.pid = pid;
+#if defined(__linux__)
+        ok = open_mem(pid, &t.mem_fd);
+#else
         ok = false;
+#endif
+    } else {
+        pid = fork();
+        if (pid < 0) {
+            perror("fathom: fork");
+            return -1;
+        }
+        if (pid == 0)
+            child_exec(ex);
+
+        pid_t got;
+        while ((got = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
+            ;
+        if (got < 0) {
+            perror("fathom: waitpid (exec stop)");
+            return -1;
+        }
+        if (!WIFSTOPPED(st)) {
+            fprintf(stderr, "fathom: target failed to start: %s (status 0x%x)\n",
+                    ex->target_path, st);
+            return -1;
+        }
+
+        ok = tgt_attach(&t, pid) == 0;
+        if (ok && !tgt_slide(&t, ex, &os->slide)) {
+            fprintf(stderr, "fathom: cannot find the target image in memory\n");
+            ok = false;
+        }
     }
 #if defined(__APPLE__)
     int kq = -1;
@@ -1097,7 +1351,7 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
             kevent(kq, &kev, 1, NULL, 0, NULL);
     }
 #endif
-    if (!ok || exec_insert_breakpoints(ex, rd_mem, wr_mem, &t) < 0) {
+    if (!ok || (!forked && exec_insert_breakpoints(ex, rd_mem, wr_mem, &t) < 0)) {
         tgt_kill(pid);
         waitpid(pid, NULL, 0);
 #if defined(__APPLE__)
@@ -1349,10 +1603,18 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 #else
     (void)abandoned;
 #endif
-    /* The target leads its own process group: this ends every descendant. */
-    kill(-pid, SIGKILL);
 #if defined(__linux__)
-    kids_reap(&kids);
+    if (forked) {
+        /* The group is the template's: end the child and its traced descendants only. */
+        kids_reap(&kids);
+        fs_reap(os, pid);
+    } else {
+        kill(-pid, SIGKILL);   /* the target leads its own group: ends every descendant */
+        kids_reap(&kids);
+    }
+#else
+    (void)forked;
+    kill(-pid, SIGKILL);       /* the target leads its own group: ends every descendant */
 #endif
     if (g_timed_out && res->status != FATHOM_EXIT_CRASH)
         res->status = FATHOM_EXIT_HANG;

@@ -375,6 +375,12 @@ typedef struct {
     uint32_t     jobs;
     bool         analysis_only;
     bool         verbose;
+    /*
+     * Linux: start the target once, stop it at its entry point and fork
+     * every run from there, skipping execve and dynamic linking.  Falls
+     * back to a fresh process per run if that cannot be set up.
+     */
+    bool         fork_server;
 } fathom_config_t;
 
 /* ── Public API ──────────────────────────────────────────────────────── */

@@ -257,6 +257,28 @@ else
     diff <(digest "$out/a") <(digest "$out/b") | head -5
 fi
 
+if [ "$(uname -s)" = Linux ]; then
+    info "fork server: the maze is solved with --fork-server"
+    out=$(new_outdir forkserver)
+    mkdir -p "$out/seeds"
+    printf 'AAAA' > "$out/seeds/a"
+    set +e
+    "$FATHOM" --fork-server -i "$out/seeds" -o "$out/run" -t 1000 -T "$MAZE_SECS" -s 1 \
+        --until-crash -- "$TARGETS/maze$EXE" 2>"$out/log"
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ]; then
+        fail "fork server: fathom exited with status $rc"
+        tail -5 "$out/log"
+    elif grep -q "fork server unavailable" "$out/log"; then
+        fail "fork server: fell back to fresh processes"
+    elif [ "$(count_crashes "$out/run")" -eq 0 ]; then
+        fail "fork server: maze not solved"
+    else
+        ok "fork server: solved after $(stat_of "$out/run" first_crash_execs) execs"
+    fi
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────
 
 echo
