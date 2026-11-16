@@ -207,6 +207,9 @@ Options:
   --trim      Shrink queue inputs that keep the same blocks (off by
               default: coverage cannot see loop counts)
   -a          Analysis-only mode (print CFG + scores, no fuzzing)
+  --replay <f>    Run input f once and report the outcome (exit
+                  status 0 ok, 2 crash, 3 hang)
+  --minimize <f>  Shrink crashing input f to f.min, keeping the crash
   -v          Verbose output
   --dict <f>  Extra dictionary file
   -h          Show this help
@@ -221,9 +224,18 @@ the path of a file holding the input, and stdin is then empty:
 ```
 
 The output directory holds `queue/`
-(inputs that found new coverage), `crashes/` (one file per unique crash)
-and `fuzzer_stats` (executions, coverage, crashes, hangs and time to first
-crash). With `-j`, each worker writes to `out/worker-NNN/`.
+(inputs that found new coverage), `crashes/` (one file per unique crash,
+plus a `.txt` report naming the signal or exception, the function it
+happened in and the command that replays it), `hangs/` (inputs that
+timed out, one per distinct path, at most 256) and `fuzzer_stats`
+(executions, coverage, crashes, hangs and time to first crash).
+
+To look at a crash again, or shrink it to the bytes that matter:
+
+```sh
+./fathom --replay out/crashes/crash_<hash> -- ./target     # exit status 2: crashed
+./fathom --minimize out/crashes/crash_<hash> -- ./target   # writes crash_<hash>.min
+``` With `-j`, each worker writes to `out/worker-NNN/`.
 
 Running again with the same `-o` resumes: the existing queue replaces the
 seeds from `-i`, new queue entries are numbered after it, and crashes

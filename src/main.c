@@ -56,6 +56,8 @@ typedef struct {
      * overflow needs.
      */
     bool     trim;
+    const char *replay;      /* --replay: run this input once and report */
+    const char *minimize;    /* --minimize: shrink this crashing input */
     int      worker_id;      /* -1 unless launched as a worker (Windows) */
     char     stop_event[64];
 } fathom_opts_t;
@@ -168,13 +170,58 @@ static void print_status(const fathom_stats_t *st, const char *prefix,
         fputc('\n', stderr);
 }
 
+/* "SIGSEGV" or "EXCEPTION_ACCESS_VIOLATION (0xc0000005)", for people. */
 static void describe_crash(char *buf, size_t cap, uint32_t code)
 {
+    static const struct { uint32_t code; const char *name; } names[] = {
 #ifdef _WIN32
-    snprintf(buf, cap, "exception=0x%08" PRIx32, code);
+        { 0xC0000005u, "EXCEPTION_ACCESS_VIOLATION" },
+        { 0xC000001Du, "EXCEPTION_ILLEGAL_INSTRUCTION" },
+        { 0xC0000096u, "EXCEPTION_PRIV_INSTRUCTION" },
+        { 0xC0000094u, "EXCEPTION_INT_DIVIDE_BY_ZERO" },
+        { 0xC0000095u, "EXCEPTION_INT_OVERFLOW" },
+        { 0xC00000FDu, "EXCEPTION_STACK_OVERFLOW" },
+        { 0xC000008Cu, "EXCEPTION_ARRAY_BOUNDS_EXCEEDED" },
+        { 0x80000002u, "EXCEPTION_DATATYPE_MISALIGNMENT" },
+        { 0xC0000006u, "EXCEPTION_IN_PAGE_ERROR" },
+        { 0x80000003u, "EXCEPTION_BREAKPOINT" },
+        { 0xC0000374u, "STATUS_HEAP_CORRUPTION" },
+        { 0xC0000409u, "STATUS_STACK_BUFFER_OVERRUN" },
+        { 0xC0000602u, "STATUS_FAIL_FAST_EXCEPTION" },
 #else
-    snprintf(buf, cap, "signal=%" PRIu32, code);
+        { SIGSEGV, "SIGSEGV" }, { SIGBUS, "SIGBUS" }, { SIGILL, "SIGILL" },
+        { SIGFPE, "SIGFPE" }, { SIGABRT, "SIGABRT" }, { SIGTRAP, "SIGTRAP" },
+        { SIGSYS, "SIGSYS" },
 #endif
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (names[i].code == code) {
+#ifdef _WIN32
+            snprintf(buf, cap, "%s (0x%08" PRIx32 ")", names[i].name, code);
+#else
+            snprintf(buf, cap, "%s", names[i].name);
+#endif
+            return;
+        }
+    }
+#ifdef _WIN32
+    snprintf(buf, cap, "exception 0x%08" PRIx32, code);
+#else
+    snprintf(buf, cap, "signal %" PRIu32, code);
+#endif
+}
+
+/* "0x100000abc (main+0x24)", or a note that the PC was outside the image. */
+static void describe_pc(char *buf, size_t cap, const fathom_binary_t *bin, uint64_t pc)
+{
+    uint64_t off = 0;
+    const char *sym = pc ? fathom_symbol_near(bin, pc, &off) : NULL;
+    if (!pc)
+        snprintf(buf, cap, "outside the target image (a library, or a smashed stack)");
+    else if (sym)
+        snprintf(buf, cap, "0x%" PRIx64 " (%s+0x%" PRIx64 ")", pc, sym, off);
+    else
+        snprintf(buf, cap, "0x%" PRIx64, pc);
 }
 
 static int ensure_dir(const char *path)
@@ -306,10 +353,123 @@ static void usage(const char *prog)
         "  --trim      Shrink queue inputs that keep the same blocks (off by\n"
         "              default: coverage cannot see loop counts)\n"
         "  -a          Analysis-only mode (print CFG + scores, no fuzzing)\n"
+        "  --replay <f>    Run input f once and report the outcome (exit\n"
+        "                  status 0 ok, 2 crash, 3 hang)\n"
+        "  --minimize <f>  Shrink crashing input f to f.min, keeping the crash\n"
         "  -v          Verbose output\n"
         "  --dict <f>  Extra dictionary file\n"
         "  -h          Show this help\n",
         prog, DEFAULT_TIMEOUT_MS, DEFAULT_JOBS);
+}
+
+/* ── Replay and minimise ─────────────────────────────────────────────── */
+
+#define MINIMIZE_MAX_EXECS  20000
+
+static uint8_t *read_input(const char *path, size_t *len)
+{
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        fprintf(stderr, "fathom: cannot open %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    uint8_t *buf = malloc(MAX_INPUT_SIZE);
+    *len = buf ? fread(buf, 1, MAX_INPUT_SIZE, fp) : 0;
+    fclose(fp);
+    return buf;
+}
+
+/*
+ * Run one input as the fuzzer would and report what happened.  Exit
+ * status: 0 normal exit, 2 crash, 3 hang, 1 error.  With minimize, shrink
+ * a crashing input to <file>.min while it keeps the same crash.
+ */
+static int run_replay(const fathom_opts_t *opts, const char *path, bool minimize)
+{
+    const fathom_config_t *cfg = &opts->cfg;
+    fathom_session_t s;
+    fathom_exec_t ex;
+    fathom_coverage_t cov;
+    size_t len = 0;
+    uint8_t *buf = read_input(path, &len);
+    if (!buf || prepare_session(cfg, true, &s) < 0) {
+        free(buf);
+        return 1;
+    }
+    int ret = 1;
+    bool ex_ready = false, cov_ready = false;
+    if (fathom_exec_init(&ex, cfg, &s.bin) < 0)
+        goto done;
+    ex_ready = true;
+    for (size_t i = 0; i < s.ana.cov_count; i++) {
+        if (fathom_exec_add_breakpoint(&ex, s.cfg_graph.blocks[s.ana.cov_blocks[i]].start_addr) < 0)
+            goto done;
+    }
+    if (fathom_coverage_init(&cov, ex.bp_count) < 0)
+        goto done;
+    cov_ready = true;
+
+    fathom_exec_result_t res;
+    if (fathom_exec_run(&ex, &cov, buf, len, &res) < 0)
+        goto done;
+    size_t covered = 0;
+    for (size_t i = 0; i < cov.size; i++)
+        covered += cov.local[i] != 0;
+
+    char what[64], where[160];
+    fprintf(stderr, "input:    %s (%zu bytes)\n", path, len);
+    fprintf(stderr, "coverage: %zu/%zu blocks, %.1f ms\n", covered, ex.bp_count,
+            (double)res.exec_us / 1000);
+    if (res.status == FATHOM_EXIT_CRASH) {
+        describe_crash(what, sizeof(what), res.crash_code);
+        describe_pc(where, sizeof(where), &s.bin, res.crash_pc);
+        fprintf(stderr, "result:   crash, %s at %s\nhash:     0x%016" PRIx64 "\n",
+                what, where, res.crash_hash);
+        ret = 2;
+    } else if (res.status == FATHOM_EXIT_HANG) {
+        fprintf(stderr, "result:   hang (no exit within %u ms)\n", cfg->timeout_ms);
+        ret = 3;
+    } else {
+        fprintf(stderr, "result:   exited normally\n");
+        ret = 0;
+    }
+    if (!minimize)
+        goto done;
+
+    if (res.status != FATHOM_EXIT_CRASH) {
+        fprintf(stderr, "fathom: --minimize needs an input that crashes\n");
+        ret = 1;
+        goto done;
+    }
+    uint64_t execs = 0;
+    size_t before = len;
+    if (fathom_minimize(&ex, &cov, buf, &len, res.crash_hash, MINIMIZE_MAX_EXECS, &execs) < 0) {
+        ret = 1;
+        goto done;
+    }
+    char out[FATHOM_PATH_MAX + 8];
+    snprintf(out, sizeof(out), "%s.min", path);
+    FILE *fp = fopen(out, "wb");
+    if (!fp || (len && fwrite(buf, 1, len, fp) != len)) {
+        fprintf(stderr, "fathom: cannot write %s\n", out);
+        if (fp)
+            fclose(fp);
+        ret = 1;
+        goto done;
+    }
+    fclose(fp);
+    fprintf(stderr, "minimized: %zu -> %zu bytes in %" PRIu64 " execs: %s\n",
+            before, len, execs, out);
+    ret = 0;
+
+done:
+    if (cov_ready)
+        fathom_coverage_destroy(&cov);
+    if (ex_ready)
+        fathom_exec_destroy(&ex);
+    cleanup_session(&s);
+    free(buf);
+    return ret;
 }
 
 /* ── Analysis-only mode ──────────────────────────────────────────────── */
@@ -486,14 +646,31 @@ static int note_crash(worker_t *w, const uint8_t *buf, size_t len,
         w->stats.first_crash_execs = w->stats.total_execs;
         w->stats.first_crash_ms = (fathom_now_us() - w->stats.start_us) / 1000;
     }
-    char what[48];
+    char what[64], where[160];
     describe_crash(what, sizeof(what), res->crash_code);
+    describe_pc(where, sizeof(where), &w->session->bin, res->crash_pc);
     if (w->multi)
-        fprintf(stderr, "%s new crash: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 "\n",
-                w->prefix, what, res->crash_pc, res->crash_hash);
+        fprintf(stderr, "%s new crash: %s at %s hash=0x%016" PRIx64 "\n",
+                w->prefix, what, where, res->crash_hash);
     else
-        fprintf(stderr, "\n*** NEW CRASH: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 " ***\n",
-                what, res->crash_pc, res->crash_hash);
+        fprintf(stderr, "\n*** NEW CRASH: %s at %s hash=0x%016" PRIx64 " ***\n",
+                what, where, res->crash_hash);
+
+    /* A report next to the input: what, where, when, and how to replay it. */
+    char report[4096];
+    int n = snprintf(report, sizeof(report),
+                     "crash:  %s\npc:     %s\nhash:   0x%016" PRIx64 "\n"
+                     "found:  after %" PRIu64 " execs, %.1f s\ninput:  %zu bytes\n"
+                     "replay: fathom --replay %s/crashes/crash_%016" PRIx64 " --",
+                     what, where, res->crash_hash, w->stats.total_execs,
+                     (double)(fathom_now_us() - w->stats.start_us) / 1e6, len,
+                     w->cfg->output_dir, res->crash_hash);
+    for (size_t i = 0; w->cfg->target_argv[i] && n > 0 && (size_t)n < sizeof(report); i++)
+        n += snprintf(report + n, sizeof(report) - (size_t)n, " %s", w->cfg->target_argv[i]);
+    if (n > 0 && (size_t)n < sizeof(report) - 1)
+        strcat(report, "\n");
+    if (fathom_corpus_describe_crash(corpus, res->crash_hash, report) < 0)
+        fprintf(stderr, "fathom: failed to write the crash report\n");
     if (w->opts->until_crash)
         w->done = true;
     return 1;
@@ -524,6 +701,9 @@ static int calibrate(worker_t *w)
         if (res.status == FATHOM_EXIT_HANG) {
             w->stats.hangs++;
             dropped_hangs++;
+            if (fathom_corpus_save_hang(corpus, inp->data, inp->len,
+                                        fathom_coverage_hash(&w->cov)) < 0)
+                return -1;
             fathom_corpus_remove(corpus, i);
             continue;
         }
@@ -612,8 +792,11 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
 
     if (res.status == FATHOM_EXIT_CRASH)
         return note_crash(w, buf, len, &res) < 0 ? -1 : 0;
-    if (res.status == FATHOM_EXIT_HANG)
+    if (res.status == FATHOM_EXIT_HANG) {
         w->stats.hangs++;
+        if (fathom_corpus_save_hang(corpus, buf, len, fathom_coverage_hash(&w->cov)) < 0)
+            return -1;
+    }
     return 0;
 }
 
@@ -764,7 +947,8 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         fprintf(stderr, "  corpus size:    %zu\n", w->corpus.count);
         fprintf(stderr, "  crashes:        %" PRIu64 " (%" PRIu64 " unique)\n",
                 st->crashes, st->unique_crashes);
-        fprintf(stderr, "  hangs:          %" PRIu64 "\n", st->hangs);
+        fprintf(stderr, "  hangs:          %" PRIu64 " (%zu saved)\n", st->hangs,
+                w->corpus.unique_hangs);
         fprintf(stderr, "  output dir:     %s\n", cfg->output_dir);
     }
     ret = 0;
@@ -1011,6 +1195,8 @@ int main(int argc, char *argv[])
         {"seed",     required_argument, NULL, 's'},
         {"until-crash", no_argument,    NULL, 'U'},
         {"trim",     no_argument,       NULL, 'R'},
+        {"replay",   required_argument, NULL, 'P'},
+        {"minimize", required_argument, NULL, 'M'},
         {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
         {NULL, 0, NULL, 0},
     };
@@ -1029,6 +1215,8 @@ int main(int argc, char *argv[])
             break;
         case 'U': opts.until_crash = true; break;
         case 'R': opts.trim = true; break;
+        case 'P': opts.replay = optarg; break;
+        case 'M': opts.minimize = optarg; break;
         case 'a': opts.cfg.analysis_only = true; break;
         case 'v': opts.cfg.verbose = true; break;
         case 'D': opts.cfg.dict_file = optarg; break;
@@ -1075,6 +1263,9 @@ int main(int argc, char *argv[])
     }
     if (opts.cfg.analysis_only)
         return run_analysis(&opts.cfg);
+    if (opts.replay || opts.minimize)
+        return run_replay(&opts, opts.minimize ? opts.minimize : opts.replay,
+                          opts.minimize != NULL);
 
     fathom_session_t session;
     if (prepare_session(&opts.cfg, worker, &session) < 0)

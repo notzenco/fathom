@@ -320,6 +320,28 @@ static void test_file_input(void)
     END();
 }
 
+/* Minimising keeps the crash, not just any crash. */
+static void test_minimize(void)
+{
+    BEGIN("minimize_keeps_crash");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("maze")) == 0, "load failed");
+    const char *in = "FUZZ-padding-that-does-not-matter-at-all";
+    CHECK(run_cov(&t, &cov, in, &res) == 0 && res.status == FATHOM_EXIT_CRASH, "no crash");
+
+    uint8_t buf[64];
+    size_t len = strlen(in);
+    memcpy(buf, in, len);
+    uint64_t execs = 0;
+    CHECK(fathom_minimize(&t.ex, &cov, buf, &len, res.crash_hash, 1000, &execs) == 0,
+          "minimize failed");
+    CHECK(len == 4 && memcmp(buf, "FUZZ", 4) == 0, "not minimal");
+    unload(&t, &cov);
+    END();
+}
+
 /* Trimming drops bytes that do not change the path. */
 static void test_trim(void)
 {
@@ -435,6 +457,7 @@ int main(void)
     test_loop_counts();
     test_disarm();
     test_file_input();
+    test_minimize();
 #ifndef _WIN32
     test_reexec();
     test_forked_children();

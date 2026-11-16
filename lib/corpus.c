@@ -168,6 +168,7 @@ static int cmp_input_by_size(const void *a, const void *b)
  * we use a single global instance.
  */
 static fathom_hashset_t g_crash_hashes;
+static fathom_hashset_t g_hang_hashes;
 static bool             g_crash_hashes_ready;
 
 /* ── Loading ────────────────────────────────────────────────────────── */
@@ -240,23 +241,27 @@ static int load_dir(fathom_corpus_t *corpus, const char *dir_path, bool queue)
     return 0;
 }
 
-static int load_crash_hashes(fathom_corpus_t *corpus, const char *dir_path)
+/* Rebuild a dedup set from file names "<prefix><16 hex digits>" in dir. */
+static int load_hashes(const char *dir_path, const char *prefix, fathom_hashset_t *set,
+                       size_t *count)
 {
     DIR *dir = opendir(dir_path);
     if (!dir)
         return 0;
     struct dirent *ent;
     int rc = 0;
+    size_t plen = strlen(prefix);
     while (rc == 0 && (ent = readdir(dir)) != NULL) {
         unsigned long long hash;
         char rest;
-        if (sscanf(ent->d_name, "crash_%16llx%c", &hash, &rest) != 1)
-            continue;   /* sidecars and anything else */
-        int r = fathom_hashset_insert(&g_crash_hashes, (uint64_t)hash);
+        if (strncmp(ent->d_name, prefix, plen) != 0 ||
+            sscanf(ent->d_name + plen, "%16llx%c", &hash, &rest) != 1)
+            continue;   /* reports and anything else */
+        int r = fathom_hashset_insert(set, (uint64_t)hash);
         if (r < 0)
             rc = -1;
         else if (r == 1)
-            corpus->unique_crashes++;
+            (*count)++;
     }
     closedir(dir);
     return rc;
@@ -296,11 +301,16 @@ int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
 
         snprintf(path, sizeof(path), "%s/crashes", output_dir);
         fathom_mkdir(path);
+
+        snprintf(path, sizeof(path), "%s/hangs", output_dir);
+        fathom_mkdir(path);
     }
 
     /* Initialise crash hash set. */
     if (!g_crash_hashes_ready) {
-        if (fathom_hashset_init(&g_crash_hashes, FATHOM_CRASH_HASHSET_CAP) < 0) {
+        if (fathom_hashset_init(&g_crash_hashes, FATHOM_CRASH_HASHSET_CAP) < 0 ||
+            fathom_hashset_init(&g_hang_hashes, FATHOM_CRASH_HASHSET_CAP) < 0) {
+            fathom_hashset_destroy(&g_crash_hashes);
             free(corpus->inputs);
             free((void *)corpus->out_dir);
             return -1;
@@ -320,7 +330,10 @@ int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
             return -1;
         corpus->resumed = corpus->count > 0;
         snprintf(path, sizeof(path), "%s/crashes", output_dir);
-        if (load_crash_hashes(corpus, path) < 0)
+        if (load_hashes(path, "crash_", &g_crash_hashes, &corpus->unique_crashes) < 0)
+            return -1;
+        snprintf(path, sizeof(path), "%s/hangs", output_dir);
+        if (load_hashes(path, "hang_", &g_hang_hashes, &corpus->unique_hangs) < 0)
             return -1;
     }
     if (input_dir && !corpus->resumed && load_dir(corpus, input_dir, false) < 0)
@@ -347,6 +360,7 @@ void fathom_corpus_destroy(fathom_corpus_t *corpus)
 
     if (g_crash_hashes_ready) {
         fathom_hashset_destroy(&g_crash_hashes);
+        fathom_hashset_destroy(&g_hang_hashes);
         g_crash_hashes_ready = false;
     }
 }
@@ -652,5 +666,32 @@ int fathom_corpus_save_crash(fathom_corpus_t *corpus, const uint8_t *data,
             return -1;
     }
 
+    return 1;
+}
+
+int fathom_corpus_describe_crash(fathom_corpus_t *corpus, uint64_t hash, const char *text)
+{
+    if (!corpus->out_dir)
+        return 0;
+    char path[4096];
+    snprintf(path, sizeof(path), "%s/crashes/crash_%016" PRIx64 ".txt", corpus->out_dir, hash);
+    return write_file(path, (const uint8_t *)text, strlen(text));
+}
+
+int fathom_corpus_save_hang(fathom_corpus_t *corpus, const uint8_t *data,
+                            size_t len, uint64_t hash)
+{
+    if (!g_crash_hashes_ready || corpus->unique_hangs >= FATHOM_MAX_HANGS)
+        return 0;
+    int rc = fathom_hashset_insert(&g_hang_hashes, hash);
+    if (rc <= 0)
+        return rc;
+    corpus->unique_hangs++;
+    if (corpus->out_dir) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/hangs/hang_%016" PRIx64, corpus->out_dir, hash);
+        if (write_file(path, data, len) < 0)
+            return -1;
+    }
     return 1;
 }

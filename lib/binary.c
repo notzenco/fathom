@@ -278,3 +278,27 @@ void fathom_binary_close(fathom_binary_t *bin)
     free(bin->data);
     memset(bin, 0, sizeof(*bin));
 }
+
+const char *fathom_symbol_near(const fathom_binary_t *bin, uint64_t addr, uint64_t *off)
+{
+    /* Symbols are sorted by address: take the last function at or before addr. */
+    const fathom_symbol_t *best = NULL;
+    size_t lo = 0, hi = bin->symbol_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (bin->symbols[mid].addr <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    for (size_t i = lo; i-- > 0;) {
+        if (bin->symbols[i].type == FATHOM_SYM_FUNC) {
+            best = &bin->symbols[i];
+            break;
+        }
+    }
+    if (!best || (best->size && addr - best->addr >= best->size))
+        return NULL;
+    *off = addr - best->addr;
+    return best->name;
+}

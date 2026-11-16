@@ -62,7 +62,7 @@ stat_of() {
 }
 
 count_crashes() {
-    find "$1" -type f -path '*crashes/crash_*' 2>/dev/null | wc -l | tr -d ' '
+    find "$1" -type f -path '*crashes/crash_*' ! -name '*.txt' 2>/dev/null | wc -l | tr -d ' '
 }
 
 # ── Build ────────────────────────────────────────────────────────────
@@ -101,6 +101,30 @@ else
     for f in "$out"/run/queue/*; do
         printf '  %s  %s\n' "$(basename "$f")" "$(od -An -tx1 -N8 "$f" | tr -d '\n')"
     done | head -20
+fi
+
+# ── Replay and minimise the maze crash ───────────────────────────────
+
+crash=$(find "$out/run/crashes" -type f -name 'crash_*' ! -name '*.txt' 2>/dev/null | head -1)
+if [ -n "$crash" ]; then
+    info "replay: the saved maze crash must replay as a crash and minimise to FUZZ"
+    set +e
+    "$FATHOM" --replay "$crash" -- "$TARGETS/maze$EXE" 2>"$out/replay.log"
+    replay_rc=$?
+    "$FATHOM" --minimize "$crash" -- "$TARGETS/maze$EXE" 2>"$out/min.log"
+    min_rc=$?
+    set -e
+    if [ "$replay_rc" -ne 2 ]; then
+        fail "replay: exit status $replay_rc, expected 2 (crash)"
+        cat "$out/replay.log"
+    elif [ "$min_rc" -ne 0 ] || [ "$(cat "$crash.min" 2>/dev/null)" != "FUZZ" ]; then
+        fail "minimize: status $min_rc, result '$(cat "$crash.min" 2>/dev/null)'"
+        cat "$out/min.log"
+    elif [ ! -f "$crash.txt" ]; then
+        fail "crash report $crash.txt missing"
+    else
+        ok "replay: crash replays, minimises to FUZZ and has a report"
+    fi
 fi
 
 # ── Classic memory-safety targets (crash behaviour varies by libc) ───
