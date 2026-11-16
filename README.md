@@ -297,6 +297,7 @@ public header `include/fathom.h`.
 ```sh
 make test                  # unit tests
 bash tests/integration.sh  # end-to-end fuzzing
+bash tests/bench.sh 30 5   # time to crash per target: 30 s budget, 5 seeds
 ```
 
 - **Unit tests** load prebuilt fixtures (`tests/fixtures/`: the same
@@ -305,6 +306,12 @@ bash tests/integration.sh  # end-to-end fuzzing
   every host. Executor tests run the real debugger backend against the
   maze, a hanging target, and targets that fork, re-exec themselves,
   recover from a fault, or start a block with a trap instruction.
+- **Benchmark** (`tests/bench.sh`): fuzzes each benchmark target from
+  `AAAA` with several seeds and prints how many runs found the crash and
+  the median time, executions, execution rate and coverage. Besides the
+  test targets it covers known hard cases: a `memcmp` magic string, a
+  big-endian length field, and an `-O2` comparison against a constant
+  held in a register. Run it on two builds to compare them.
 - **Integration tests** fuzz from a seed that contains none of the bytes
   the bugs need. The maze must be solved on every platform. They also check
   that hangs are not reported as crashes and that parallel workers shard
