@@ -109,7 +109,8 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
 
 - **Dictionary extraction**: printable strings from read-only data, plus
   the constants the code compares against (`cmp al, 0x46`,
-  `subs w8, w8, #0x46`), which random mutation rarely guesses.
+  `subs w8, w8, #0x46`) in both byte orders, which random mutation rarely
+  guesses.
 - **Frontier tokens**: during fuzzing, constants compared in covered
   blocks whose branch still has an uncovered side, favouring blocks
   reached most recently. This keeps a statically linked runtime's
@@ -128,9 +129,12 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
 - `--trim` shrinks queue inputs while they reach the same blocks. It is
   off by default because breakpoints cannot see loop counts, so trimming
   would cut inputs below the length an overflow needs.
-- Seven mutation strategies (bitflip, byteflip, arithmetic, interesting
-  values, dictionary, havoc, splice) with adaptive weights: a strategy that
-  finds new coverage is boosted 2x, and all weights decay by 0.95x.
+- Ten mutation strategies (bitflip, byteflip, arithmetic, interesting
+  values, dictionary, havoc, splice, insert, delete, clone) with adaptive
+  weights: a strategy that finds new coverage is boosted 2x, and all
+  weights decay by 0.95x. Arithmetic and interesting values use 8- to
+  64-bit widths in either byte order, insert and delete change the length,
+  and havoc stacks all of them.
 - Seedable xorshift PRNG (`-s`), so runs are reproducible.
 - Crash deduplication by FNV-1a hash of the crash PC and the frame-pointer
   return chain. Main-image addresses count at their link-time value and

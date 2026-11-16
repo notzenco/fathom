@@ -198,6 +198,9 @@ typedef enum {
     FATHOM_MUT_DICTIONARY,
     FATHOM_MUT_HAVOC,
     FATHOM_MUT_SPLICE,
+    FATHOM_MUT_INSERT,       /* insert random bytes or a copy of a chunk */
+    FATHOM_MUT_DELETE,       /* delete a chunk */
+    FATHOM_MUT_CLONE,        /* overwrite a chunk with a copy of another */
     FATHOM_MUT_COUNT,
 } fathom_mutation_t;
 
@@ -423,7 +426,7 @@ void fathom_dict_init(fathom_dict_t *dict);
 void fathom_dict_destroy(fathom_dict_t *dict);
 int  fathom_dict_add(fathom_dict_t *dict, const uint8_t *data, size_t len);
 int  fathom_dict_load(fathom_dict_t *dict, const char *path);
-/* Add v as a 1/2/4/8-byte little-endian token unless already present.
+/* Add v as a 1/2/4/8-byte token, little- and big-endian, unless present.
  * Returns 1 if added, 0 if skipped (duplicate or trivial), -1 on error. */
 int  fathom_dict_add_constant(fathom_dict_t *dict, int64_t v);
 
