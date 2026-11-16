@@ -1,8 +1,10 @@
 /*
  * mutate.c — Mutation engine for libfathom
  *
- * Implements 7 mutation strategies with weighted random selection
- * and adaptive boosting for strategies that find new coverage.
+ * Implements the mutation strategies of fathom_mutation_t with weighted
+ * random selection and adaptive boosting for strategies that find new
+ * coverage.  Multi-byte values are written in either byte order, since
+ * file formats and protocols are often big-endian.
  */
 
 #include "mutate.h"
@@ -31,6 +33,11 @@ static const int32_t interesting_32[] = {
     (int32_t)0x10000, 0x7FFFFFFF, (int32_t)0x80000000, (int32_t)0xFFFFFFFF,
 };
 
+static const int64_t interesting_64[] = {
+    0, 1, -1, 0x7F, 0xFF, 0x7FFF, 0xFFFF, 0x7FFFFFFF, 0xFFFFFFFFLL,
+    0x100000000LL, INT64_MAX, INT64_MIN,
+};
+
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 /* ── Random helpers ──────────────────────────────────────────────────── */
@@ -56,6 +63,39 @@ static uint32_t rand_below(uint64_t *rng, uint32_t limit)
 uint32_t fathom_rand_below(fathom_mutator_t *mut, uint32_t limit)
 {
     return rand_below(&mut->rng, limit);
+}
+
+/* Write the low `width` bytes of v at p, little- or big-endian. */
+static void put_int(uint8_t *p, uint64_t v, size_t width, bool big)
+{
+    for (size_t i = 0; i < width; i++)
+        p[big ? width - 1 - i : i] = (uint8_t)(v >> (8 * i));
+}
+
+static uint64_t get_int(const uint8_t *p, size_t width, bool big)
+{
+    uint64_t v = 0;
+    for (size_t i = 0; i < width; i++)
+        v |= (uint64_t)p[big ? width - 1 - i : i] << (8 * i);
+    return v;
+}
+
+/* Largest of 1, 2, 4, 8 bytes that fits len, chosen at random. */
+static size_t pick_width(uint64_t *rng, size_t len)
+{
+    size_t w = (size_t)1 << rand_below(rng, 4);
+    while (w > len)
+        w >>= 1;
+    return w;
+}
+
+/* Chunk length for insert/delete/clone: mostly small, sometimes large. */
+static size_t block_len(uint64_t *rng, size_t limit)
+{
+    if (limit <= 1)
+        return limit;
+    size_t cap = rand_below(rng, 4) == 0 ? limit : (limit < 32 ? limit : 32);
+    return 1 + rand_below(rng, (uint32_t)cap);
 }
 
 /* ── Strategy: bitflip ───────────────────────────────────────────────── */
@@ -94,35 +134,13 @@ static void mutate_arith(uint64_t *rng, uint8_t *buf, size_t len)
     if (len == 0)
         return;
 
-    size_t pos = rand_below(rng, (uint32_t)len);
-    int32_t delta = (int32_t)(rand_below(rng, FATHOM_ARITH_MAX * 2 + 1))
-                    - FATHOM_ARITH_MAX;
+    size_t width = pick_width(rng, len);
+    size_t pos = rand_below(rng, (uint32_t)(len - width + 1));
+    bool big = width > 1 && rand_below(rng, 2);
+    int64_t delta = (int64_t)rand_below(rng, FATHOM_ARITH_MAX * 2 + 1) - FATHOM_ARITH_MAX;
     if (delta == 0)
         delta = 1;
-
-    /* Choose byte or word granularity. */
-    uint32_t width = rand_below(rng, 3);  /* 0 = byte, 1 = word16, 2 = dword32 */
-
-    if (width == 0 || len < 2) {
-        /* Byte arithmetic. */
-        buf[pos] = (uint8_t)(buf[pos] + delta);
-    } else if (width == 1 || len < 4) {
-        /* 16-bit arithmetic. */
-        if (pos + 1 >= len)
-            pos = len - 2;
-        uint16_t val;
-        memcpy(&val, buf + pos, 2);
-        val = (uint16_t)(val + delta);
-        memcpy(buf + pos, &val, 2);
-    } else {
-        /* 32-bit arithmetic. */
-        if (pos + 3 >= len)
-            pos = len - 4;
-        uint32_t val;
-        memcpy(&val, buf + pos, 4);
-        val = (uint32_t)(val + delta);
-        memcpy(buf + pos, &val, 4);
-    }
+    put_int(buf + pos, get_int(buf + pos, width, big) + (uint64_t)delta, width, big);
 }
 
 /* ── Strategy: interesting values ────────────────────────────────────── */
@@ -132,21 +150,64 @@ static void mutate_interesting(uint64_t *rng, uint8_t *buf, size_t len)
     if (len == 0)
         return;
 
-    uint32_t width = rand_below(rng, 3);  /* 0 = 8-bit, 1 = 16-bit, 2 = 32-bit */
-
-    if (width == 0 || len < 2) {
-        size_t pos = rand_below(rng, (uint32_t)len);
-        int8_t val = interesting_8[rand_below(rng, ARRAY_LEN(interesting_8))];
-        buf[pos] = (uint8_t)val;
-    } else if (width == 1 || len < 4) {
-        size_t pos = rand_below(rng, (uint32_t)(len - 1));
-        int16_t val = interesting_16[rand_below(rng, ARRAY_LEN(interesting_16))];
-        memcpy(buf + pos, &val, 2);
-    } else {
-        size_t pos = rand_below(rng, (uint32_t)(len - 3));
-        int32_t val = interesting_32[rand_below(rng, ARRAY_LEN(interesting_32))];
-        memcpy(buf + pos, &val, 4);
+    size_t width = pick_width(rng, len);
+    size_t pos = rand_below(rng, (uint32_t)(len - width + 1));
+    bool big = width > 1 && rand_below(rng, 2);
+    uint64_t v;
+    switch (width) {
+    case 1:  v = (uint64_t)interesting_8[rand_below(rng, ARRAY_LEN(interesting_8))];   break;
+    case 2:  v = (uint64_t)interesting_16[rand_below(rng, ARRAY_LEN(interesting_16))]; break;
+    case 4:  v = (uint64_t)interesting_32[rand_below(rng, ARRAY_LEN(interesting_32))]; break;
+    default: v = (uint64_t)interesting_64[rand_below(rng, ARRAY_LEN(interesting_64))]; break;
     }
+    put_int(buf + pos, v, width, big);
+}
+
+/* ── Strategies: insert, delete, clone ───────────────────────────────── */
+
+static void mutate_insert(uint64_t *rng, uint8_t *buf, size_t *len, size_t max_len)
+{
+    if (*len >= max_len)
+        return;
+    size_t n = block_len(rng, max_len - *len);
+    size_t pos = rand_below(rng, (uint32_t)(*len + 1));
+    memmove(buf + pos + n, buf + pos, *len - pos);
+
+    /* Copy an existing chunk (repeating structure) 3 times in 4, else random bytes. */
+    if (*len >= n && rand_below(rng, 4) != 0) {
+        size_t src = rand_below(rng, (uint32_t)(*len - n + 1));
+        if (src >= pos)
+            src += n;   /* the source moved with the tail */
+        memmove(buf + pos, buf + src, n);
+    } else if (rand_below(rng, 2)) {
+        memset(buf + pos, (int)rand_below(rng, 256), n);
+    } else {
+        for (size_t i = 0; i < n; i++)
+            buf[pos + i] = (uint8_t)rand_below(rng, 256);
+    }
+    *len += n;
+}
+
+static void mutate_delete(uint64_t *rng, uint8_t *buf, size_t *len)
+{
+    if (*len < 2)
+        return;
+    size_t n = block_len(rng, *len - 1);
+    size_t pos = rand_below(rng, (uint32_t)(*len - n + 1));
+    memmove(buf + pos, buf + pos + n, *len - pos - n);
+    *len -= n;
+}
+
+static void mutate_clone(uint64_t *rng, uint8_t *buf, size_t len)
+{
+    if (len < 2)
+        return;
+    size_t n = block_len(rng, len - 1);
+    size_t src = rand_below(rng, (uint32_t)(len - n + 1));
+    size_t dst = rand_below(rng, (uint32_t)(len - n + 1));
+    if (dst == src)
+        dst = (dst + 1) % (len - n + 1);
+    memmove(buf + dst, buf + src, n);
 }
 
 /* ── Strategy: dictionary ────────────────────────────────────────────── */
@@ -208,13 +269,19 @@ static void mutate_havoc(uint64_t *rng, uint8_t *buf, size_t *len, size_t max_le
 
     for (uint32_t i = 0; i < rounds; i++) {
         /* Pick an atomic mutation (everything except havoc and splice). */
-        uint32_t which = rand_below(rng, 5);
-        switch (which) {
+        switch (rand_below(rng, 9)) {
         case 0: mutate_bitflip(rng, buf, *len);                    break;
         case 1: mutate_byteflip(rng, buf, *len);                   break;
         case 2: mutate_arith(rng, buf, *len);                      break;
-        case 3: mutate_interesting(rng, buf, *len);                 break;
+        case 3: mutate_interesting(rng, buf, *len);                break;
         case 4: mutate_dictionary(rng, buf, len, max_len, dict);   break;
+        case 5: mutate_insert(rng, buf, len, max_len);             break;
+        case 6: mutate_delete(rng, buf, len);                      break;
+        case 7: mutate_clone(rng, buf, *len);                      break;
+        default:
+            if (*len)   /* set a random byte to a different random value */
+                buf[rand_below(rng, (uint32_t)*len)] ^= (uint8_t)(1 + rand_below(rng, 255));
+            break;
         }
     }
 }
@@ -551,6 +618,15 @@ int fathom_mutate(fathom_mutator_t *mut, uint8_t *buf, size_t *len,
     case FATHOM_MUT_SPLICE:
         mutate_splice(rng, buf, len, max_len, splice, splice_len);
         break;
+    case FATHOM_MUT_INSERT:
+        mutate_insert(rng, buf, len, max_len);
+        break;
+    case FATHOM_MUT_DELETE:
+        mutate_delete(rng, buf, len);
+        break;
+    case FATHOM_MUT_CLONE:
+        mutate_clone(rng, buf, *len);
+        break;
     case FATHOM_MUT_COUNT:
         /* Not a real strategy. */
         break;
@@ -588,14 +664,21 @@ int fathom_dict_add_constant(fathom_dict_t *dict, int64_t v)
     size_t width = (v >= -128 && v <= 255) ? 1
                  : (v >= -32768 && v <= 65535) ? 2
                  : (v >= INT32_MIN && v <= (int64_t)UINT32_MAX) ? 4 : 8;
-    uint8_t bytes[8];
-    for (size_t b = 0; b < width; b++)
-        bytes[b] = (uint8_t)((uint64_t)v >> (8 * b));
 
-    for (size_t e = 0; e < dict->count; e++) {
-        if (dict->entries[e].len == width &&
-            memcmp(dict->entries[e].data, bytes, width) == 0)
-            return 0;
+    /* Little-endian for native integers, big-endian for file and wire formats. */
+    int added = 0;
+    for (int big = 0; big < (width > 1 ? 2 : 1); big++) {
+        uint8_t bytes[8];
+        put_int(bytes, (uint64_t)v, width, big);
+        bool dup = false;
+        for (size_t e = 0; e < dict->count && !dup; e++)
+            dup = dict->entries[e].len == width &&
+                  memcmp(dict->entries[e].data, bytes, width) == 0;
+        if (dup)
+            continue;
+        if (fathom_dict_add(dict, bytes, width) < 0)
+            return -1;
+        added = 1;
     }
-    return fathom_dict_add(dict, bytes, width) == 0 ? 1 : -1;
+    return added;
 }

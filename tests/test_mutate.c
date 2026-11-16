@@ -4,6 +4,7 @@
 
 #include "fathom.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,7 +113,7 @@ static void test_each_strategy_no_crash(void)
             all_seen = 0;
         }
     }
-    CHECK(all_seen, "all 7 strategies exercised over 5000 iterations");
+    CHECK(all_seen, "every strategy exercised over 5000 iterations");
 
     fathom_dict_destroy(&dict);
 }
@@ -360,6 +361,87 @@ static void test_uses_counter(void)
           "uses counter incremented by exactly 1");
 }
 
+/* ── Test: length-changing and chunk strategies ──────────────────────── */
+
+/* Mutate a copy of a 32-byte ramp with only strategy `which` enabled. */
+static size_t mutate_only(fathom_mutator_t *mut, int which, uint8_t *buf, size_t cap)
+{
+    for (int i = 0; i < FATHOM_MUT_COUNT; i++)
+        mut->weights[i] = i == which ? 1.0 : 0.0;
+    for (size_t i = 0; i < 32; i++)
+        buf[i] = (uint8_t)i;
+    size_t len = 32;
+    int got = fathom_mutate(mut, buf, &len, cap, NULL, 0);
+    CHECK(got == which, "forced strategy was not used");
+    return len;
+}
+
+static void test_resize_strategies(void)
+{
+    fathom_mutator_t mut;
+    fathom_mutator_init(&mut, NULL);
+    fathom_mutator_seed(&mut, 11);
+    uint8_t buf[256];
+
+    bool grew = false, shrank = false, cloned = false;
+    for (int i = 0; i < 200; i++) {
+        grew |= mutate_only(&mut, FATHOM_MUT_INSERT, buf, sizeof(buf)) > 32;
+        shrank |= mutate_only(&mut, FATHOM_MUT_DELETE, buf, sizeof(buf)) < 32;
+
+        /* A clone overwrites bytes with a copy of another run of the input. */
+        size_t len = mutate_only(&mut, FATHOM_MUT_CLONE, buf, sizeof(buf));
+        CHECK(len == 32, "clone keeps the length");
+        for (size_t p = 0; p + 1 < len; p++)
+            cloned |= buf[p] != p && buf[p + 1] == (uint8_t)(buf[p] + 1);
+    }
+    CHECK(grew, "insert grows the input");
+    CHECK(shrank, "delete shrinks the input");
+    CHECK(cloned, "clone copies a run of the input elsewhere");
+
+    /* Havoc stacks them, so lengths move both ways. */
+    grew = shrank = false;
+    for (int i = 0; i < 200; i++) {
+        size_t len = mutate_only(&mut, FATHOM_MUT_HAVOC, buf, sizeof(buf));
+        grew |= len > 32;
+        shrank |= len < 32;
+    }
+    CHECK(grew && shrank, "havoc changes the length both ways");
+}
+
+/* Interesting values are also tried big-endian and at 64 bits. */
+static void test_interesting_widths(void)
+{
+    fathom_mutator_t mut;
+    fathom_mutator_init(&mut, NULL);
+    fathom_mutator_seed(&mut, 5);
+    uint8_t buf[256];
+    bool be16 = false, wide = false;
+    for (int i = 0; i < 4000; i++) {
+        mutate_only(&mut, FATHOM_MUT_INTERESTING, buf, sizeof(buf));
+        for (size_t p = 0; p + 8 <= 32; p++) {
+            be16 |= buf[p] == 0x7F && buf[p + 1] == 0xFF;
+            wide |= !memcmp(buf + p, "\xff\xff\xff\xff\xff\xff\xff\x7f", 8);
+        }
+    }
+    CHECK(be16, "big-endian 0x7fff written");
+    CHECK(wide, "64-bit INT64_MAX written");
+}
+
+/* Comparison constants become tokens in both byte orders. */
+static void test_dict_constant(void)
+{
+    fathom_dict_t dict;
+    fathom_dict_init(&dict);
+    CHECK(fathom_dict_add_constant(&dict, 0x1234) == 1, "constant added");
+    CHECK(dict.count == 2, "little- and big-endian tokens");
+    CHECK(dict.count == 2 && !memcmp(dict.entries[0].data, "\x34\x12", 2) &&
+          !memcmp(dict.entries[1].data, "\x12\x34", 2), "token bytes");
+    CHECK(fathom_dict_add_constant(&dict, 0x1234) == 0, "duplicate skipped");
+    CHECK(fathom_dict_add_constant(&dict, 0x46) == 1 && dict.count == 3,
+          "one-byte constants have one order");
+    fathom_dict_destroy(&dict);
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -377,6 +459,9 @@ int main(void)
     test_empty_input();
     test_max_len();
     test_uses_counter();
+    test_resize_strategies();
+    test_interesting_widths();
+    test_dict_constant();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
