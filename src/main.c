@@ -65,6 +65,7 @@ typedef struct {
     uint64_t max_execs;      /* --max-execs: stop after this many runs, 0 = no limit */
     bool     fail_on_crash;  /* --fail-on-crash: exit status 2 if any unique crash */
     bool     no_cmplog;      /* --no-cmplog: skip the input-to-state stage */
+    bool     det;            /* --det: deterministic stage on new short inputs */
     int      worker_id;      /* -1 unless launched as a worker (Windows) */
     char     stop_event[64];
 } fathom_opts_t;
@@ -383,6 +384,8 @@ static void usage(const char *prog)
         "  --max-input <n> Largest input to generate, in bytes (default: %d)\n"
         "  --fail-on-crash Exit with status 2 if any unique crash was found\n"
         "  --no-cmplog Skip comparison logging (input-to-state) on new inputs\n"
+        "  --det       Try every deterministic edit (bit flips, small arithmetic,\n"
+        "              interesting values) of each new input up to 256 bytes\n"
         "  --fork-server   Linux: fork each run from the target stopped at its\n"
         "                  entry point instead of starting it afresh\n"
         "  --version   Show the version\n"
@@ -767,6 +770,8 @@ static int trim_input(worker_t *w, size_t idx, uint8_t *buf)
 
 /* One mutated run of input idx.  Returns -1 on a fatal error. */
 #define STRATEGY_CMPLOG  (-2)   /* input-to-state candidate, not a mutation strategy */
+#define STRATEGY_DET     (-3)   /* deterministic stage candidate */
+#define DET_MAX_LEN      256    /* longer inputs skip the deterministic stage */
 
 /*
  * Run one candidate input and act on the result: keep it if it reaches
@@ -811,7 +816,8 @@ static int evaluate(worker_t *w, const uint8_t *buf, size_t len, int strategy)
                     w->multi ? "" : "\n", w->prefix ? w->prefix : "", fresh,
                     w->stats.covered, w->stats.instrumented,
                     strategy >= 0 && strategy < FATHOM_MUT_COUNT ? strategy_names[strategy]
-                    : strategy == STRATEGY_CMPLOG ? "comparison log" : "?", len);
+                    : strategy == STRATEGY_CMPLOG ? "comparison log"
+                    : strategy == STRATEGY_DET ? "deterministic" : "?", len);
     }
 
     if (res.status == FATHOM_EXIT_CRASH)
@@ -839,6 +845,28 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
                                  can_splice ? donor->data : NULL,
                                  can_splice ? donor->len : 0);
     return evaluate(w, buf, len, strategy);
+}
+
+/*
+ * --det: the first time a short input is fuzzed, try every deterministic
+ * edit of it (fathom_det_next) before random mutation.  Thorough for
+ * byte-by-byte checks, but its cost grows with the input's length.
+ */
+static int det_stage(worker_t *w, size_t idx, uint8_t *buf)
+{
+    const fathom_input_t *inp = &w->corpus.inputs[idx];
+    size_t len = inp->len;
+    if (len == 0 || len > DET_MAX_LEN)
+        return 0;
+    uint8_t in[DET_MAX_LEN];
+    memcpy(in, inp->data, len);
+    fathom_det_t d;
+    memset(&d, 0, sizeof(d));
+    while (!out_of_time(w) && fathom_det_next(&d, in, len, buf)) {
+        if (evaluate(w, buf, len, STRATEGY_DET) < 0)
+            return -1;
+    }
+    return 0;
 }
 
 /* ── Input-to-state (comparison logging) ─────────────────────────────── */
@@ -1193,6 +1221,10 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
             fprintf(stderr, "fathom: target execution failed\n");
             goto cleanup;
         }
+        if (opts->det && w->corpus.inputs[idx].fuzz_count == 0 && det_stage(w, idx, buf) < 0) {
+            fprintf(stderr, "fathom: target execution failed\n");
+            goto cleanup;
+        }
         if (w->n_cmp_sites && w->corpus.inputs[idx].fuzz_count == 0 &&
             cmplog_stage(w, idx, buf) < 0) {
             fprintf(stderr, "fathom: target execution failed\n");
@@ -1476,6 +1508,7 @@ int main(int argc, char *argv[])
         {"fail-on-crash", no_argument,  NULL, 'F'},
         {"no-cmplog", no_argument,      NULL, 'C'},
         {"fork-server", no_argument,    NULL, 'K'},
+        {"det",      no_argument,       NULL, 'X'},
         {"version",  no_argument,       NULL, 'V'},
         {"minimize", required_argument, NULL, 'M'},
         {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
@@ -1508,6 +1541,7 @@ int main(int argc, char *argv[])
         case 'F': opts.fail_on_crash = true; break;
         case 'C': opts.no_cmplog = true; break;
         case 'K': opts.cfg.fork_server = true; break;
+        case 'X': opts.det = true; break;
         case 'V':
             printf("fathom %d.%d.%d\n", FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR,
                    FATHOM_VERSION_PATCH);
