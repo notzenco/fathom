@@ -273,6 +273,11 @@ typedef struct {
     bool            cull_dirty;   /* favored set needs recomputing */
     uint64_t        rng;          /* scheduling randomness, see fathom_corpus_seed */
     bool            resumed;      /* loaded an existing queue instead of the seeds */
+    /*
+     * Schedule without run times, which vary between runs, so a seeded
+     * run is reproducible: inputs are ranked by size alone.
+     */
+    bool            deterministic;
     size_t          unique_hangs;
 } fathom_corpus_t;
 
