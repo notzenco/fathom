@@ -31,7 +31,7 @@
 #define FATHOM_BANNER       "fathom — coverage-guided binary fuzzer v%d.%d.%d\n"
 #define DEFAULT_TIMEOUT_MS  1000
 #define DEFAULT_JOBS        1
-#define MAX_INPUT_SIZE      (1 << 20)   /* 1 MB max mutated input */
+#define DEFAULT_MAX_INPUT   (1 << 20)   /* 1 MB max mutated input */
 #define STATS_INTERVAL_US   1000000     /* status line refresh rate */
 #define FATHOM_PATH_MAX     4096
 #define STATS_FILE          "fuzzer_stats"
@@ -42,6 +42,8 @@
 #endif
 
 /* ── Options ─────────────────────────────────────────────────────────── */
+
+static size_t g_max_input = DEFAULT_MAX_INPUT;   /* --max-input */
 
 typedef struct {
     fathom_config_t cfg;
@@ -58,6 +60,8 @@ typedef struct {
     bool     trim;
     const char *replay;      /* --replay: run this input once and report */
     const char *minimize;    /* --minimize: shrink this crashing input */
+    uint64_t max_execs;      /* --max-execs: stop after this many runs, 0 = no limit */
+    bool     fail_on_crash;  /* --fail-on-crash: exit status 2 if any unique crash */
     int      worker_id;      /* -1 unless launched as a worker (Windows) */
     char     stop_event[64];
 } fathom_opts_t;
@@ -133,7 +137,15 @@ typedef struct {
     uint64_t first_crash_execs;     /* 0 until the first unique crash */
     uint64_t first_crash_ms;
     uint64_t start_us;
+    uint64_t last_gain_us;          /* when coverage last grew */
+    size_t   unique_hangs;
+    const fathom_mutator_t *mut;    /* per-strategy counters, when known */
 } fathom_stats_t;
+
+static const char *const strategy_names[FATHOM_MUT_COUNT] = {
+    "bitflip", "byteflip", "arith", "interesting", "dictionary",
+    "havoc", "splice", "insert", "delete", "clone",
+};
 
 static void cleanup_session(fathom_session_t *s)
 {
@@ -257,12 +269,20 @@ static void write_stats(const char *dir, const fathom_stats_t *st)
     FILE *fp = fopen(path, "w");
     if (!fp)
         return;
+    uint64_t now = fathom_now_us();
+    uint64_t run_ms = st->start_us ? (now - st->start_us) / 1000 : 0;
     fprintf(fp, "execs %" PRIu64 "\ncrashes %" PRIu64 "\nunique_crashes %" PRIu64
-                "\nhangs %" PRIu64 "\ncorpus %zu\ncovered %zu\ninstrumented %zu\n"
-                "first_crash_execs %" PRIu64 "\nfirst_crash_ms %" PRIu64 "\n",
-            st->total_execs, st->crashes, st->unique_crashes, st->hangs,
+                "\nhangs %" PRIu64 "\nunique_hangs %zu\ncorpus %zu\ncovered %zu\n"
+                "instrumented %zu\nfirst_crash_execs %" PRIu64 "\nfirst_crash_ms %" PRIu64
+                "\nrun_ms %" PRIu64 "\nexecs_per_sec %" PRIu64 "\nlast_gain_ms %" PRIu64 "\n",
+            st->total_execs, st->crashes, st->unique_crashes, st->hangs, st->unique_hangs,
             st->corpus_size, st->covered, st->instrumented,
-            st->first_crash_execs, st->first_crash_ms);
+            st->first_crash_execs, st->first_crash_ms, run_ms,
+            run_ms ? st->total_execs * 1000 / run_ms : 0,
+            st->last_gain_us > st->start_us ? (st->last_gain_us - st->start_us) / 1000 : 0);
+    for (int i = 0; st->mut && i < FATHOM_MUT_COUNT; i++)
+        fprintf(fp, "mut_%s_uses %" PRIu64 "\nmut_%s_hits %" PRIu64 "\n",
+                strategy_names[i], st->mut->uses[i], strategy_names[i], st->mut->hits[i]);
     fclose(fp);
 }
 
@@ -286,6 +306,9 @@ static bool read_stats(const char *dir, fathom_stats_t *st)
         else if (!strcmp(key, "corpus"))         st->corpus_size = (size_t)val;
         else if (!strcmp(key, "covered"))        st->covered = (size_t)val;
         else if (!strcmp(key, "instrumented"))   st->instrumented = (size_t)val;
+        else if (!strcmp(key, "unique_hangs"))   st->unique_hangs = (size_t)val;
+        else if (!strcmp(key, "first_crash_execs")) st->first_crash_execs = val;
+        else if (!strcmp(key, "first_crash_ms")) st->first_crash_ms = val;
     }
     fclose(fp);
     return any;
@@ -353,13 +376,17 @@ static void usage(const char *prog)
         "  --trim      Shrink queue inputs that keep the same blocks (off by\n"
         "              default: coverage cannot see loop counts)\n"
         "  -a          Analysis-only mode (print CFG + scores, no fuzzing)\n"
+        "  --max-execs <n> Stop after n target runs\n"
+        "  --max-input <n> Largest input to generate, in bytes (default: %d)\n"
+        "  --fail-on-crash Exit with status 2 if any unique crash was found\n"
+        "  --version   Show the version\n"
         "  --replay <f>    Run input f once and report the outcome (exit\n"
         "                  status 0 ok, 2 crash, 3 hang)\n"
         "  --minimize <f>  Shrink crashing input f to f.min, keeping the crash\n"
         "  -v          Verbose output\n"
         "  --dict <f>  Extra dictionary file\n"
         "  -h          Show this help\n",
-        prog, DEFAULT_TIMEOUT_MS, DEFAULT_JOBS);
+        prog, DEFAULT_TIMEOUT_MS, DEFAULT_JOBS, DEFAULT_MAX_INPUT);
 }
 
 /* ── Replay and minimise ─────────────────────────────────────────────── */
@@ -373,8 +400,8 @@ static uint8_t *read_input(const char *path, size_t *len)
         fprintf(stderr, "fathom: cannot open %s: %s\n", path, strerror(errno));
         return NULL;
     }
-    uint8_t *buf = malloc(MAX_INPUT_SIZE);
-    *len = buf ? fread(buf, 1, MAX_INPUT_SIZE, fp) : 0;
+    uint8_t *buf = malloc(g_max_input);
+    *len = buf ? fread(buf, 1, g_max_input, fp) : 0;
     fclose(fp);
     return buf;
 }
@@ -564,9 +591,13 @@ static bool out_of_time(worker_t *w)
     uint64_t now = fathom_now_us();
     if (now - w->last_status >= STATS_INTERVAL_US) {
         print_status(&w->stats, w->prefix, !w->multi);
+        w->stats.corpus_size = w->corpus.count;
+        w->stats.unique_hangs = w->corpus.unique_hangs;
+        write_stats(w->cfg->output_dir, &w->stats);
         w->last_status = now;
     }
-    return stop_requested() || w->done || (w->deadline && now >= w->deadline);
+    return stop_requested() || w->done || (w->deadline && now >= w->deadline) ||
+           (w->opts->max_execs && w->stats.total_execs >= w->opts->max_execs);
 }
 
 /*
@@ -585,6 +616,7 @@ static double take_coverage(worker_t *w)
     }
     fathom_coverage_merge(&w->cov);
     w->stats.covered = w->cov.total_blocks;
+    w->stats.last_gain_us = fathom_now_us();
     rebuild_frontier(&w->frontier, w->session, &w->cov, w->slot_block, w->block_slot,
                      w->epoch, w->gains, w->cov.size);
     return score;
@@ -730,7 +762,7 @@ static int trim_input(worker_t *w, size_t idx, uint8_t *buf)
     inp->trimmed = true;
     if (!inp->slots)
         return 0;
-    size_t len = inp->len < MAX_INPUT_SIZE ? inp->len : MAX_INPUT_SIZE, orig = len;
+    size_t len = inp->len < g_max_input ? inp->len : g_max_input, orig = len;
     memcpy(buf, inp->data, len);
     arm_all(w);
     int rc = fathom_trim(&w->ex, &w->cov, buf, &len, inp->trace_hash, TRIM_MAX_EXECS,
@@ -748,13 +780,13 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
 {
     fathom_corpus_t *corpus = &w->corpus;
     const fathom_input_t *seed = &corpus->inputs[idx];
-    size_t len = seed->len < MAX_INPUT_SIZE ? seed->len : MAX_INPUT_SIZE;
+    size_t len = seed->len < g_max_input ? seed->len : g_max_input;
     memcpy(buf, seed->data, len);
 
     const fathom_input_t *donor =
         &corpus->inputs[fathom_rand_below(&w->mut, (uint32_t)corpus->count)];
     bool can_splice = corpus->count > 1 && donor != seed;
-    int strategy = fathom_mutate(&w->mut, buf, &len, MAX_INPUT_SIZE,
+    int strategy = fathom_mutate(&w->mut, buf, &len, g_max_input,
                                  can_splice ? donor->data : NULL,
                                  can_splice ? donor->len : 0);
 
@@ -788,6 +820,12 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
         update_steer(w);
         if (strategy >= 0 && strategy < FATHOM_MUT_COUNT)
             fathom_mutator_reward(&w->mut, (fathom_mutation_t)strategy);
+        if (w->cfg->verbose)
+            fprintf(stderr, "%s%s[+] %zu new block(s), %zu/%zu covered, by %s, %zu bytes\n",
+                    w->multi ? "" : "\n", w->prefix ? w->prefix : "", fresh,
+                    w->stats.covered, w->stats.instrumented,
+                    strategy >= 0 && strategy < FATHOM_MUT_COUNT ? strategy_names[strategy]
+                                                                  : "?", len);
     }
 
     if (res.status == FATHOM_EXIT_CRASH)
@@ -841,6 +879,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         goto cleanup;
 
     fathom_mutator_init(&w->mut, &session->ana.dict);
+    w->stats.mut = &w->mut;
     w->mut.frontier = &w->frontier;
     if (opts->have_seed) {
         fathom_mutator_seed(&w->mut, opts->seed + (uint64_t)worker_id);
@@ -857,7 +896,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     w->slot_block = malloc((session->ana.cov_count + 1) * sizeof(*w->slot_block));
     w->block_slot = malloc((session->cfg_graph.block_count + 1) * sizeof(*w->block_slot));
     w->epoch = calloc(session->ana.cov_count + 1, sizeof(*w->epoch));
-    buf = malloc(MAX_INPUT_SIZE);
+    buf = malloc(g_max_input);
     if (!w->slot_block || !w->block_slot || !w->epoch || !buf) {
         fprintf(stderr, "fathom: out of memory\n");
         goto cleanup;
@@ -951,7 +990,8 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
                 w->corpus.unique_hangs);
         fprintf(stderr, "  output dir:     %s\n", cfg->output_dir);
     }
-    ret = 0;
+    /* Workers report crashes through their stats; the supervisor decides. */
+    ret = !multi && opts->fail_on_crash && w->corpus.unique_crashes > 0 ? 2 : 0;
 
 cleanup:
     if (corpus_ready) {
@@ -1148,6 +1188,7 @@ static int run_parallel(const fathom_opts_t *opts, int argc, char **argv,
         }
         total.total_execs += w.total_execs;
         total.crashes += w.crashes;
+        total.unique_crashes += w.unique_crashes;
         total.hangs += w.hangs;
         snprintf(lines[i], sizeof(lines[i]),
                  "    worker-%03u: coverage=%zu/%zu blocks | corpus=%zu | crashes=%" PRIu64,
@@ -1161,7 +1202,9 @@ static int run_parallel(const fathom_opts_t *opts, int argc, char **argv,
     for (uint32_t i = 0; i < jobs; i++)
         fprintf(stderr, "%s\n", lines[i]);
 
-    return ok ? 0 : 1;
+    if (!ok)
+        return 1;
+    return opts->fail_on_crash && total.unique_crashes > 0 ? 2 : 0;
 }
 
 /* ── Main ────────────────────────────────────────────────────────────── */
@@ -1196,6 +1239,10 @@ int main(int argc, char *argv[])
         {"until-crash", no_argument,    NULL, 'U'},
         {"trim",     no_argument,       NULL, 'R'},
         {"replay",   required_argument, NULL, 'P'},
+        {"max-execs", required_argument, NULL, 'E'},
+        {"max-input", required_argument, NULL, 'I'},
+        {"fail-on-crash", no_argument,  NULL, 'F'},
+        {"version",  no_argument,       NULL, 'V'},
         {"minimize", required_argument, NULL, 'M'},
         {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
         {NULL, 0, NULL, 0},
@@ -1216,6 +1263,19 @@ int main(int argc, char *argv[])
         case 'U': opts.until_crash = true; break;
         case 'R': opts.trim = true; break;
         case 'P': opts.replay = optarg; break;
+        case 'E': opts.max_execs = strtoull(optarg, NULL, 0); break;
+        case 'I':
+            g_max_input = parse_u32(optarg, "input size", &ok);
+            if (g_max_input == 0) {
+                fprintf(stderr, "fathom: --max-input must be at least 1\n");
+                ok = false;
+            }
+            break;
+        case 'F': opts.fail_on_crash = true; break;
+        case 'V':
+            printf("fathom %d.%d.%d\n", FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR,
+                   FATHOM_VERSION_PATCH);
+            return 0;
         case 'M': opts.minimize = optarg; break;
         case 'a': opts.cfg.analysis_only = true; break;
         case 'v': opts.cfg.verbose = true; break;
