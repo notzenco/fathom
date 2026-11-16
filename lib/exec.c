@@ -133,6 +133,7 @@ void fathom_exec_destroy(fathom_exec_t *ex)
         free(ex->os->follow_slot);
         free(ex->os->follow_off);
         free(ex->os->bp_follow);
+        free(ex->os->disarmed);
         free(ex->os);
     }
     free(ex->bp_addrs);
@@ -197,6 +198,7 @@ static void invalidate_patch(struct fathom_exec_os *os)
     os->bp_off = os->follow_off = NULL;
     os->n_clusters = 0;
     os->patch_ready = false;
+    os->patch_stale = true;
 }
 
 int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
@@ -224,6 +226,25 @@ int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
     ex->bp_addrs[slot] = addr;
     invalidate_patch(os);
     return slot;
+}
+
+void fathom_exec_arm(fathom_exec_t *ex, int slot, bool armed)
+{
+    struct fathom_exec_os *os = ex->os;
+    if (slot < 0 || (size_t)slot >= ex->bp_count)
+        return;
+    if (os->disarmed_len < ex->bp_count) {
+        bool *p = realloc(os->disarmed, ex->bp_count * sizeof(*p));
+        if (!p)
+            return;   /* stays armed: slower, never wrong */
+        memset(p + os->disarmed_len, 0, (ex->bp_count - os->disarmed_len) * sizeof(*p));
+        os->disarmed = p;
+        os->disarmed_len = ex->bp_count;
+    }
+    if (os->disarmed[slot] != !armed) {
+        os->disarmed[slot] = !armed;
+        os->patch_stale = true;
+    }
 }
 
 int fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn)
@@ -356,14 +377,19 @@ int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr
                 return -1;
             }
         }
+        os->patch_ready = true;
+        os->patch_slide = os->slide;
+        os->patch_stale = true;
+    }
+    if (os->patch_stale) {
         const struct exec_cluster *last = &os->clusters[os->n_clusters - 1];
         memcpy(os->patched, os->orig, last->off + (size_t)(last->hi - last->lo));
         for (size_t i = 0; i < ex->bp_count; i++) {
-            if (!is_trap(os, os->bp_off[i]))
+            bool off = i < os->disarmed_len && os->disarmed[i];
+            if (!off && !is_trap(os, os->bp_off[i]))
                 memcpy(os->patched + os->bp_off[i], os->bp_insn, os->bp_len);
         }
-        os->patch_ready = true;
-        os->patch_slide = os->slide;
+        os->patch_stale = false;
     }
 
     for (size_t i = 0; i < os->n_clusters; i++) {

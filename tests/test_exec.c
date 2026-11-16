@@ -259,6 +259,47 @@ static void test_loop_counts(void)
     END();
 }
 
+/* Disarmed breakpoints cost nothing; only blocks still armed report. */
+static void test_disarm(void)
+{
+    BEGIN("disarmed_blocks_do_not_trap");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("maze")) == 0, "load failed");
+    CHECK(run_cov(&t, &cov, "FUZA", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    size_t full = 0;
+    for (size_t i = 0; i < cov.size; i++) {
+        if (cov.local[i]) {
+            full++;
+            fathom_exec_arm(&t.ex, (int)i, false);
+        }
+    }
+    CHECK(full > 0, "no coverage");
+
+    CHECK(run_cov(&t, &cov, "FUZA", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    bool any = false;
+    for (size_t i = 0; i < cov.size; i++)
+        any |= cov.local[i] != 0;
+    CHECK(!any, "a disarmed block still trapped");
+
+    CHECK(run_cov(&t, &cov, "FUZZ", &res) == 0 && res.status == FATHOM_EXIT_CRASH, "exec failed");
+    any = false;
+    for (size_t i = 0; i < cov.size; i++)
+        any |= cov.local[i] != 0;
+    CHECK(any, "the newly reached block did not trap");
+
+    for (size_t i = 0; i < cov.size; i++)
+        fathom_exec_arm(&t.ex, (int)i, true);
+    CHECK(run_cov(&t, &cov, "FUZA", &res) == 0, "exec failed");
+    size_t again = 0;
+    for (size_t i = 0; i < cov.size; i++)
+        again += cov.local[i] != 0;
+    CHECK(again == full, "re-armed blocks should trap again");
+    unload(&t, &cov);
+    END();
+}
+
 /* Trimming drops bytes that do not change the path. */
 static void test_trim(void)
 {
@@ -372,6 +413,7 @@ int main(void)
     test_recovered_fault();
     test_trim();
     test_loop_counts();
+    test_disarm();
 #ifndef _WIN32
     test_reexec();
     test_forked_children();

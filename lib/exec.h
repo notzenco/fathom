@@ -77,6 +77,9 @@ struct fathom_exec_os {
      */
     bool      patch_ready;
     uint64_t  patch_slide;
+    bool      patch_stale;   /* patched needs rebuilding from orig (arming changed) */
+    bool     *disarmed;      /* slot -> left out of the patch */
+    size_t    disarmed_len;
 
     uint8_t   bp_insn[4];
     size_t    bp_len;

@@ -387,6 +387,7 @@ typedef struct {
     uint32_t              *slot_block;
     int32_t               *block_slot;
     uint32_t              *epoch;       /* coverage gain in which each slot was first hit */
+    bool                  *counted;     /* slot counts loop iterations, so stays armed */
     uint32_t               gains;
     uint64_t               deadline;
     uint64_t               last_status;
@@ -422,6 +423,23 @@ static double take_coverage(worker_t *w)
     rebuild_frontier(&w->frontier, w->session, &w->cov, w->slot_block, w->block_slot,
                      w->epoch, w->gains, w->cov.size);
     return score;
+}
+
+/*
+ * Fuzzing runs leave covered blocks disarmed, so most runs only trap on
+ * blocks not reached yet.  Calibration, trimming and recording a new
+ * input need the full path, so they arm everything first.
+ */
+static void arm_all(worker_t *w)
+{
+    for (size_t s = 0; s < w->cov.size; s++)
+        fathom_exec_arm(&w->ex, (int)s, true);
+}
+
+static void disarm_covered(worker_t *w)
+{
+    for (size_t s = 0; s < w->cov.size; s++)
+        fathom_exec_arm(&w->ex, (int)s, !w->cov.global[s] || w->counted[s]);
 }
 
 /* Returns -1 on a fatal error, 1 if this was a new unique crash, else 0. */
@@ -509,8 +527,11 @@ static int trim_input(worker_t *w, size_t idx, uint8_t *buf)
         return 0;
     size_t len = inp->len < MAX_INPUT_SIZE ? inp->len : MAX_INPUT_SIZE, orig = len;
     memcpy(buf, inp->data, len);
-    if (fathom_trim(&w->ex, &w->cov, buf, &len, inp->trace_hash, TRIM_MAX_EXECS,
-                    &w->stats.total_execs) < 0)
+    arm_all(w);
+    int rc = fathom_trim(&w->ex, &w->cov, buf, &len, inp->trace_hash, TRIM_MAX_EXECS,
+                         &w->stats.total_execs);
+    disarm_covered(w);
+    if (rc < 0)
         return -1;
     if (len < orig && fathom_corpus_update(&w->corpus, idx, buf, len) < 0)
         return -1;
@@ -541,8 +562,20 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
 
     if (fathom_coverage_has_new(&w->cov)) {
         double score = take_coverage(w);
-        if (fathom_corpus_add(corpus, buf, len, w->cov.new_blocks, score) < 0 ||
-            fathom_corpus_record(corpus, corpus->count - 1, &w->cov, res.exec_us) < 0) {
+        size_t fresh = w->cov.new_blocks;
+
+        /* The run saw only armed blocks: run it again in full for its trace. */
+        fathom_exec_result_t full;
+        arm_all(w);
+        w->stats.total_execs++;
+        int rc = fathom_exec_run(&w->ex, &w->cov, buf, len, &full);
+        disarm_covered(w);
+        if (rc < 0)
+            return -1;
+        fathom_coverage_merge(&w->cov);
+
+        if (fathom_corpus_add(corpus, buf, len, fresh, score) < 0 ||
+            fathom_corpus_record(corpus, corpus->count - 1, &w->cov, full.exec_us) < 0) {
             fprintf(stderr, "fathom: failed to add interesting input\n");
             return -1;
         }
@@ -633,10 +666,14 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         w->block_slot[bid] = slot;
     }
     /* Loop headers count their iterations, so a different trip count is new coverage. */
+    w->counted = calloc(session->ana.cov_count + 1, sizeof(*w->counted));
+    if (!w->counted)
+        goto cleanup;
     for (size_t i = 0; i < session->ana.cov_count; i++) {
         const fathom_block_t *b = &session->cfg_graph.blocks[session->ana.cov_blocks[i]];
         if (b->is_loop_header && b->insn_count > 1)
-            fathom_exec_count_hits(&w->ex, (int)i, session->dis.insns[b->insn_start + 1].addr);
+            w->counted[i] = fathom_exec_count_hits(&w->ex, (int)i,
+                                session->dis.insns[b->insn_start + 1].addr) == 0;
     }
     w->stats.instrumented = w->ex.bp_count;
 
@@ -669,6 +706,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         }
     }
     w->stats.corpus_size = w->corpus.count;
+    disarm_covered(w);
 
     while (!out_of_time(w)) {
         fathom_input_t *inp = fathom_corpus_next(&w->corpus);
@@ -707,6 +745,7 @@ cleanup:
     free(w->slot_block);
     free(w->block_slot);
     free(w->epoch);
+    free(w->counted);
     fathom_dict_destroy(&w->frontier);
     if (ex_ready)
         fathom_exec_destroy(&w->ex);
