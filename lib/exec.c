@@ -129,6 +129,10 @@ void fathom_exec_destroy(fathom_exec_t *ex)
         free(ex->os->orig);
         free(ex->os->patched);
         free(ex->os->bp_off);
+        free(ex->os->follow_addrs);
+        free(ex->os->follow_slot);
+        free(ex->os->follow_off);
+        free(ex->os->bp_follow);
         free(ex->os);
     }
     free(ex->bp_addrs);
@@ -137,17 +141,62 @@ void fathom_exec_destroy(fathom_exec_t *ex)
 
 /* ── Breakpoints ────────────────────────────────────────────────────── */
 
+#define FOLLOW_BIT  0x80000000u   /* hash value is a follow index, not a slot */
+
+/* Hash value for addr, or false if there is none. */
+static bool hash_get(const struct fathom_exec_os *os, uint64_t addr, uint32_t *val)
+{
+    if (addr == 0)
+        return false;
+    for (size_t i = hash_slot(addr, os->hash_cap);; i = (i + 1) & (os->hash_cap - 1)) {
+        if (os->hash_keys[i] == addr) {
+            *val = os->hash_vals[i];
+            return true;
+        }
+        if (os->hash_keys[i] == 0)
+            return false;
+    }
+}
+
+static int hash_put(struct fathom_exec_os *os, size_t entries, uint64_t addr, uint32_t val)
+{
+    if ((entries + 1) * 2 > os->hash_cap && hash_grow(os) < 0)
+        return -1;
+    size_t i = hash_slot(addr, os->hash_cap);
+    while (os->hash_keys[i] != 0)
+        i = (i + 1) & (os->hash_cap - 1);
+    os->hash_keys[i] = addr;
+    os->hash_vals[i] = val;
+    return 0;
+}
+
 int exec_bp_lookup(const fathom_exec_t *ex, uint64_t addr)
 {
-    const struct fathom_exec_os *os = ex->os;
-    if (addr == 0)
+    uint32_t v;
+    if (!hash_get(ex->os, addr, &v) || (v & FOLLOW_BIT))
         return -1;
-    for (size_t i = hash_slot(addr, os->hash_cap);; i = (i + 1) & (os->hash_cap - 1)) {
-        if (os->hash_keys[i] == addr)
-            return (int)os->hash_vals[i];
-        if (os->hash_keys[i] == 0)
-            return -1;
-    }
+    return (int)v;
+}
+
+bool exec_is_ours(const fathom_exec_t *ex, uint64_t addr)
+{
+    uint32_t v;
+    return hash_get(ex->os, addr, &v);
+}
+
+/* Clusters and patch buffers are rebuilt on the next run. */
+static void invalidate_patch(struct fathom_exec_os *os)
+{
+    free(os->clusters);
+    free(os->orig);
+    free(os->patched);
+    free(os->bp_off);
+    free(os->follow_off);
+    os->clusters = NULL;
+    os->orig = os->patched = NULL;
+    os->bp_off = os->follow_off = NULL;
+    os->n_clusters = 0;
+    os->patch_ready = false;
 }
 
 int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
@@ -156,15 +205,9 @@ int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
     if (addr == 0)
         return -1;
 
-    int existing = exec_bp_lookup(ex, addr);
-    if (existing >= 0)
-        return existing;
-    if ((ex->bp_count + 1) * 2 > os->hash_cap && hash_grow(os) < 0)
-        return -1;
-
-    size_t i = hash_slot(addr, os->hash_cap);
-    while (os->hash_keys[i] != 0)
-        i = (i + 1) & (os->hash_cap - 1);
+    uint32_t v;
+    if (hash_get(os, addr, &v))
+        return v & FOLLOW_BIT ? -1 : (int)v;
 
     if (ex->bp_count >= ex->bp_capacity) {
         size_t cap = ex->bp_capacity * 2;
@@ -175,22 +218,49 @@ int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
         ex->bp_capacity = cap;
     }
 
+    if (hash_put(os, ex->bp_count + os->n_follow, addr, (uint32_t)ex->bp_count) < 0)
+        return -1;
     int slot = (int)ex->bp_count++;
     ex->bp_addrs[slot] = addr;
-    os->hash_keys[i] = addr;
-    os->hash_vals[i] = (uint32_t)slot;
-
-    /* Clusters and patch buffers are rebuilt on the next run. */
-    free(os->clusters);
-    free(os->orig);
-    free(os->patched);
-    free(os->bp_off);
-    os->clusters = NULL;
-    os->orig = os->patched = NULL;
-    os->bp_off = NULL;
-    os->n_clusters = 0;
-    os->patch_ready = false;
+    invalidate_patch(os);
     return slot;
+}
+
+int fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn)
+{
+    struct fathom_exec_os *os = ex->os;
+    uint32_t v;
+    if (slot < 0 || (size_t)slot >= ex->bp_count || next_insn == 0 ||
+        hash_get(os, next_insn, &v))
+        return -1;   /* already a breakpoint of its own */
+
+    if (os->bp_follow_len < ex->bp_count) {
+        uint32_t *p = realloc(os->bp_follow, ex->bp_count * sizeof(*p));
+        if (!p)
+            return -1;
+        for (size_t i = os->bp_follow_len; i < ex->bp_count; i++)
+            p[i] = UINT32_MAX;
+        os->bp_follow = p;
+        os->bp_follow_len = ex->bp_count;
+    }
+    if (os->bp_follow[slot] != UINT32_MAX)
+        return 0;
+
+    size_t k = os->n_follow;
+    uint64_t *a = realloc(os->follow_addrs, (k + 1) * sizeof(*a));
+    if (a)
+        os->follow_addrs = a;
+    uint32_t *f = realloc(os->follow_slot, (k + 1) * sizeof(*f));
+    if (f)
+        os->follow_slot = f;
+    if (!a || !f || hash_put(os, ex->bp_count + k, next_insn, FOLLOW_BIT | (uint32_t)k) < 0)
+        return -1;
+    os->follow_addrs[k] = next_insn;
+    os->follow_slot[k] = (uint32_t)slot;
+    os->bp_follow[slot] = (uint32_t)k;
+    os->n_follow++;
+    invalidate_patch(os);
+    return 0;
 }
 
 /* ── Patching ───────────────────────────────────────────────────────── */
@@ -206,20 +276,27 @@ static int cmp_slot_addr(const void *a, const void *b)
     return (x > y) - (x < y);
 }
 
+/* Cluster every breakpoint address: slots first, then follows. */
 static int build_clusters(fathom_exec_t *ex)
 {
     struct fathom_exec_os *os = ex->os;
-    size_t n = ex->bp_count;
+    size_t nb = ex->bp_count, n = nb + os->n_follow;
+    uint64_t *addrs = malloc(n * sizeof(*addrs));
     uint32_t *order = malloc(n * sizeof(*order));
     os->clusters = malloc(n * sizeof(*os->clusters));
-    os->bp_off = malloc(n * sizeof(*os->bp_off));
-    if (!order || !os->clusters || !os->bp_off) {
+    os->bp_off = malloc(nb * sizeof(*os->bp_off));
+    os->follow_off = malloc((os->n_follow ? os->n_follow : 1) * sizeof(*os->follow_off));
+    if (!addrs || !order || !os->clusters || !os->bp_off || !os->follow_off) {
+        free(addrs);
         free(order);
         return -1;
     }
+    memcpy(addrs, ex->bp_addrs, nb * sizeof(*addrs));
+    if (os->n_follow)
+        memcpy(addrs + nb, os->follow_addrs, os->n_follow * sizeof(*addrs));
     for (size_t i = 0; i < n; i++)
         order[i] = (uint32_t)i;
-    g_sort_addrs = ex->bp_addrs;
+    g_sort_addrs = addrs;
     qsort(order, n, sizeof(*order), cmp_slot_addr);
     g_sort_addrs = NULL;
 
@@ -227,20 +304,26 @@ static int build_clusters(fathom_exec_t *ex)
     struct exec_cluster *c = NULL;
     uint64_t prev = 0;
     for (size_t i = 0; i < n; i++) {
-        uint64_t addr = ex->bp_addrs[order[i]];
+        uint64_t addr = addrs[order[i]];
         if (!c || addr - prev > CLUSTER_GAP) {
             if (c)
                 total += (size_t)(c->hi - c->lo);
             c = &os->clusters[os->n_clusters++];
-            c->lo = addr;
+            c->lo = c->hi = addr;
             c->off = total;
         }
-        c->hi = addr + os->bp_len;
-        os->bp_off[order[i]] = c->off + (size_t)(addr - c->lo);
+        if (addr + os->bp_len > c->hi)
+            c->hi = addr + os->bp_len;
+        size_t off = c->off + (size_t)(addr - c->lo);
+        if (order[i] < nb)
+            os->bp_off[order[i]] = off;
+        else
+            os->follow_off[order[i] - nb] = off;
         prev = addr;
     }
     total += (size_t)(c->hi - c->lo);
     free(order);
+    free(addrs);
 
     os->orig = malloc(total);
     os->patched = malloc(total);
@@ -294,20 +377,39 @@ int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr
     return 0;
 }
 
-bool exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
-                 const uint8_t **orig, size_t *len)
+size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
+                   exec_write_t w[2])
 {
     struct fathom_exec_os *os = ex->os;
     uint64_t addr = pc_bp - os->slide;
-    int slot = os->foreign_image ? -1 : exec_bp_lookup(ex, addr);
-    if (slot < 0 || !os->patch_ready || is_trap(os, os->bp_off[slot]))
-        return false;
+    uint32_t v;
+    if (os->foreign_image || !os->patch_ready || !hash_get(os, addr, &v))
+        return 0;
 
-    if (cov && (size_t)slot < cov->size)
-        cov->local[slot] = 1;   /* one-shot: a block counts once per run */
-    *orig = os->orig + os->bp_off[slot];
-    *len  = os->bp_len;
-    return true;
+    if (v & FOLLOW_BIT) {
+        /* The counted block's first instruction has run: re-arm it. */
+        uint32_t k = v & ~FOLLOW_BIT, slot = os->follow_slot[k];
+        w[0] = (exec_write_t){ pc_bp, os->orig + os->follow_off[k], os->bp_len };
+        w[1] = (exec_write_t){ ex->bp_addrs[slot] + os->slide, os->bp_insn, os->bp_len };
+        return 2;
+    }
+
+    if (is_trap(os, os->bp_off[v]))
+        return 0;
+    uint8_t hits = 1;
+    if (cov && v < cov->size) {
+        if (cov->local[v] < 255)
+            cov->local[v]++;
+        hits = cov->local[v];
+    }
+    w[0] = (exec_write_t){ pc_bp, os->orig + os->bp_off[v], os->bp_len };
+
+    uint32_t k = v < os->bp_follow_len ? os->bp_follow[v] : UINT32_MAX;
+    if (k != UINT32_MAX && hits < FATHOM_HIT_LIMIT && !is_trap(os, os->follow_off[k])) {
+        w[1] = (exec_write_t){ os->follow_addrs[k] + os->slide, os->bp_insn, os->bp_len };
+        return 2;
+    }
+    return 1;
 }
 
 /* ── Crash hashing ──────────────────────────────────────────────────── */

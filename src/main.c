@@ -632,6 +632,12 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         w->slot_block[slot] = bid;
         w->block_slot[bid] = slot;
     }
+    /* Loop headers count their iterations, so a different trip count is new coverage. */
+    for (size_t i = 0; i < session->ana.cov_count; i++) {
+        const fathom_block_t *b = &session->cfg_graph.blocks[session->ana.cov_blocks[i]];
+        if (b->is_loop_header && b->insn_count > 1)
+            fathom_exec_count_hits(&w->ex, (int)i, session->dis.insns[b->insn_start + 1].addr);
+    }
     w->stats.instrumented = w->ex.bp_count;
 
     if (!multi)

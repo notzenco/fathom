@@ -381,6 +381,14 @@ int  fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                      fathom_exec_result_t *result);
 /* Returns the coverage map slot for addr, or -1 on failure. */
 int  fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr);
+/*
+ * Count how often slot's block runs, up to FATHOM_HIT_LIMIT per run, by
+ * re-arming its breakpoint each time.  next_insn is the address of the
+ * block's second instruction, where a temporary breakpoint re-arms the
+ * first; the first instruction must fall through to it.
+ */
+#define FATHOM_HIT_LIMIT 8
+int  fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn);
 
 /*
  * Shrink buf by deleting chunks while its run still exits normally with

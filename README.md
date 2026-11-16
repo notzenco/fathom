@@ -77,6 +77,11 @@ gets block coverage from the unmodified binary instead:
    fires at most once per run, so after warm-up the target runs at native
    speed. On macOS breakpoints are serviced on a Mach exception port
    rather than through ptrace stops.
+5. Loop headers are the exception: a temporary breakpoint on the header's
+   second instruction re-arms the header once its first instruction has
+   run, up to 8 times per run. The iteration count lands in AFL-style
+   buckets (1, 2, 3, 4-7, 8+), so an input that runs a loop a different
+   number of times counts as new coverage.
 
 Processes the target starts are handled too. On Linux a vfork child is
 traced like a thread, and a forked child gets its original code back and
@@ -284,7 +289,8 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
 ## Limitations
 
 - **Block coverage, not edge coverage.** One-shot breakpoints record
-  which blocks ran, not how often or in which order.
+  which blocks ran, not in which order. Only loop headers count how often
+  they ran, up to 8 times per run.
 - **One process launch per input.** There is no fork server or persistent
   mode, so throughput is bounded by process creation, which is slowest on
   Windows. On macOS, `task_for_pid()` adds roughly 10 ms per run unless
