@@ -412,34 +412,42 @@ static void usage(const char *prog)
         "Input reaches the target on stdin, or as a file whose path replaces\n"
         "every @@ in target_args (then stdin is empty).\n"
         "\n"
-        "Options:\n"
-        "  -i <dir>    Input corpus (seeds)\n"
-        "  -o <dir>    Output directory (default: ./fathom-out)\n"
-        "  -t <ms>     Timeout per exec (default: %d)\n"
-        "  -j <n>      Parallel instances (default: %d)\n"
-        "  -T <secs>   Stop after this many seconds (default: run until Ctrl-C)\n"
-        "  -s <seed>   Random seed, for reproducible runs\n"
-        "  --until-crash  Stop after the first unique crash\n"
-        "  --trim      Shrink queue inputs that keep the same blocks (off by\n"
-        "              default: coverage cannot see loop counts)\n"
-        "  -a          Analysis-only mode (print CFG + scores, no fuzzing)\n"
-        "  --max-execs <n> Stop after n target runs\n"
-        "  --max-input <n> Largest input to generate, in bytes (default: %d)\n"
-        "  --fail-on-crash Exit with status 2 if any unique crash was found\n"
-        "  --no-cmplog Skip comparison logging (input-to-state) on new inputs\n"
-        "  --lib <so>  Also instrument this shared library (.so, .dylib, .dll)\n"
-        "              the target loads at startup; repeatable\n"
-        "  --det       Try every deterministic edit (bit flips, small arithmetic,\n"
-        "              interesting values) of each new input up to 256 bytes\n"
-        "  --fork-server   Linux: fork each run from the target stopped at its\n"
-        "                  entry point instead of starting it afresh\n"
-        "  --version   Show the version\n"
-        "  --replay <f>    Run input f once and report the outcome (exit\n"
-        "                  status 0 ok, 2 crash, 3 hang)\n"
-        "  --minimize <f>  Shrink crashing input f to f.min, keeping the crash\n"
-        "  -v          Verbose output\n"
-        "  --dict <f>  Extra dictionary file\n"
-        "  -h          Show this help\n",
+        "Input and output:\n"
+        "  -i <dir>           Seed inputs\n"
+        "  -o <dir>           Output directory, resumed if it already has a queue\n"
+        "                     (default: ./fathom-out)\n"
+        "  --dict <file>      Extra dictionary file\n"
+        "  --lib <path>       Also instrument this shared library the target loads\n"
+        "                     at startup (.so, .dylib, .dll); repeatable\n"
+        "\n"
+        "Running:\n"
+        "  -t <ms>            Timeout per run (default: %d)\n"
+        "  -j <n>             Parallel workers (default: %d)\n"
+        "  -T <secs>          Stop after this many seconds (default: until Ctrl-C)\n"
+        "  --max-execs <n>    Stop after n target runs\n"
+        "  --until-crash      Stop at the first unique crash\n"
+        "  --fail-on-crash    Exit with status 2 if any unique crash was found\n"
+        "  --fork-server      Linux: fork each run from the target stopped at its\n"
+        "                     entry point instead of starting it afresh\n"
+        "\n"
+        "Fuzzing:\n"
+        "  -s <seed>          Random seed, for reproducible runs\n"
+        "  --max-input <n>    Largest input to generate, in bytes (default: %d)\n"
+        "  --no-cmplog        Skip comparison logging (input-to-state)\n"
+        "  --det              Try every deterministic edit (bit flips, small\n"
+        "                     arithmetic, interesting values) of new inputs up to\n"
+        "                     256 bytes\n"
+        "  --trim             Shrink queue inputs that keep the same blocks (off by\n"
+        "                     default: coverage cannot see loop counts)\n"
+        "\n"
+        "Other modes:\n"
+        "  -a                 Analysis only: print the CFG summary and top blocks\n"
+        "  --replay <file>    Run one input and report the outcome (exit status\n"
+        "                     0 ok, 2 crash, 3 hang)\n"
+        "  --minimize <file>  Shrink a crashing input to <file>.min, keeping the crash\n"
+        "  -v                 Verbose: print every coverage gain\n"
+        "  --version          Show the version\n"
+        "  -h                 Show this help\n",
         prog, DEFAULT_TIMEOUT_MS, DEFAULT_JOBS, DEFAULT_MAX_INPUT);
 }
 
@@ -449,9 +457,8 @@ static void usage(const char *prog)
  * One breakpoint per instrumentable block of the target, then of each
  * library: slots 0..n-1 are the target's cov_blocks in order, the
  * libraries' follow.  slot_block maps a slot to its block in its own
- * module's CFG, slot_score gives every slot its
- * block's static score and counted marks loop headers counting their
- * iterations; each may be NULL.
+ * module's CFG, slot_score gives every slot its block's static score and
+ * counted marks loop headers counting their iterations; each may be NULL.
  */
 static int instrument(fathom_exec_t *ex, const fathom_session_t *s, uint32_t *slot_block,
                       double *slot_score, bool *counted, bool cmplog, long *n_cmp)

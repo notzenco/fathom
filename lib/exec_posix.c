@@ -1113,9 +1113,8 @@ static target_t kid_target(kids_t *ks, const target_t *root, pid_t tid)
 }
 
 /* Let a new task run once both its first stop and its kind are known. */
-static void kid_start(kids_t *ks, kid_t *k)
+static void kid_start(kid_t *k)
 {
-    (void)ks;
     k->started = true;
     tgt_continue(k->pid, 0);
 }
@@ -1132,7 +1131,7 @@ static void kid_event(kids_t *ks, pid_t tid, int event)
             : event == PTRACE_EVENT_VFORK ? KID_VFORK : KID_THREAD;
     k->owner = k->kind == KID_FORK ? k->pid : parent_owner;
     if (k->stopped && !k->started)
-        kid_start(ks, k);
+        kid_start(k);
 }
 
 /* Returns true if the stop was a new task's first stop and is handled. */
@@ -1147,7 +1146,7 @@ static bool kid_first_stop(kids_t *ks, pid_t tid, int sig)
     }
     k->stopped = true;
     if (k->kind != KID_UNKNOWN)
-        kid_start(ks, k);
+        kid_start(k);
     return true;
 }
 
