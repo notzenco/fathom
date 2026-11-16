@@ -176,7 +176,7 @@ static void test_jump_table(const char *path)
             sw = &cfg.blocks[i];
         }
     }
-    CHECK(fan >= 12, "the switch block should have a successor per case");
+    CHECK(fan >= 24, "the switch block should have a successor per case");
     CHECK(sw && sw->score > 0, "fan-out should score");
     size_t calls = 0;
     for (size_t k = 0; sw && k < sw->succ_count; k++) {
@@ -185,7 +185,7 @@ static void test_jump_table(const char *path)
         calls += dis.insns[c->insn_start].kind == FATHOM_INSN_CALL;
     }
     /* Every case starts by calling its case_N function: wrong targets would not. */
-    CHECK(calls >= 12, "jump table targets should be the case blocks");
+    CHECK(calls >= 24, "jump table targets should be the case blocks");
 
     /* On failure, show the code before each indirect jump: a shape not decoded yet. */
     for (size_t j = 0; failures && j < dis.count; j++) {
