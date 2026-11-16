@@ -49,6 +49,13 @@ typedef struct {
     bool     have_seed;
     uint32_t max_secs;       /* 0 = run until stopped */
     bool     until_crash;    /* stop after the first unique crash */
+    /*
+     * Shrink queue inputs while their blocks stay the same.  Off by
+     * default: breakpoints fire once per run, so coverage cannot see loop
+     * counts, and trimming would cut inputs below the length a buffer
+     * overflow needs.
+     */
+    bool     trim;
     int      worker_id;      /* -1 unless launched as a worker (Windows) */
     char     stop_event[64];
 } fathom_opts_t;
@@ -293,6 +300,8 @@ static void usage(const char *prog)
         "  -T <secs>   Stop after this many seconds (default: run until Ctrl-C)\n"
         "  -s <seed>   Random seed, for reproducible runs\n"
         "  --until-crash  Stop after the first unique crash\n"
+        "  --trim      Shrink queue inputs that keep the same blocks (off by\n"
+        "              default: coverage cannot see loop counts)\n"
         "  -a          Analysis-only mode (print CFG + scores, no fuzzing)\n"
         "  -v          Verbose output\n"
         "  --dict <f>  Extra dictionary file\n"
@@ -359,209 +368,347 @@ static void rebuild_frontier(fathom_dict_t *frontier, const fathom_session_t *s,
 
 /* ── Worker fuzz loop ────────────────────────────────────────────────── */
 
+#define TRIM_MAX_EXECS  1024   /* runs one input may spend on trimming */
+
+typedef struct {
+    const fathom_opts_t   *opts;
+    const fathom_config_t *cfg;
+    fathom_session_t      *session;
+    const char            *prefix;
+    bool                   multi;
+
+    fathom_coverage_t      cov;
+    fathom_corpus_t        corpus;
+    fathom_exec_t          ex;
+    fathom_mutator_t       mut;
+    fathom_dict_t          frontier;
+    fathom_stats_t         stats;
+
+    uint32_t              *slot_block;
+    int32_t               *block_slot;
+    uint32_t              *epoch;       /* coverage gain in which each slot was first hit */
+    uint32_t               gains;
+    uint64_t               deadline;
+    uint64_t               last_status;
+    bool                   done;        /* --until-crash satisfied */
+} worker_t;
+
+static bool out_of_time(worker_t *w)
+{
+    uint64_t now = fathom_now_us();
+    if (now - w->last_status >= STATS_INTERVAL_US) {
+        print_status(&w->stats, w->prefix, !w->multi);
+        w->last_status = now;
+    }
+    return stop_requested() || w->done || (w->deadline && now >= w->deadline);
+}
+
+/*
+ * Fold a run with new coverage into the global map.  Returns the static
+ * score of the blocks it reached first.
+ */
+static double take_coverage(worker_t *w)
+{
+    double score = 0.0;
+    w->gains++;
+    for (size_t s = 0; s < w->cov.size; s++) {
+        if (w->cov.local[s] && !w->cov.global[s]) {
+            score += w->session->cfg_graph.blocks[w->slot_block[s]].score;
+            w->epoch[s] = w->gains;
+        }
+    }
+    fathom_coverage_merge(&w->cov);
+    w->stats.covered = w->cov.total_blocks;
+    rebuild_frontier(&w->frontier, w->session, &w->cov, w->slot_block, w->block_slot,
+                     w->epoch, w->gains, w->cov.size);
+    return score;
+}
+
+/* Returns -1 on a fatal error, 1 if this was a new unique crash, else 0. */
+static int note_crash(worker_t *w, const uint8_t *buf, size_t len,
+                      const fathom_exec_result_t *res)
+{
+    fathom_corpus_t *corpus = &w->corpus;
+    w->stats.crashes++;
+    size_t prev = corpus->unique_crashes;
+    if (fathom_corpus_save_crash(corpus, buf, len, res->crash_hash) < 0) {
+        fprintf(stderr, "fathom: failed to save crash\n");
+        return -1;
+    }
+    w->stats.unique_crashes = corpus->unique_crashes;
+    if (corpus->unique_crashes == prev)
+        return 0;
+
+    if (w->stats.first_crash_execs == 0) {
+        w->stats.first_crash_execs = w->stats.total_execs;
+        w->stats.first_crash_ms = (fathom_now_us() - w->stats.start_us) / 1000;
+    }
+    char what[48];
+    describe_crash(what, sizeof(what), res->crash_code);
+    if (w->multi)
+        fprintf(stderr, "%s new crash: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 "\n",
+                w->prefix, what, res->crash_pc, res->crash_hash);
+    else
+        fprintf(stderr, "\n*** NEW CRASH: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 " ***\n",
+                what, res->crash_pc, res->crash_hash);
+    if (w->opts->until_crash)
+        w->done = true;
+    return 1;
+}
+
+/*
+ * Run every seed unmutated before fuzzing: its coverage seeds the global
+ * map, its speed and blocks feed scheduling, and seeds that crash (saved
+ * as crashes) or hang are dropped from the queue.
+ */
+static int calibrate(worker_t *w)
+{
+    fathom_corpus_t *corpus = &w->corpus;
+    size_t dropped_hangs = 0;
+    for (size_t i = 0; i < corpus->count && !stop_requested();) {
+        fathom_input_t *inp = &corpus->inputs[i];
+        fathom_exec_result_t res;
+        w->stats.total_execs++;
+        if (fathom_exec_run(&w->ex, &w->cov, inp->data, inp->len, &res) < 0)
+            return -1;
+
+        if (res.status == FATHOM_EXIT_CRASH) {
+            if (note_crash(w, inp->data, inp->len, &res) < 0)
+                return -1;
+            fathom_corpus_remove(corpus, i);
+            continue;
+        }
+        if (res.status == FATHOM_EXIT_HANG) {
+            w->stats.hangs++;
+            dropped_hangs++;
+            fathom_corpus_remove(corpus, i);
+            continue;
+        }
+        if (fathom_coverage_has_new(&w->cov)) {
+            take_coverage(w);
+            inp = &corpus->inputs[i];
+            inp->new_coverage = w->cov.new_blocks;
+        }
+        if (fathom_corpus_record(corpus, i, &w->cov, res.exec_us) < 0)
+            return -1;
+        i++;
+    }
+    if (dropped_hangs)
+        fprintf(stderr, "%s%sfathom: dropped %zu seed(s) that time out at -t %u ms\n",
+                w->prefix ? w->prefix : "", w->prefix ? " " : "", dropped_hangs,
+                w->cfg->timeout_ms);
+    return 0;
+}
+
+/* Trim input idx once, the first time it is picked. */
+static int trim_input(worker_t *w, size_t idx, uint8_t *buf)
+{
+    fathom_input_t *inp = &w->corpus.inputs[idx];
+    inp->trimmed = true;
+    if (!inp->slots)
+        return 0;
+    size_t len = inp->len < MAX_INPUT_SIZE ? inp->len : MAX_INPUT_SIZE, orig = len;
+    memcpy(buf, inp->data, len);
+    if (fathom_trim(&w->ex, &w->cov, buf, &len, inp->trace_hash, TRIM_MAX_EXECS,
+                    &w->stats.total_execs) < 0)
+        return -1;
+    if (len < orig && fathom_corpus_update(&w->corpus, idx, buf, len) < 0)
+        return -1;
+    return 0;
+}
+
+/* One mutated run of input idx.  Returns -1 on a fatal error. */
+static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
+{
+    fathom_corpus_t *corpus = &w->corpus;
+    const fathom_input_t *seed = &corpus->inputs[idx];
+    size_t len = seed->len < MAX_INPUT_SIZE ? seed->len : MAX_INPUT_SIZE;
+    memcpy(buf, seed->data, len);
+
+    const fathom_input_t *donor =
+        &corpus->inputs[fathom_rand_below(&w->mut, (uint32_t)corpus->count)];
+    bool can_splice = corpus->count > 1 && donor != seed;
+    int strategy = fathom_mutate(&w->mut, buf, &len, MAX_INPUT_SIZE,
+                                 can_splice ? donor->data : NULL,
+                                 can_splice ? donor->len : 0);
+
+    fathom_exec_result_t res;
+    w->stats.total_execs++;
+    if (fathom_exec_run(&w->ex, &w->cov, buf, len, &res) < 0) {
+        fprintf(stderr, "%sfathom: target execution failed\n", w->multi ? "" : "\n");
+        return -1;
+    }
+
+    if (fathom_coverage_has_new(&w->cov)) {
+        double score = take_coverage(w);
+        if (fathom_corpus_add(corpus, buf, len, w->cov.new_blocks, score) < 0 ||
+            fathom_corpus_record(corpus, corpus->count - 1, &w->cov, res.exec_us) < 0) {
+            fprintf(stderr, "fathom: failed to add interesting input\n");
+            return -1;
+        }
+        w->stats.corpus_size = corpus->count;
+        if (strategy >= 0 && strategy < FATHOM_MUT_COUNT)
+            fathom_mutator_reward(&w->mut, (fathom_mutation_t)strategy);
+    }
+
+    if (res.status == FATHOM_EXIT_CRASH)
+        return note_crash(w, buf, len, &res) < 0 ? -1 : 0;
+    if (res.status == FATHOM_EXIT_HANG)
+        w->stats.hangs++;
+    return 0;
+}
+
 static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
                       fathom_session_t *session, int worker_id, bool multi)
 {
     int ret = 1;
     char prefix_buf[16];
-    const char *prefix = NULL;
-    fathom_coverage_t cov;
-    fathom_corpus_t corpus;
-    fathom_exec_t ex;
-    fathom_mutator_t mut;
     bool cov_ready = false, corpus_ready = false, ex_ready = false;
     uint8_t *buf = NULL;
-    uint32_t *slot_block = NULL;
-    int32_t *block_slot = NULL;
-    uint32_t *epoch = NULL;       /* coverage gain in which each slot was first hit */
-    uint32_t gains = 0;
-    fathom_dict_t frontier;
-    fathom_stats_t stats;
-
-    memset(&stats, 0, sizeof(stats));
+    worker_t *w = calloc(1, sizeof(*w));
+    if (!w)
+        return 1;
+    w->opts = opts;
+    w->cfg = cfg;
+    w->session = session;
+    w->multi = multi;
+    fathom_dict_init(&w->frontier);
     if (multi) {
         snprintf(prefix_buf, sizeof(prefix_buf), "[w%03d]", worker_id);
-        prefix = prefix_buf;
+        w->prefix = prefix_buf;
     }
 
     if (install_stop_handlers() < 0) {
         fprintf(stderr, "fathom: cannot install stop handlers\n");
-        return 1;
+        goto cleanup;
     }
 
-    if (fathom_coverage_init(&cov, session->ana.cov_count) < 0) {
+    if (fathom_coverage_init(&w->cov, session->ana.cov_count) < 0) {
         fprintf(stderr, "fathom: coverage init failed\n");
         goto cleanup;
     }
     cov_ready = true;
 
-    if (fathom_corpus_init(&corpus, cfg->input_dir, cfg->output_dir) < 0) {
+    if (fathom_corpus_init(&w->corpus, cfg->input_dir, cfg->output_dir) < 0) {
         fprintf(stderr, "fathom: corpus init failed\n");
         goto cleanup;
     }
     corpus_ready = true;
-    if (corpus.count == 0 && fathom_corpus_add(&corpus, (const uint8_t *)"AAAA", 4, 0, 0) < 0)
+    if (w->corpus.count == 0 &&
+        fathom_corpus_add(&w->corpus, (const uint8_t *)"AAAA", 4, 0, 0) < 0)
         goto cleanup;
 
-    fathom_dict_init(&frontier);
-    fathom_mutator_init(&mut, &session->ana.dict);
-    mut.frontier = &frontier;
-    if (opts->have_seed)
-        fathom_mutator_seed(&mut, opts->seed + (uint64_t)worker_id);
+    fathom_mutator_init(&w->mut, &session->ana.dict);
+    w->mut.frontier = &w->frontier;
+    if (opts->have_seed) {
+        fathom_mutator_seed(&w->mut, opts->seed + (uint64_t)worker_id);
+        fathom_corpus_seed(&w->corpus, ~(opts->seed + (uint64_t)worker_id));
+    }
 
-    if (fathom_exec_init(&ex, cfg, &session->bin) < 0) {
+    if (fathom_exec_init(&w->ex, cfg, &session->bin) < 0) {
         fprintf(stderr, "fathom: executor init failed\n");
         goto cleanup;
     }
     ex_ready = true;
 
     /* One breakpoint per instrumentable block; slot i ↔ cov_blocks[i]. */
-    slot_block = malloc((session->ana.cov_count + 1) * sizeof(*slot_block));
-    block_slot = malloc((session->cfg_graph.block_count + 1) * sizeof(*block_slot));
-    epoch = calloc(session->ana.cov_count + 1, sizeof(*epoch));
-    if (!slot_block || !block_slot || !epoch)
+    w->slot_block = malloc((session->ana.cov_count + 1) * sizeof(*w->slot_block));
+    w->block_slot = malloc((session->cfg_graph.block_count + 1) * sizeof(*w->block_slot));
+    w->epoch = calloc(session->ana.cov_count + 1, sizeof(*w->epoch));
+    buf = malloc(MAX_INPUT_SIZE);
+    if (!w->slot_block || !w->block_slot || !w->epoch || !buf) {
+        fprintf(stderr, "fathom: out of memory\n");
         goto cleanup;
+    }
     for (size_t i = 0; i < session->cfg_graph.block_count; i++)
-        block_slot[i] = -1;
+        w->block_slot[i] = -1;
     for (size_t i = 0; i < session->ana.cov_count; i++) {
         uint32_t bid = session->ana.cov_blocks[i];
-        int slot = fathom_exec_add_breakpoint(&ex, session->cfg_graph.blocks[bid].start_addr);
+        int slot = fathom_exec_add_breakpoint(&w->ex, session->cfg_graph.blocks[bid].start_addr);
         if (slot < 0) {
             fprintf(stderr, "fathom: breakpoint setup failed\n");
             goto cleanup;
         }
-        slot_block[slot] = bid;
-        block_slot[bid] = slot;
+        w->slot_block[slot] = bid;
+        w->block_slot[bid] = slot;
     }
-    stats.instrumented = ex.bp_count;
+    w->stats.instrumented = w->ex.bp_count;
 
     if (!multi)
         fprintf(stderr, "  seeds: %zu, breakpoints: %zu\n\nfuzzing started%s...\n\n",
-                corpus.count, ex.bp_count,
+                w->corpus.count, w->ex.bp_count,
                 opts->max_secs ? "" : " (Ctrl-C to stop)");
     else if (cfg->verbose)
-        fprintf(stderr, "%s seeds: %zu, output: %s\n", prefix, corpus.count, cfg->output_dir);
+        fprintf(stderr, "%s seeds: %zu, output: %s\n", w->prefix, w->corpus.count,
+                cfg->output_dir);
 
-    buf = malloc(MAX_INPUT_SIZE);
-    if (!buf) {
-        fprintf(stderr, "fathom: out of memory\n");
+    w->stats.start_us = fathom_now_us();
+    w->last_status = w->stats.start_us;
+    w->deadline = opts->max_secs
+                ? w->stats.start_us + (uint64_t)opts->max_secs * 1000000u : 0;
+
+    if (calibrate(w) < 0) {
+        fprintf(stderr, "fathom: target execution failed\n");
         goto cleanup;
     }
-
-    stats.corpus_size = corpus.count;
-    stats.start_us = fathom_now_us();
-    uint64_t last_status = stats.start_us;
-    uint64_t deadline = opts->max_secs
-                      ? stats.start_us + (uint64_t)opts->max_secs * 1000000u : 0;
-
-    while (!stop_requested()) {
-        uint64_t now = fathom_now_us();
-        if (deadline && now >= deadline)
-            break;
-        if (now - last_status >= STATS_INTERVAL_US) {
-            print_status(&stats, prefix, !multi);
-            last_status = now;
-        }
-
-        fathom_input_t *seed = fathom_corpus_next(&corpus);
-        size_t len = seed->len < MAX_INPUT_SIZE ? seed->len : MAX_INPUT_SIZE;
-        memcpy(buf, seed->data, len);
-
-        const fathom_input_t *donor =
-            &corpus.inputs[fathom_rand_below(&mut, (uint32_t)corpus.count)];
-        bool can_splice = corpus.count > 1 && donor != seed;
-        int strategy = fathom_mutate(&mut, buf, &len, MAX_INPUT_SIZE,
-                                     can_splice ? donor->data : NULL,
-                                     can_splice ? donor->len : 0);
-
-        fathom_exec_result_t result;
-        stats.total_execs++;
-        if (fathom_exec_run(&ex, &cov, buf, len, &result) < 0) {
-            fprintf(stderr, "%sfathom: target execution failed\n", multi ? "" : "\n");
+    if (w->corpus.count == 0 && !w->done && !stop_requested()) {
+        /* Every seed crashed or hung: carry on from a neutral input. */
+        if (fathom_corpus_add(&w->corpus, (const uint8_t *)"AAAA", 4, 0, 0) < 0 ||
+            calibrate(w) < 0)
+            goto cleanup;
+        if (w->corpus.count == 0) {
+            fprintf(stderr, "fathom: every seed crashes or hangs; nothing to fuzz\n");
+            ret = w->corpus.unique_crashes > 0 ? 0 : 1;
             goto cleanup;
         }
+    }
+    w->stats.corpus_size = w->corpus.count;
 
-        if (fathom_coverage_has_new(&cov)) {
-            /* Weight new blocks by their static score before merging. */
-            double score = 0.0;
-            gains++;
-            for (size_t s = 0; s < ex.bp_count; s++) {
-                if (cov.local[s] && !cov.global[s]) {
-                    score += session->cfg_graph.blocks[slot_block[s]].score;
-                    epoch[s] = gains;
-                }
-            }
-            fathom_coverage_merge(&cov);
-            stats.covered = cov.total_blocks;
-            rebuild_frontier(&frontier, session, &cov, slot_block, block_slot, epoch, gains,
-                             ex.bp_count);
-
-            if (fathom_corpus_add(&corpus, buf, len, cov.new_blocks, score) < 0) {
-                fprintf(stderr, "fathom: failed to add interesting input\n");
-                goto cleanup;
-            }
-            stats.corpus_size = corpus.count;
-            if (strategy >= 0 && strategy < FATHOM_MUT_COUNT)
-                fathom_mutator_reward(&mut, (fathom_mutation_t)strategy);
+    while (!out_of_time(w)) {
+        fathom_input_t *inp = fathom_corpus_next(&w->corpus);
+        size_t idx = (size_t)(inp - w->corpus.inputs);
+        if (opts->trim && !inp->trimmed && trim_input(w, idx, buf) < 0) {
+            fprintf(stderr, "fathom: target execution failed\n");
+            goto cleanup;
         }
-
-        if (result.status == FATHOM_EXIT_CRASH) {
-            stats.crashes++;
-            size_t prev = corpus.unique_crashes;
-            if (fathom_corpus_save_crash(&corpus, buf, len, result.crash_hash) < 0) {
-                fprintf(stderr, "fathom: failed to save crash\n");
+        uint32_t energy = fathom_corpus_energy(&w->corpus, idx);
+        for (uint32_t e = 0; e < energy && !out_of_time(w); e++) {
+            if (fuzz_one(w, idx, buf) < 0)
                 goto cleanup;
-            }
-            stats.unique_crashes = corpus.unique_crashes;
-            if (corpus.unique_crashes > prev && stats.first_crash_execs == 0) {
-                stats.first_crash_execs = stats.total_execs;
-                stats.first_crash_ms = (fathom_now_us() - stats.start_us) / 1000;
-            }
-            if (corpus.unique_crashes > prev) {
-                char what[48];
-                describe_crash(what, sizeof(what), result.crash_code);
-                if (multi)
-                    fprintf(stderr, "%s new crash: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 "\n",
-                            prefix, what, result.crash_pc, result.crash_hash);
-                else
-                    fprintf(stderr, "\n*** NEW CRASH: %s pc=0x%" PRIx64 " hash=0x%016" PRIx64 " ***\n",
-                            what, result.crash_pc, result.crash_hash);
-            }
-            if (opts->until_crash && corpus.unique_crashes > 0)
-                break;
-        } else if (result.status == FATHOM_EXIT_HANG) {
-            stats.hangs++;
         }
+        w->corpus.inputs[idx].fuzz_count++;
     }
 
     if (!multi) {
+        fathom_stats_t *st = &w->stats;
         fprintf(stderr, "\n\n=== Fathom session complete ===\n");
-        fprintf(stderr, "  total execs:    %" PRIu64 "\n", stats.total_execs);
-        fprintf(stderr, "  coverage:       %zu/%zu blocks\n", stats.covered, stats.instrumented);
-        fprintf(stderr, "  corpus size:    %zu\n", corpus.count);
+        fprintf(stderr, "  total execs:    %" PRIu64 "\n", st->total_execs);
+        fprintf(stderr, "  coverage:       %zu/%zu blocks\n", st->covered, st->instrumented);
+        fprintf(stderr, "  corpus size:    %zu\n", w->corpus.count);
         fprintf(stderr, "  crashes:        %" PRIu64 " (%" PRIu64 " unique)\n",
-                stats.crashes, stats.unique_crashes);
-        fprintf(stderr, "  hangs:          %" PRIu64 "\n", stats.hangs);
+                st->crashes, st->unique_crashes);
+        fprintf(stderr, "  hangs:          %" PRIu64 "\n", st->hangs);
         fprintf(stderr, "  output dir:     %s\n", cfg->output_dir);
     }
     ret = 0;
 
 cleanup:
     if (corpus_ready) {
-        stats.corpus_size = corpus.count;
-        write_stats(cfg->output_dir, &stats);
+        w->stats.corpus_size = w->corpus.count;
+        write_stats(cfg->output_dir, &w->stats);
     }
     free(buf);
-    free(slot_block);
-    free(block_slot);
-    free(epoch);
-    fathom_dict_destroy(&frontier);
+    free(w->slot_block);
+    free(w->block_slot);
+    free(w->epoch);
+    fathom_dict_destroy(&w->frontier);
     if (ex_ready)
-        fathom_exec_destroy(&ex);
+        fathom_exec_destroy(&w->ex);
     if (corpus_ready)
-        fathom_corpus_destroy(&corpus);
+        fathom_corpus_destroy(&w->corpus);
     if (cov_ready)
-        fathom_coverage_destroy(&cov);
+        fathom_coverage_destroy(&w->cov);
+    free(w);
     return ret;
 }
 
@@ -783,6 +930,7 @@ int main(int argc, char *argv[])
         {"max-time", required_argument, NULL, 'T'},
         {"seed",     required_argument, NULL, 's'},
         {"until-crash", no_argument,    NULL, 'U'},
+        {"trim",     no_argument,       NULL, 'R'},
         {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
         {NULL, 0, NULL, 0},
     };
@@ -800,6 +948,7 @@ int main(int argc, char *argv[])
             opts.have_seed = true;
             break;
         case 'U': opts.until_crash = true; break;
+        case 'R': opts.trim = true; break;
         case 'a': opts.cfg.analysis_only = true; break;
         case 'v': opts.cfg.verbose = true; break;
         case 'D': opts.cfg.dict_file = optarg; break;

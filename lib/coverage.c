@@ -70,3 +70,18 @@ void fathom_coverage_merge(fathom_coverage_t *cov)
     }
     cov->new_blocks = fresh;
 }
+
+uint64_t fathom_coverage_hash(const fathom_coverage_t *cov)
+{
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < cov->size; i++) {
+        if (!cov->local[i])
+            continue;
+        uint64_t v = (uint64_t)i << 8 | fathom_classify_count(cov->local[i]);
+        for (int b = 0; b < 8; b++) {
+            h ^= (uint8_t)(v >> (8 * b));
+            h *= 0x100000001b3ULL;
+        }
+    }
+    return h;
+}

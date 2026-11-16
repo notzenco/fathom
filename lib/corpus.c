@@ -183,6 +183,7 @@ int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
     corpus->capacity = FATHOM_CORPUS_INIT_CAP;
     corpus->count    = 0;
     corpus->current  = 0;
+    fathom_corpus_seed(corpus, fathom_entropy());
 
     /* Duplicate the output dir string so corpus owns it. */
     if (output_dir) {
@@ -260,8 +261,11 @@ int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
 
 void fathom_corpus_destroy(fathom_corpus_t *corpus)
 {
-    for (size_t i = 0; i < corpus->count; i++)
+    for (size_t i = 0; i < corpus->count; i++) {
         free(corpus->inputs[i].data);
+        free(corpus->inputs[i].path);
+        free(corpus->inputs[i].slots);
+    }
 
     free(corpus->inputs);
     free((void *)corpus->out_dir);
@@ -313,56 +317,241 @@ int fathom_corpus_add(fathom_corpus_t *corpus, const uint8_t *data,
      */
     inp->priority = 1.0 + (double)new_blocks * 10.0 + score;
 
+    inp->favored      = true;   /* until a recorded run says otherwise */
+
     /* Save to queue directory if we have an output dir. */
     if (corpus->out_dir) {
         char path[4096];
         /* AFL uses "id:...", but ':' is not allowed in Windows file names. */
         snprintf(path, sizeof(path), "%s/queue/id_%06zu_cov_%zu",
-                 corpus->out_dir, corpus->count, new_blocks);
+                 corpus->out_dir, corpus->next_id, new_blocks);
+        inp->path = strdup(path);
         write_file(path, data, len);
     }
 
+    corpus->next_id++;
     corpus->count++;
+    corpus->cull_dirty = true;
     return 0;
+}
+
+/* ── Scheduling ─────────────────────────────────────────────────────── */
+
+static uint64_t corpus_rand(fathom_corpus_t *corpus)
+{
+    uint64_t x = corpus->rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    corpus->rng = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
+void fathom_corpus_seed(fathom_corpus_t *corpus, uint64_t seed)
+{
+    seed += 0x9E3779B97F4A7C15ULL;
+    seed = (seed ^ (seed >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    seed = (seed ^ (seed >> 27)) * 0x94D049BB133111EBULL;
+    seed ^= seed >> 31;
+    corpus->rng = seed ? seed : 1;
+}
+
+int fathom_corpus_record(fathom_corpus_t *corpus, size_t idx,
+                         const fathom_coverage_t *cov, uint64_t exec_us)
+{
+    fathom_input_t *inp = &corpus->inputs[idx];
+    size_t n = 0;
+    for (size_t i = 0; i < cov->size; i++)
+        n += cov->local[i] != 0;
+    uint32_t *slots = malloc((n ? n : 1) * sizeof(*slots));
+    if (!slots)
+        return -1;
+    n = 0;
+    for (size_t i = 0; i < cov->size; i++) {
+        if (cov->local[i])
+            slots[n++] = (uint32_t)i;
+    }
+    free(inp->slots);
+    inp->slots = slots;
+    inp->slot_count = n;
+    inp->trace_hash = fathom_coverage_hash(cov);
+    inp->exec_us = exec_us ? exec_us : 1;
+    corpus->map_size = cov->size;
+    corpus->cull_dirty = true;
+    return 0;
+}
+
+int fathom_corpus_update(fathom_corpus_t *corpus, size_t idx,
+                         const uint8_t *data, size_t len)
+{
+    fathom_input_t *inp = &corpus->inputs[idx];
+    uint8_t *copy = malloc(len ? len : 1);
+    if (!copy)
+        return -1;
+    if (len)
+        memcpy(copy, data, len);
+    free(inp->data);
+    inp->data = copy;
+    inp->len = len;
+    inp->trimmed = true;
+    corpus->cull_dirty = true;
+    if (inp->path && write_file(inp->path, data, len) < 0)
+        return -1;
+    return 0;
+}
+
+void fathom_corpus_remove(fathom_corpus_t *corpus, size_t idx)
+{
+    fathom_input_t *inp = &corpus->inputs[idx];
+    if (inp->path)
+        remove(inp->path);
+    free(inp->data);
+    free(inp->path);
+    free(inp->slots);
+    memmove(inp, inp + 1, (corpus->count - idx - 1) * sizeof(*inp));
+    corpus->count--;
+    if (corpus->current > idx)
+        corpus->current--;
+    if (corpus->current >= corpus->count)
+        corpus->current = 0;
+    corpus->cull_dirty = true;
+}
+
+static double input_cost(const fathom_input_t *inp)
+{
+    return (double)(inp->exec_us + 1) * (double)(inp->len + 1);
+}
+
+/*
+ * AFL's queue culling: give every reached slot its cheapest input, then
+ * favor a greedy subset of those that together reach every slot.
+ */
+static void cull(fathom_corpus_t *corpus)
+{
+    if (!corpus->cull_dirty)
+        return;
+    corpus->cull_dirty = false;
+
+    size_t m = corpus->map_size;
+    size_t *top = m ? malloc(m * sizeof(*top)) : NULL;
+    bool *done = m ? calloc(m, sizeof(*done)) : NULL;
+    for (size_t i = 0; i < corpus->count; i++)
+        corpus->inputs[i].favored = corpus->inputs[i].slots == NULL;
+    if (!top || !done) {
+        free(top);
+        free(done);
+        for (size_t i = 0; i < corpus->count; i++)
+            corpus->inputs[i].favored = true;   /* no memory: fuzz everything */
+        return;
+    }
+
+    for (size_t s = 0; s < m; s++)
+        top[s] = SIZE_MAX;
+    for (size_t i = 0; i < corpus->count; i++) {
+        const fathom_input_t *inp = &corpus->inputs[i];
+        for (size_t k = 0; k < inp->slot_count; k++) {
+            size_t s = inp->slots[k];
+            if (s < m && (top[s] == SIZE_MAX ||
+                          input_cost(inp) < input_cost(&corpus->inputs[top[s]])))
+                top[s] = i;
+        }
+    }
+    for (size_t s = 0; s < m; s++) {
+        if (top[s] == SIZE_MAX || done[s])
+            continue;
+        fathom_input_t *inp = &corpus->inputs[top[s]];
+        inp->favored = true;
+        for (size_t k = 0; k < inp->slot_count; k++) {
+            if (inp->slots[k] < m)
+                done[inp->slots[k]] = true;
+        }
+    }
+    free(top);
+    free(done);
+}
+
+uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx)
+{
+    const fathom_input_t *inp = &corpus->inputs[idx];
+    double sum_us = 0, sum_cov = 0;
+    size_t traced = 0;
+    for (size_t i = 0; i < corpus->count; i++) {
+        if (corpus->inputs[i].slots) {
+            sum_us += (double)corpus->inputs[i].exec_us;
+            sum_cov += (double)corpus->inputs[i].slot_count;
+            traced++;
+        }
+    }
+
+    /* AFL's calculate_score, in spirit: speed and coverage relative to the queue. */
+    double e = FATHOM_ENERGY_BASE;
+    if (inp->slots && traced) {
+        double us = (double)inp->exec_us, avg_us = sum_us / (double)traced;
+        if (us * 0.1 > avg_us)       e *= 0.1;
+        else if (us * 0.25 > avg_us) e *= 0.25;
+        else if (us * 0.5 > avg_us)  e *= 0.5;
+        else if (us * 0.75 > avg_us) e *= 0.75;
+        else if (us * 4 < avg_us)    e *= 3;
+        else if (us * 3 < avg_us)    e *= 2;
+        else if (us * 2 < avg_us)    e *= 1.5;
+
+        double c = (double)inp->slot_count, avg_c = sum_cov / (double)traced;
+        if (c * 0.3 > avg_c)         e *= 3;
+        else if (c * 0.5 > avg_c)    e *= 2;
+        else if (c * 0.75 > avg_c)   e *= 1.5;
+        else if (c * 3 < avg_c)      e *= 0.25;
+        else if (c * 2 < avg_c)      e *= 0.5;
+        else if (c * 1.5 < avg_c)    e *= 0.75;
+    }
+
+    /* Static analysis: new blocks and high-scoring ones (see fathom_corpus_add). */
+    double bonus = inp->priority - 1.0;
+    if (bonus > 40)
+        bonus = 40;
+    e *= 1.0 + bonus / 20.0;
+    if (inp->fuzz_count == 0)
+        e *= 2;
+
+    if (e < 1)
+        e = 1;
+    if (e > FATHOM_ENERGY_MAX)
+        e = FATHOM_ENERGY_MAX;
+    return (uint32_t)e;
 }
 
 fathom_input_t *fathom_corpus_next(fathom_corpus_t *corpus)
 {
     if (corpus->count == 0)
         return NULL;
+    cull(corpus);
 
-    /*
-     * Phase 1: find the next unfuzzed input with highest priority.
-     * We scan starting from corpus->current and wrap around.
-     */
-    fathom_input_t *best_unfuzzed = NULL;
+    /* Unfuzzed favored inputs first, highest priority first. */
+    size_t best = SIZE_MAX;
     for (size_t i = 0; i < corpus->count; i++) {
-        size_t idx = (corpus->current + i) % corpus->count;
-        fathom_input_t *inp = &corpus->inputs[idx];
-        if (!inp->was_fuzzed) {
-            if (!best_unfuzzed || inp->priority > best_unfuzzed->priority)
-                best_unfuzzed = inp;
-        }
-    }
-
-    if (best_unfuzzed) {
-        best_unfuzzed->was_fuzzed = true;
-        /* Advance current past this input for next call's starting scan. */
-        for (size_t i = 0; i < corpus->count; i++) {
-            if (&corpus->inputs[i] == best_unfuzzed) {
-                corpus->current = (i + 1) % corpus->count;
-                break;
-            }
-        }
-        return best_unfuzzed;
+        const fathom_input_t *inp = &corpus->inputs[i];
+        if (inp->favored && !inp->was_fuzzed &&
+            (best == SIZE_MAX || inp->priority > corpus->inputs[best].priority))
+            best = i;
     }
 
     /*
-     * Phase 2: all inputs have been fuzzed — round-robin cycle.
+     * Otherwise cycle through the queue, taking favored inputs and only
+     * occasionally the rest: 25% for an input never fuzzed, 5% after.
      */
-    fathom_input_t *inp = &corpus->inputs[corpus->current];
-    corpus->current = (corpus->current + 1) % corpus->count;
-    return inp;
+    for (size_t tries = 0; best == SIZE_MAX && tries < 64 * corpus->count; tries++) {
+        size_t i = corpus->current;
+        corpus->current = (corpus->current + 1) % corpus->count;
+        const fathom_input_t *inp = &corpus->inputs[i];
+        uint32_t pct = inp->was_fuzzed ? 5 : 25;
+        if (inp->favored || corpus_rand(corpus) % 100 < pct)
+            best = i;
+    }
+    if (best == SIZE_MAX)
+        best = corpus->current;
+
+    corpus->current = (best + 1) % corpus->count;
+    corpus->inputs[best].was_fuzzed = true;
+    return &corpus->inputs[best];
 }
 
 int fathom_corpus_save_crash(fathom_corpus_t *corpus, const uint8_t *data,

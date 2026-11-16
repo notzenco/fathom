@@ -48,7 +48,7 @@ endif
 LIB_SRCS := lib/binary.c lib/fmt_elf.c lib/fmt_macho.c lib/fmt_pe.c \
             lib/disasm.c lib/cfg.c lib/analyze.c lib/mutate.c \
             lib/exec.c lib/exec_posix.c lib/exec_windows.c \
-            lib/coverage.c lib/corpus.c lib/osdep.c
+            lib/coverage.c lib/corpus.c lib/trim.c lib/osdep.c
 LIB_OBJS := $(LIB_SRCS:.c=.o)
 LIB_HDRS := include/fathom.h $(wildcard lib/*.h)
 

@@ -234,6 +234,21 @@ typedef struct {
     bool     was_fuzzed;
     size_t   new_coverage;   /* blocks first reached by this input */
     uint64_t exec_us;        /* execution time in microseconds */
+    char    *path;           /* queue file, NULL without an output dir */
+
+    /* Set by fathom_corpus_record once the input has been run as-is. */
+    uint32_t *slots;         /* coverage slots it reaches, ascending */
+    size_t    slot_count;
+    uint64_t  trace_hash;    /* fathom_coverage_hash of that run */
+    bool      trimmed;
+
+    uint32_t  fuzz_count;    /* times picked for fuzzing */
+    /*
+     * Smallest and fastest input for some slot no other favored input
+     * reaches; the scheduler mostly fuzzes these.  Inputs not yet run
+     * as-is count as favored.
+     */
+    bool      favored;
 } fathom_input_t;
 
 typedef struct {
@@ -244,6 +259,10 @@ typedef struct {
     const char     *out_dir;
     size_t          crash_count;
     size_t          unique_crashes;
+    size_t          next_id;      /* queue file numbering */
+    size_t          map_size;     /* coverage slots, from fathom_corpus_record */
+    bool            cull_dirty;   /* favored set needs recomputing */
+    uint64_t        rng;          /* scheduling randomness, see fathom_corpus_seed */
 } fathom_corpus_t;
 
 /* ── Executor types ──────────────────────────────────────────────────── */
@@ -339,6 +358,8 @@ void fathom_coverage_destroy(fathom_coverage_t *cov);
 void fathom_coverage_reset_local(fathom_coverage_t *cov);
 bool fathom_coverage_has_new(fathom_coverage_t *cov);
 void fathom_coverage_merge(fathom_coverage_t *cov);
+/* Hash of which slots the last run reached, to compare two runs' paths. */
+uint64_t fathom_coverage_hash(const fathom_coverage_t *cov);
 
 /* Mutation */
 void fathom_mutator_init(fathom_mutator_t *mut, fathom_dict_t *dict);
@@ -358,13 +379,42 @@ int  fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 /* Returns the coverage map slot for addr, or -1 on failure. */
 int  fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr);
 
+/*
+ * Shrink buf by deleting chunks while its run still exits normally with
+ * path want_hash (see fathom_coverage_hash).  Stops after max_execs runs
+ * in total, counted in *execs.  Returns -1 if the executor fails.
+ */
+int  fathom_trim(fathom_exec_t *ex, fathom_coverage_t *cov, uint8_t *buf,
+                 size_t *len, uint64_t want_hash, uint32_t max_execs,
+                 uint64_t *execs);
+
 /* Corpus */
 int  fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
                         const char *output_dir);
 void fathom_corpus_destroy(fathom_corpus_t *corpus);
 int  fathom_corpus_add(fathom_corpus_t *corpus, const uint8_t *data,
                        size_t len, size_t new_blocks, double score);
+/*
+ * Pick the next input to fuzz: unfuzzed favored inputs by priority, then
+ * a cycle through the queue that mostly skips inputs that are not
+ * favored.
+ */
 fathom_input_t *fathom_corpus_next(fathom_corpus_t *corpus);
+void fathom_corpus_seed(fathom_corpus_t *corpus, uint64_t seed);
+/* Record what running input idx unmutated covered and how long it took. */
+int  fathom_corpus_record(fathom_corpus_t *corpus, size_t idx,
+                          const fathom_coverage_t *cov, uint64_t exec_us);
+/* Replace input idx's bytes (after trimming), rewriting its queue file. */
+int  fathom_corpus_update(fathom_corpus_t *corpus, size_t idx,
+                          const uint8_t *data, size_t len);
+/* Drop input idx (a seed that crashes or hangs) and its queue file. */
+void fathom_corpus_remove(fathom_corpus_t *corpus, size_t idx);
+/*
+ * Mutated executions to spend on input idx this pick: more for inputs
+ * that are fast, reach many blocks, scored high in static analysis or
+ * have not been fuzzed yet.
+ */
+uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx);
 int  fathom_corpus_save_crash(fathom_corpus_t *corpus, const uint8_t *data,
                               size_t len, uint64_t hash);
 

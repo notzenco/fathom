@@ -233,6 +233,29 @@ static void test_recovered_fault(void)
     END();
 }
 
+/* Trimming drops bytes that do not change the path. */
+static void test_trim(void)
+{
+    BEGIN("trim_keeps_path");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("maze")) == 0, "load failed");
+    const char *in = "FUZAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    CHECK(run_cov(&t, &cov, in, &res) == 0, "exec failed");
+    uint64_t want = fathom_coverage_hash(&cov);
+
+    uint8_t buf[128];
+    size_t len = strlen(in);
+    memcpy(buf, in, len);
+    uint64_t execs = 0;
+    CHECK(fathom_trim(&t.ex, &cov, buf, &len, want, 1000, &execs) == 0, "trim failed");
+    CHECK(len < 16, "trailing bytes were not trimmed");
+    CHECK(len >= 4 && memcmp(buf, "FUZ", 3) == 0, "trim changed the path");
+    unload(&t, &cov);
+    END();
+}
+
 #ifndef _WIN32
 /* Coverage and crash attribution continue after the target re-executes itself. */
 static void test_reexec(void)
@@ -321,6 +344,7 @@ int main(void)
     test_many_breakpoints();
     test_original_trap();
     test_recovered_fault();
+    test_trim();
 #ifndef _WIN32
     test_reexec();
     test_forked_children();

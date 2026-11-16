@@ -148,6 +148,24 @@ static void test_destroy_is_clean(void)
     PASS("destroy_is_clean");
 }
 
+static void test_hash(void)
+{
+    fathom_coverage_t cov;
+    assert(fathom_coverage_init(&cov, MAP) == 0);
+    cov.local[3] = 1;
+    cov.local[9] = 1;
+    uint64_t a = fathom_coverage_hash(&cov);
+    cov.local[9] = 1;
+    assert(fathom_coverage_hash(&cov) == a);
+    cov.local[9] = 5;                     /* a different hit-count bucket */
+    assert(fathom_coverage_hash(&cov) != a);
+    cov.local[9] = 1;
+    cov.local[10] = 1;
+    assert(fathom_coverage_hash(&cov) != a);
+    fathom_coverage_destroy(&cov);
+    PASS("hash");
+}
+
 int main(void)
 {
     fprintf(stderr, "=== test_coverage ===\n");
@@ -159,6 +177,7 @@ int main(void)
     test_same_pattern_not_new();
     test_new_pattern_is_new();
     test_destroy_is_clean();
+    test_hash();
 
     fprintf(stderr, "All coverage tests passed.\n");
     return 0;
