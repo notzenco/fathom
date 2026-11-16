@@ -200,6 +200,77 @@ static void test_rejects_bad_input(void)
     tu_rm_tree(dir);
 }
 
+/*
+ * A minimal arm64 Mach-O: one __TEXT segment with one __text section.
+ * cmdsize and sizeofcmds are parameters so a test can make the load
+ * command claim less than the section array it carries.
+ */
+static size_t build_macho(uint8_t *f, size_t cap, uint32_t sizeofcmds, uint32_t cmdsize)
+{
+    memset(f, 0, cap);
+    uint32_t hdr[8] = { 0xfeedfacfu, 0x0100000c, 0, 2, 1, sizeofcmds, 0, 0 };
+    memcpy(f, hdr, sizeof(hdr));
+
+    uint8_t *seg = f + 32;
+    uint32_t cmd[2] = { 0x19, cmdsize };
+    memcpy(seg, cmd, 8);
+    memcpy(seg + 8, "__TEXT", 6);
+    uint64_t vm[4] = { 0x100000000ull, 0x1000, 0, 0x1000 };   /* vmaddr, vmsize, fileoff, filesize */
+    memcpy(seg + 24, vm, sizeof(vm));
+    uint32_t prot_n[4] = { 5, 5, 1, 0 };                       /* maxprot, initprot, nsects, flags */
+    memcpy(seg + 56, prot_n, sizeof(prot_n));
+
+    uint8_t *sec = seg + 72;
+    memcpy(sec, "__text", 6);
+    memcpy(sec + 16, "__TEXT", 6);
+    uint64_t addr_size[2] = { 0x100000200ull, 4 };
+    memcpy(sec + 32, addr_size, sizeof(addr_size));
+    uint32_t offset = 0x200, flags = 0x80000400u;
+    memcpy(sec + 48, &offset, 4);
+    memcpy(sec + 64, &flags, 4);
+
+    uint32_t ret = 0xd65f03c0;
+    memcpy(f + 0x200, &ret, 4);
+    return 0x1000;
+}
+
+static bool open_bytes(fathom_binary_t *bin, const uint8_t *data, size_t len)
+{
+    char dir[512], path[600];
+    if (tu_make_tmpdir(dir, sizeof(dir), "macho") != 0)
+        return false;
+    snprintf(path, sizeof(path), "%s/t", dir);
+    FILE *out = fopen(path, "wb");
+    if (!out)
+        return false;
+    fwrite(data, 1, len, out);
+    fclose(out);
+    bool ok = fathom_binary_open(bin, path) == 0;
+    tu_rm_tree(dir);
+    return ok;
+}
+
+static void test_macho_load_command_bounds(void)
+{
+    static uint8_t f[0x1000];
+    fathom_binary_t bin;
+
+    size_t n = build_macho(f, sizeof(f), 72 + 80, 72 + 80);
+    CHECK(open_bytes(&bin, f, n), "well-formed synthetic Mach-O should load");
+    if (bin.data)
+        fathom_binary_close(&bin);
+
+    n = build_macho(f, sizeof(f), 8, 8);
+    CHECK(!open_bytes(&bin, f, n), "segment larger than its cmdsize must be rejected");
+    if (bin.data)
+        fathom_binary_close(&bin);
+
+    n = build_macho(f, sizeof(f), 72, 72 + 80);
+    CHECK(!open_bytes(&bin, f, n), "command past sizeofcmds must be rejected");
+    if (bin.data)
+        fathom_binary_close(&bin);
+}
+
 int main(void)
 {
     printf("=== test_binary ===\n");
@@ -207,6 +278,7 @@ int main(void)
         test_fixture(&fixtures[i]);
     test_universal_picks_host_slice();
     test_rejects_bad_input();
+    test_macho_load_command_bounds();
 
     printf("\n%d checks, %d failed\n", tests_run, tests_failed);
     return tests_failed ? 1 : 0;
