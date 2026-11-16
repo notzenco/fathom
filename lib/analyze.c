@@ -200,12 +200,6 @@ static int cmp_ranked_desc(const void *a, const void *b)
     return c;
 }
 
-static int cmp_u32(const void *a, const void *b)
-{
-    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
-    return (x > y) - (x < y);
-}
-
 /*
  * Breakpoints overwrite code bytes, so they must only land on real
  * instruction boundaries.  Linear sweep can misread data embedded in
@@ -272,15 +266,6 @@ static int find_cov_blocks(fathom_analysis_t *ana, const fathom_cfg_t *cfg,
     }
     free(seen);
     free(work);
-
-    /* Over the map size, keep the most interesting blocks. */
-    if (ana->cov_count > FATHOM_MAP_SIZE) {
-        g_sort_blocks = cfg->blocks;
-        qsort(ana->cov_blocks, ana->cov_count, sizeof(uint32_t), cmp_ranked_desc);
-        g_sort_blocks = NULL;
-        ana->cov_count = FATHOM_MAP_SIZE;
-        qsort(ana->cov_blocks, ana->cov_count, sizeof(uint32_t), cmp_u32);
-    }
     return 0;
 }
 

@@ -13,11 +13,38 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define HASH_CAP  (2 * FATHOM_MAP_SIZE)   /* load factor <= 0.5 */
+#define HASH_INIT_CAP  4096   /* power of two; doubles to keep load <= 0.5 */
 
-static size_t hash_slot(uint64_t addr)
+static size_t hash_slot(uint64_t addr, size_t cap)
 {
-    return (size_t)((addr * 0x9E3779B97F4A7C15ULL) >> 47) & (HASH_CAP - 1);
+    return (size_t)((addr * 0x9E3779B97F4A7C15ULL) >> 32) & (cap - 1);
+}
+
+static int hash_grow(struct fathom_exec_os *os)
+{
+    size_t cap = os->hash_cap * 2;
+    uint64_t *keys = calloc(cap, sizeof(*keys));
+    uint32_t *vals = calloc(cap, sizeof(*vals));
+    if (!keys || !vals) {
+        free(keys);
+        free(vals);
+        return -1;
+    }
+    for (size_t i = 0; i < os->hash_cap; i++) {
+        if (!os->hash_keys[i])
+            continue;
+        size_t j = hash_slot(os->hash_keys[i], cap);
+        while (keys[j])
+            j = (j + 1) & (cap - 1);
+        keys[j] = os->hash_keys[i];
+        vals[j] = os->hash_vals[i];
+    }
+    free(os->hash_keys);
+    free(os->hash_vals);
+    os->hash_keys = keys;
+    os->hash_vals = vals;
+    os->hash_cap  = cap;
+    return 0;
 }
 
 /* ── Init / Destroy ─────────────────────────────────────────────────── */
@@ -62,9 +89,9 @@ int fathom_exec_init(fathom_exec_t *ex, const fathom_config_t *cfg,
         goto fail;
 
     struct fathom_exec_os *os = ex->os;
-    os->hash_cap  = HASH_CAP;
-    os->hash_keys = calloc(HASH_CAP, sizeof(*os->hash_keys));
-    os->hash_vals = calloc(HASH_CAP, sizeof(*os->hash_vals));
+    os->hash_cap  = HASH_INIT_CAP;
+    os->hash_keys = calloc(HASH_INIT_CAP, sizeof(*os->hash_keys));
+    os->hash_vals = calloc(HASH_INIT_CAP, sizeof(*os->hash_vals));
     if (!os->hash_keys || !os->hash_vals)
         goto fail;
 
@@ -113,7 +140,7 @@ int exec_bp_lookup(const fathom_exec_t *ex, uint64_t addr)
     const struct fathom_exec_os *os = ex->os;
     if (addr == 0)
         return -1;
-    for (size_t i = hash_slot(addr);; i = (i + 1) & (HASH_CAP - 1)) {
+    for (size_t i = hash_slot(addr, os->hash_cap);; i = (i + 1) & (os->hash_cap - 1)) {
         if (os->hash_keys[i] == addr)
             return (int)os->hash_vals[i];
         if (os->hash_keys[i] == 0)
@@ -127,13 +154,15 @@ int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
     if (addr == 0)
         return -1;
 
-    size_t i = hash_slot(addr);
-    for (; os->hash_keys[i] != 0; i = (i + 1) & (HASH_CAP - 1)) {
-        if (os->hash_keys[i] == addr)
-            return (int)os->hash_vals[i];
-    }
-    if (ex->bp_count >= FATHOM_MAP_SIZE)
+    int existing = exec_bp_lookup(ex, addr);
+    if (existing >= 0)
+        return existing;
+    if ((ex->bp_count + 1) * 2 > os->hash_cap && hash_grow(os) < 0)
         return -1;
+
+    size_t i = hash_slot(addr, os->hash_cap);
+    while (os->hash_keys[i] != 0)
+        i = (i + 1) & (os->hash_cap - 1);
 
     if (ex->bp_count >= ex->bp_capacity) {
         size_t cap = ex->bp_capacity * 2;
@@ -170,7 +199,7 @@ bool exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
     if (slot < 0 || !os->orig)
         return false;
 
-    if (cov)
+    if (cov && (size_t)slot < cov->size)
         cov->local[slot] = 1;   /* one-shot: a block counts once per run */
     *orig = os->orig + (addr - os->lo);
     *len  = os->bp_len;

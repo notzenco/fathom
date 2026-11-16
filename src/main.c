@@ -389,7 +389,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         return 1;
     }
 
-    if (fathom_coverage_init(&cov) < 0) {
+    if (fathom_coverage_init(&cov, session->ana.cov_count) < 0) {
         fprintf(stderr, "fathom: coverage init failed\n");
         goto cleanup;
     }

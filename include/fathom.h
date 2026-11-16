@@ -19,11 +19,6 @@
 #define FATHOM_VERSION_MINOR 2
 #define FATHOM_VERSION_PATCH 0
 
-/* ── Coverage map ────────────────────────────────────────────────────── */
-
-/* One byte per instrumented basic block; also caps the breakpoint count. */
-#define FATHOM_MAP_SIZE   (1 << 16)
-
 /* ── Binary image types ──────────────────────────────────────────────── */
 
 typedef enum {
@@ -187,7 +182,7 @@ typedef struct {
     /*
      * Blocks safe to instrument: reachable from the entry point, a
      * symbol, a call target or a code address the program takes.
-     * Sorted by address, capped at FATHOM_MAP_SIZE.
+     * Sorted by address.
      */
     uint32_t      *cov_blocks;
     size_t         cov_count;
@@ -225,6 +220,7 @@ typedef struct {
 typedef struct {
     uint8_t *local;        /* per-exec map: one byte per instrumented block */
     uint8_t *global;       /* cumulative map */
+    size_t   size;         /* slots in each map */
     size_t   total_blocks;
     size_t   new_blocks;
 } fathom_coverage_t;
@@ -337,7 +333,8 @@ const char *fathom_resolve_call(const fathom_binary_t *bin,
                                 const fathom_insn_t *call);
 
 /* Coverage */
-int  fathom_coverage_init(fathom_coverage_t *cov);
+/* size is the number of slots, normally the breakpoint count. */
+int  fathom_coverage_init(fathom_coverage_t *cov, size_t size);
 void fathom_coverage_destroy(fathom_coverage_t *cov);
 void fathom_coverage_reset_local(fathom_coverage_t *cov);
 bool fathom_coverage_has_new(fathom_coverage_t *cov);
@@ -358,7 +355,7 @@ void fathom_exec_destroy(fathom_exec_t *ex);
 int  fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                      const uint8_t *input, size_t input_len,
                      fathom_exec_result_t *result);
-/* Returns the coverage map slot for addr, or -1 on failure / full map. */
+/* Returns the coverage map slot for addr, or -1 on failure. */
 int  fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr);
 
 /* Corpus */
