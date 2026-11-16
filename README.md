@@ -87,13 +87,16 @@ gets block coverage from the unmodified binary instead:
    buckets (1, 2, 3, 4-7, 8+), so an input that runs a loop a different
    number of times counts as new coverage.
 
-Processes the target starts are handled too. On Linux a vfork child is
-traced like a thread, and a forked child gets its original code back and
-runs uninstrumented. On macOS forked children inherit the exception port,
-so their breakpoints are serviced and count as coverage. A target that
-re-executes itself is instrumented again; one that execs another program
-runs it uninstrumented. Every run ends by killing the target's process
-group (a job object on Windows), so nothing it started outlives the run.
+Processes the target starts are handled too. On Linux every fork, vfork
+and thread is traced, and a breakpoint is restored in the memory of the
+process that hit it; on macOS forked children inherit the exception port.
+Either way their code counts as coverage. A target that re-executes
+itself is instrumented again; one that execs another program runs it
+uninstrumented. Every run ends by killing the target's process group and
+also any descendant that left it with `setsid` (on Linux it is still
+traced or was recorded when it exec'd; on macOS a process started during
+the run that carries our exception port is one), or the job object on
+Windows, so nothing the target started outlives the run.
 
 Breakpoints overwrite code, so they must land on real instruction
 boundaries. Rather than trust every block found by linear sweep (which can
@@ -376,8 +379,7 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
 - Code reached only through indirect jumps other than recognised jump
   tables (function pointers stored in data, computed gotos) is left
   uninstrumented.
-- Descendants that leave the target's process group (`setsid`) are not
-  killed at the end of a run. On Linux, forked children are not covered.
+- Coverage of forked children stops at an exec into another program.
 
 ## License
 

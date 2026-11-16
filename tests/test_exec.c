@@ -501,12 +501,33 @@ static void test_forked_children(void)
     CHECK(load_cov(&t, &cov, TARGET("fork_child")) == 0, "load failed");
     CHECK(run_cov(&t, &cov, "A", &res) == 0, "exec failed");
     CHECK(res.status == FATHOM_EXIT_OK, "the child died running instrumented code");
+    /* work() runs only in the child: its blocks count as coverage. */
+    const char *name = "work";
+    uint64_t work = 0;
+    for (size_t i = 0; i < t.bin.symbol_count; i++) {
+        if (strcmp(t.bin.symbols[i].name, name) == 0)
+            work = t.bin.symbols[i].addr;
+    }
+    bool child_covered = false;
+    for (size_t i = 0; work && i < t.ana.cov_count; i++)
+        child_covered |= t.cfg.blocks[t.ana.cov_blocks[i]].start_addr == work && cov.local[i];
+    CHECK(work != 0, "no work symbol");
+    CHECK(child_covered, "the child's code was not covered");
+
     CHECK(run_cov(&t, &cov, "S", &res) == 0, "exec failed");
     bool alive = true;
     for (int i = 0; i < 20 && (alive = process_named("fork_child")); i++)
         usleep(50 * 1000);
     unload(&t, &cov);
     CHECK(!alive, "a child process outlived the run");
+
+    /* Even one that left the process group and session. */
+    CHECK(load_cov(&t, &cov, TARGET("setsid_child")) == 0, "load failed");
+    CHECK(run_cov(&t, &cov, "", &res) == 0, "exec failed");
+    for (int i = 0; i < 20 && (alive = process_named("setsid_child")); i++)
+        usleep(50 * 1000);
+    unload(&t, &cov);
+    CHECK(!alive, "a child that called setsid outlived the run");
     END();
 }
 #endif

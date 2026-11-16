@@ -772,6 +772,57 @@ static bool exc_take_fault(int sig, uint64_t *pc, uint64_t *fp)
     return match;
 }
 
+/*
+ * Descendants that left the target's process group (setsid, daemons)
+ * escape the group kill.  Forked children inherit the target's exception
+ * ports, so any process started during this run whose exception port is
+ * ours is one of them.
+ */
+static void kill_strays(const struct timeval *since)
+{
+    if (!g_exc.ready || !MACH_PORT_VALID(g_exc.port))
+        return;   /* no port of ours to recognise them by */
+    int n = proc_listallpids(NULL, 0);
+    if (n <= 0)
+        return;
+    pid_t *pids = malloc((size_t)(n + 32) * sizeof(*pids));
+    if (!pids)
+        return;
+    n = proc_listallpids(pids, (n + 32) * (int)sizeof(*pids));
+    for (int i = 0; i < n; i++) {
+        struct proc_bsdinfo bi;
+        if (pids[i] == getpid() ||
+            proc_pidinfo(pids[i], PROC_PIDTBSDINFO, 0, &bi, sizeof(bi)) != sizeof(bi) ||
+            bi.pbi_uid != getuid() ||
+            (time_t)bi.pbi_start_tvsec < since->tv_sec ||
+            ((time_t)bi.pbi_start_tvsec == since->tv_sec &&
+             (suseconds_t)bi.pbi_start_tvusec < since->tv_usec))
+            continue;
+
+        task_t task;
+        if (task_for_pid(mach_task_self(), pids[i], &task) != KERN_SUCCESS)
+            continue;
+        exception_mask_t masks[EXC_TYPES_COUNT];
+        exception_handler_t ports[EXC_TYPES_COUNT];
+        exception_behavior_t behaviors[EXC_TYPES_COUNT];
+        thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+        mach_msg_type_number_t count = EXC_TYPES_COUNT;
+        bool ours = false;
+        if (task_get_exception_ports(task, EXC_MASK_BREAKPOINT, masks, &count, ports,
+                                     behaviors, flavors) == KERN_SUCCESS) {
+            for (mach_msg_type_number_t k = 0; k < count; k++) {
+                ours |= ports[k] == g_exc.port;
+                if (MACH_PORT_VALID(ports[k]))
+                    mach_port_deallocate(mach_task_self(), ports[k]);
+            }
+        }
+        mach_port_deallocate(mach_task_self(), task);
+        if (ours)
+            kill(pids[i], SIGKILL);
+    }
+    free(pids);
+}
+
 #endif
 
 static bool read_word(void *ctx, uint64_t addr, uint64_t *out)
@@ -920,20 +971,35 @@ static void report_crash(fathom_exec_result_t *res, const fault_t *f)
 
 #if defined(__linux__)
 
+/*
+ * Every thread, fork and vfork of the target is traced (it inherits our
+ * ptrace options).  Each task runs in some process's memory, its owner:
+ * a thread or vfork child shares its parent's, a fork has its own copy,
+ * patched breakpoints included.  Breakpoints are restored in the owner's
+ * memory, so forked children are covered like the target itself.  A
+ * descendant that execs another program is released but remembered, and
+ * killed with the rest at the end of the run, wherever it moved to.
+ */
 enum { KID_UNKNOWN, KID_THREAD, KID_FORK, KID_VFORK };
 
-#define MAX_KIDS 256
+#define MAX_KIDS    256
+#define MAX_ESCAPED 64
 
 typedef struct {
     pid_t pid;
     int   kind;
+    pid_t owner;       /* whose memory it runs in; 0 until known */
+    int   mem_fd;      /* /proc/<pid>/mem of a fork, opened on first use */
     bool  stopped;     /* first stop seen, waiting to learn the kind */
     bool  started;
 } kid_t;
 
 typedef struct {
+    pid_t  root;
     kid_t  k[MAX_KIDS];
     size_t n;
+    pid_t  escaped[MAX_ESCAPED];   /* released after exec, still to kill */
+    size_t n_escaped;
 } kids_t;
 
 static kid_t *kid_get(kids_t *ks, pid_t pid, bool add)
@@ -947,6 +1013,7 @@ static kid_t *kid_get(kids_t *ks, pid_t pid, bool add)
     kid_t *k = &ks->k[ks->n++];
     memset(k, 0, sizeof(*k));
     k->pid = pid;
+    k->mem_fd = -1;
     return k;
 }
 
@@ -954,54 +1021,60 @@ static void kid_drop(kids_t *ks, pid_t pid)
 {
     for (size_t i = 0; i < ks->n; i++) {
         if (ks->k[i].pid == pid) {
+            if (ks->k[i].mem_fd >= 0)
+                close(ks->k[i].mem_fd);
             ks->k[i] = ks->k[--ks->n];
             return;
         }
     }
 }
 
-/*
- * Let a new task run once both its first stop and its kind are known.
- * A fork has its own copy of the patched code, which nothing here would
- * restore, so it gets the original bytes back and is released.
- */
-static void kid_start(fathom_exec_t *ex, kids_t *ks, kid_t *k)
+static pid_t kid_owner(kids_t *ks, pid_t tid)
 {
-    if (k->kind != KID_FORK) {
-        k->started = true;
-        tgt_continue(k->pid, 0);
-        return;
-    }
-    const struct fathom_exec_os *os = ex->os;
-    int fd;
-    if (os->patch_ready && open_mem(k->pid, &fd)) {
-        for (size_t i = 0; i < os->n_clusters; i++) {
-            const struct exec_cluster *c = &os->clusters[i];
-            if (pwrite(fd, os->orig + c->off, (size_t)(c->hi - c->lo),
-                       (off_t)(c->lo + os->slide)) < 0)
-                break;
-        }
-        close(fd);
-    }
-    ptrace(PTRACE_DETACH, k->pid, NULL, NULL);
-    kid_drop(ks, k->pid);
+    kid_t *k = tid == ks->root ? NULL : kid_get(ks, tid, false);
+    return k && k->owner ? k->owner : ks->root;
 }
 
-static void kid_event(fathom_exec_t *ex, kids_t *ks, pid_t tid, int event)
+/* The memory and identity a task's breakpoints and faults are handled in. */
+static target_t kid_target(kids_t *ks, const target_t *root, pid_t tid)
+{
+    pid_t owner = kid_owner(ks, tid);
+    if (owner == ks->root)
+        return *root;
+    kid_t *o = kid_get(ks, owner, false);
+    target_t t = { owner, -1 };
+    if (o && o->mem_fd < 0)
+        open_mem(owner, &o->mem_fd);
+    if (o)
+        t.mem_fd = o->mem_fd;
+    return t;
+}
+
+/* Let a new task run once both its first stop and its kind are known. */
+static void kid_start(kids_t *ks, kid_t *k)
+{
+    (void)ks;
+    k->started = true;
+    tgt_continue(k->pid, 0);
+}
+
+static void kid_event(kids_t *ks, pid_t tid, int event)
 {
     unsigned long msg = 0;
     ptrace(PTRACE_GETEVENTMSG, tid, NULL, &msg);
+    pid_t parent_owner = kid_owner(ks, tid);
     kid_t *k = kid_get(ks, (pid_t)msg, true);
     if (!k)
         return;
     k->kind = event == PTRACE_EVENT_FORK  ? KID_FORK
             : event == PTRACE_EVENT_VFORK ? KID_VFORK : KID_THREAD;
+    k->owner = k->kind == KID_FORK ? k->pid : parent_owner;
     if (k->stopped && !k->started)
-        kid_start(ex, ks, k);
+        kid_start(ks, k);
 }
 
 /* Returns true if the stop was a new task's first stop and is handled. */
-static bool kid_first_stop(fathom_exec_t *ex, kids_t *ks, pid_t tid, int sig)
+static bool kid_first_stop(kids_t *ks, pid_t tid, int sig)
 {
     kid_t *k = kid_get(ks, tid, false);
     if (sig != SIGSTOP || (k && k->started))
@@ -1012,21 +1085,40 @@ static bool kid_first_stop(fathom_exec_t *ex, kids_t *ks, pid_t tid, int sig)
     }
     k->stopped = true;
     if (k->kind != KID_UNKNOWN)
-        kid_start(ex, ks, k);
+        kid_start(ks, k);
     return true;
+}
+
+/* A descendant exec'd another program: release it, but kill it at the end. */
+static void kid_exec(kids_t *ks, pid_t tid)
+{
+    if (ks->n_escaped < MAX_ESCAPED)
+        ks->escaped[ks->n_escaped++] = tid;
+    for (size_t i = 0; i < ks->n;) {   /* its threads died in the exec */
+        if (ks->k[i].pid != tid && ks->k[i].owner == tid)
+            kid_drop(ks, ks->k[i].pid);
+        else
+            i++;
+    }
+    kid_drop(ks, tid);
+    ptrace(PTRACE_DETACH, tid, NULL, NULL);
 }
 
 /* Kill and reap every task still traced, so no stale stop reaches the next run. */
 static void kids_reap(kids_t *ks)
 {
     for (size_t i = 0; i < ks->n; i++) {
+        if (ks->k[i].mem_fd >= 0)
+            close(ks->k[i].mem_fd);
         if (ks->k[i].kind == KID_THREAD)
-            continue;   /* died with the target */
+            continue;   /* died with its process */
         kill(ks->k[i].pid, SIGKILL);
         while (waitpid(ks->k[i].pid, NULL, __WALL) < 0 && errno == EINTR)
             ;
     }
-    ks->n = 0;
+    for (size_t i = 0; i < ks->n_escaped; i++)
+        kill(ks->escaped[i], SIGKILL);
+    ks->n = ks->n_escaped = 0;
 }
 
 #endif
@@ -1283,7 +1375,7 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 #if defined(__linux__)
     t.mem_fd = -1;
     kids_t kids;
-    kids.n = 0;
+    kids.n = kids.n_escaped = 0;
 #endif
     os->foreign_image = false;
     int st = 0;
@@ -1341,12 +1433,15 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     }
 #if defined(__APPLE__)
     int kq = -1;
+    bool target_forked = false;
+    struct timeval run_start;
+    gettimeofday(&run_start, NULL);
     if (ok) {
         exc_begin(&t, ex, cov);
         /* NOTE_EXEC tells a later exec's SIGTRAP apart from a trap. */
         kq = kqueue();
         struct kevent kev;
-        EV_SET(&kev, pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXEC, 0, NULL);
+        EV_SET(&kev, pid, EVFILT_PROC, EV_ADD | EV_CLEAR, NOTE_EXEC | NOTE_FORK, 0, NULL);
         if (kq >= 0)
             kevent(kq, &kev, 1, NULL, 0, NULL);
     }
@@ -1363,6 +1458,9 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
         return -1;
     }
 
+#if defined(__linux__)
+    kids.root = pid;
+#endif
     res->status = FATHOM_EXIT_OK;
     fault_t pending = { 0 };
     bool killed = false, escalated = false, abandoned = false, failed = false;
@@ -1439,12 +1537,11 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                 if (on_root_exec(ex, &t) < 0)
                     failed = true;
             } else if (event == PTRACE_EVENT_EXEC) {
-                ptrace(PTRACE_DETACH, tid, NULL, NULL);   /* a vfork child's new program */
-                kid_drop(&kids, tid);
+                kid_exec(&kids, tid);   /* a descendant's new program */
                 continue;
             } else if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
                        event == PTRACE_EVENT_CLONE) {
-                kid_event(ex, &kids, tid, event);
+                kid_event(&kids, tid, event);
             }
             if (failed) {
                 tgt_kill(pid);
@@ -1453,7 +1550,7 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
             tgt_continue(tid, 0);
             continue;
         }
-        if (tid != pid && kid_first_stop(ex, &kids, tid, sig))
+        if (tid != pid && kid_first_stop(&kids, tid, sig))
             continue;
 #endif
         if (res->status == FATHOM_EXIT_CRASH || failed) {
@@ -1472,7 +1569,10 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
         if (sig == SIGTRAP && kq >= 0) {
             struct kevent kev;
             struct timespec zero = { 0, 0 };
-            if (kevent(kq, NULL, 0, &kev, 1, &zero) == 1 && (kev.fflags & NOTE_EXEC)) {
+            bool got_event = kevent(kq, NULL, 0, &kev, 1, &zero) == 1;
+            if (got_event)
+                target_forked |= (kev.fflags & NOTE_FORK) != 0;
+            if (got_event && (kev.fflags & NOTE_EXEC)) {
                 if (on_root_exec(ex, &t) < 0) {
                     failed = true;
                     tgt_kill(pid);
@@ -1484,6 +1584,14 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                 continue;
             }
         }
+#endif
+
+        /* A forked descendant's breakpoints and faults live in its own memory. */
+#if defined(__linux__)
+        target_t kt = kid_target(&kids, &t, tid);
+        target_t *tt = &kt;
+#else
+        target_t *tt = &t;
 #endif
 
         if (sig == SIGTRAP) {
@@ -1507,11 +1615,11 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 #else
                     state_regs(&r.st, &regs);
 #endif
-                    exec_probe_log(ex, probe, &regs, rd_mem, &t);
+                    exec_probe_log(ex, probe, &regs, rd_mem, tt);
                 }
                 bool restored = true;
                 for (size_t i = 0; i < nw; i++)
-                    restored = restored && tgt_write(&t, w[i].addr, w[i].bytes, w[i].len);
+                    restored = restored && tgt_write(tt, w[i].addr, w[i].bytes, w[i].len);
 #if defined(__linux__)
                 REG_PC(r) = bp;
                 restored = restored && tgt_set_regs(&t, tid, &r);
@@ -1560,8 +1668,8 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
              */
             bool repeat = pending.set && pending.sig == sig && pending.pc == pc;
             fault_t f;
-            record_fault(ex, &t, sig, pc, fp, &f);
-            if (!repeat && tgt_catches(&t, sig)) {
+            record_fault(ex, tt, sig, pc, fp, &f);
+            if (!repeat && tgt_catches(tt, sig)) {
                 pending = f;
                 tgt_continue(tid, sig);
                 continue;
@@ -1583,6 +1691,14 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     (void)killed_at;
     disarm_timer();
 #if defined(__APPLE__)
+    if (kq >= 0) {
+        struct kevent kev;
+        struct timespec zero = { 0, 0 };
+        if (kevent(kq, NULL, 0, &kev, 1, &zero) == 1)
+            target_forked |= (kev.fflags & NOTE_FORK) != 0;
+    }
+    if (target_forked)
+        kill_strays(&run_start);
     failed |= exc_end();
     if (kq >= 0)
         close(kq);
