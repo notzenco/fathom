@@ -142,6 +142,15 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
   blocks: each covered block is worth the score of the best uncovered
   scored block it can reach, halved per CFG edge (directed fuzzing in the
   style of AFLGo, using the static scores as targets).
+- **Comparison logging** (input-to-state, as in RedQueen and AFL++'s
+  CmpLog). The first time an input is fuzzed it runs once with a one-shot
+  probe on every register or memory comparison (`cmp`, `subs`, `ccmp`)
+  and every call to `memcmp`, `strcmp` and their relatives. Each probe
+  records what was compared; wherever one side's bytes appear in the
+  input, in either byte order and as narrower values, the other side
+  (and its neighbours +-1) is written there and run. This finds magic
+  values that `-O2` code loads into a register, which static extraction
+  cannot see. `--no-cmplog` turns it off.
 - `--trim` shrinks queue inputs while they reach the same blocks. It is
   off by default because breakpoints cannot see loop counts, so trimming
   would cut inputs below the length an overflow needs.
@@ -213,6 +222,7 @@ Options:
   --max-execs <n> Stop after n target runs
   --max-input <n> Largest input to generate, in bytes (default: 1048576)
   --fail-on-crash Exit with status 2 if any unique crash was found
+  --no-cmplog Skip comparison logging (input-to-state) on new inputs
   --version   Show the version
   --replay <f>    Run input f once and report the outcome (exit
                   status 0 ok, 2 crash, 3 hang)

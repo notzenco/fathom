@@ -134,6 +134,50 @@ typedef struct {
     size_t         count;
 } fathom_disasm_t;
 
+/* ── Comparison sites (run-time comparison logging) ──────────────────── */
+
+/*
+ * General-purpose registers are numbered across architectures as:
+ *   x86-64  0 rax, 1 rcx, 2 rdx, 3 rbx, 4 rsp, 5 rbp, 6 rsi, 7 rdi, 8-15 r8-r15
+ *   arm64   0-30 x0-x30, 31 sp
+ * and FATHOM_REG_ZERO reads as 0 (xzr/wzr).
+ */
+#define FATHOM_REG_COUNT  33
+#define FATHOM_REG_ZERO   32
+#define FATHOM_REG_NONE   0xff
+
+typedef struct {
+    bool     mem;        /* memory operand: [base + index*scale + disp] */
+    uint8_t  reg;        /* the register, or the base register */
+    uint8_t  index;      /* index register, or FATHOM_REG_NONE */
+    uint8_t  scale;
+    int64_t  disp;       /* for a PC-relative operand, the link-time address */
+    bool     pc_rel;
+} fathom_operand_t;
+
+typedef enum {
+    FATHOM_CMP_VALUES = 0,   /* cmp/subs of two registers or memory */
+    FATHOM_CMP_BYTES,        /* memcmp/strcmp-style call: a and b point to the data */
+} fathom_cmp_kind_t;
+
+typedef struct {
+    uint64_t          addr;      /* link-time address of the compare or call */
+    fathom_cmp_kind_t kind;
+    uint8_t           width;     /* VALUES: operand size in bytes */
+    fathom_operand_t  a, b;      /* BYTES: registers holding the two pointers */
+    uint8_t           len_reg;   /* BYTES: register holding the length, or NONE (C strings) */
+} fathom_cmp_site_t;
+
+/* What one comparison saw at run time: the bytes of both sides. */
+#define FATHOM_CMP_MAX_BYTES 32
+typedef struct {
+    uint32_t site;
+    uint8_t  len;                /* bytes valid in a and b */
+    bool     bytes;              /* a BYTES site, else little-endian values */
+    uint8_t  a[FATHOM_CMP_MAX_BYTES];
+    uint8_t  b[FATHOM_CMP_MAX_BYTES];
+} fathom_cmp_entry_t;
+
 /* ── CFG types ───────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -352,6 +396,17 @@ int  fathom_disasm_open(fathom_disasm_t *dis, const fathom_binary_t *bin);
 void fathom_disasm_close(fathom_disasm_t *dis);
 size_t fathom_disasm_find(const fathom_disasm_t *dis, uint64_t addr);
 
+/*
+ * Comparison sites in the given blocks: register and memory compares
+ * (immediates are already dictionary tokens) and calls to memcmp,
+ * strcmp and their relatives.  *out is malloc'd; returns the count, or
+ * -1 on error.
+ */
+#define FATHOM_MAX_CMP_SITES 4096
+long fathom_cmp_sites(const fathom_binary_t *bin, const fathom_disasm_t *dis,
+                      const fathom_cfg_t *cfg, const uint32_t *blocks, size_t nblocks,
+                      fathom_cmp_site_t **out);
+
 /* CFG */
 /* bin may be NULL; when given, its entry point and function symbols start blocks. */
 int  fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis,
@@ -431,6 +486,16 @@ int  fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr);
  * only blocks still armed.
  */
 void fathom_exec_arm(fathom_exec_t *ex, int slot, bool armed);
+/*
+ * Comparison logging: probe the compare at site->addr (an instruction
+ * start that is not a loop-count breakpoint).  While armed, each probe
+ * records what its comparison sees the first time it runs; the log is
+ * reset at the start of every run.  Returns -1 if the site cannot be used.
+ */
+#define FATHOM_CMP_LOG_MAX 1024
+int  fathom_exec_add_cmp_site(fathom_exec_t *ex, const fathom_cmp_site_t *site);
+void fathom_exec_arm_cmp(fathom_exec_t *ex, bool armed);
+size_t fathom_exec_cmp_log(const fathom_exec_t *ex, const fathom_cmp_entry_t **log);
 int  fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn);
 
 /*

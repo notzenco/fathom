@@ -64,6 +64,7 @@ typedef struct {
     const char *minimize;    /* --minimize: shrink this crashing input */
     uint64_t max_execs;      /* --max-execs: stop after this many runs, 0 = no limit */
     bool     fail_on_crash;  /* --fail-on-crash: exit status 2 if any unique crash */
+    bool     no_cmplog;      /* --no-cmplog: skip the input-to-state stage */
     int      worker_id;      /* -1 unless launched as a worker (Windows) */
     char     stop_event[64];
 } fathom_opts_t;
@@ -381,6 +382,7 @@ static void usage(const char *prog)
         "  --max-execs <n> Stop after n target runs\n"
         "  --max-input <n> Largest input to generate, in bytes (default: %d)\n"
         "  --fail-on-crash Exit with status 2 if any unique crash was found\n"
+        "  --no-cmplog Skip comparison logging (input-to-state) on new inputs\n"
         "  --version   Show the version\n"
         "  --replay <f>    Run input f once and report the outcome (exit\n"
         "                  status 0 ok, 2 crash, 3 hang)\n"
@@ -546,6 +548,7 @@ typedef struct {
     int                    id;
     uint64_t               last_sync;
     size_t                *peer_next;   /* per peer: first queue id not imported yet */
+    long                   n_cmp_sites; /* comparisons probed by cmplog_stage */
 } worker_t;
 
 static bool out_of_time(worker_t *w)
@@ -761,20 +764,16 @@ static int trim_input(worker_t *w, size_t idx, uint8_t *buf)
 }
 
 /* One mutated run of input idx.  Returns -1 on a fatal error. */
-static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
+#define STRATEGY_CMPLOG  (-2)   /* input-to-state candidate, not a mutation strategy */
+
+/*
+ * Run one candidate input and act on the result: keep it if it reaches
+ * new coverage, save crashes and hangs.  strategy is the mutation that
+ * made it, rewarded on new coverage.  Returns -1 on a fatal error.
+ */
+static int evaluate(worker_t *w, const uint8_t *buf, size_t len, int strategy)
 {
     fathom_corpus_t *corpus = &w->corpus;
-    const fathom_input_t *seed = &corpus->inputs[idx];
-    size_t len = seed->len < g_max_input ? seed->len : g_max_input;
-    memcpy(buf, seed->data, len);
-
-    const fathom_input_t *donor =
-        &corpus->inputs[fathom_rand_below(&w->mut, (uint32_t)corpus->count)];
-    bool can_splice = corpus->count > 1 && donor != seed;
-    int strategy = fathom_mutate(&w->mut, buf, &len, g_max_input,
-                                 can_splice ? donor->data : NULL,
-                                 can_splice ? donor->len : 0);
-
     fathom_exec_result_t res;
     w->stats.total_execs++;
     if (fathom_exec_run(&w->ex, &w->cov, buf, len, &res) < 0) {
@@ -810,7 +809,7 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
                     w->multi ? "" : "\n", w->prefix ? w->prefix : "", fresh,
                     w->stats.covered, w->stats.instrumented,
                     strategy >= 0 && strategy < FATHOM_MUT_COUNT ? strategy_names[strategy]
-                                                                  : "?", len);
+                    : strategy == STRATEGY_CMPLOG ? "comparison log" : "?", len);
     }
 
     if (res.status == FATHOM_EXIT_CRASH)
@@ -821,6 +820,165 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
             return -1;
     }
     return 0;
+}
+
+/* One mutated run of input idx.  Returns -1 on a fatal error. */
+static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
+{
+    fathom_corpus_t *corpus = &w->corpus;
+    const fathom_input_t *seed = &corpus->inputs[idx];
+    size_t len = seed->len < g_max_input ? seed->len : g_max_input;
+    memcpy(buf, seed->data, len);
+
+    const fathom_input_t *donor =
+        &corpus->inputs[fathom_rand_below(&w->mut, (uint32_t)corpus->count)];
+    bool can_splice = corpus->count > 1 && donor != seed;
+    int strategy = fathom_mutate(&w->mut, buf, &len, g_max_input,
+                                 can_splice ? donor->data : NULL,
+                                 can_splice ? donor->len : 0);
+    return evaluate(w, buf, len, strategy);
+}
+
+/* ── Input-to-state (comparison logging) ─────────────────────────────── */
+
+#define CMPLOG_MAX_CANDIDATES  128   /* runs one input may spend on this stage */
+#define CMPLOG_MAX_POSITIONS   4     /* places one pattern is replaced at */
+
+typedef struct {
+    worker_t      *w;
+    const uint8_t *in;
+    size_t         len;
+    uint8_t       *buf;
+    uint32_t       runs;
+    uint64_t       tried[CMPLOG_MAX_CANDIDATES];   /* (position, bytes) already run */
+} i2s_t;
+
+static bool i2s_seen(i2s_t *c, size_t pos, const uint8_t *rep, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ULL ^ pos;
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ rep[i]) * 0x100000001b3ULL;
+    h = (h ^ n) * 0x100000001b3ULL;
+    for (uint32_t i = 0; i < c->runs; i++) {
+        if (c->tried[i] == h)
+            return true;
+    }
+    c->tried[c->runs] = h;
+    return false;
+}
+
+/* Replace each occurrence of pat in the input with rep (both n bytes) and run it. */
+static int i2s_replace(i2s_t *c, const uint8_t *pat, const uint8_t *rep, size_t n)
+{
+    if (n == 0 || n > c->len || !memcmp(pat, rep, n))
+        return 0;
+    int found = 0;
+    for (size_t p = 0; p + n <= c->len && found < CMPLOG_MAX_POSITIONS; p++) {
+        if (memcmp(c->in + p, pat, n) != 0)
+            continue;
+        if (c->runs >= CMPLOG_MAX_CANDIDATES || out_of_time(c->w))
+            return 0;
+        found++;
+        if (i2s_seen(c, p, rep, n))
+            continue;
+        c->runs++;
+        memcpy(c->buf, c->in, c->len);
+        memcpy(c->buf + p, rep, n);
+        if (evaluate(c->w, c->buf, c->len, STRATEGY_CMPLOG) < 0)
+            return -1;
+    }
+    return 0;
+}
+
+static size_t min_width(const uint8_t *le, size_t width)
+{
+    size_t n = width;
+    while (n > 1 && le[n - 1] == 0)
+        n--;
+    return n;
+}
+
+/* Candidates for one compared pair: value a replaced by b, b by a, b +- 1. */
+static int i2s_values(i2s_t *c, const uint8_t *a, const uint8_t *b, size_t width)
+{
+    uint64_t bv = 0;
+    for (size_t i = 0; i < width; i++)
+        bv |= (uint64_t)b[i] << (8 * i);
+    const uint64_t reps[3] = { bv, bv + 1, bv - 1 };
+
+    /* The input may hold a narrower value the program widened (a byte compared as an int). */
+    size_t widths[2] = { width, min_width(a, width) };
+    for (int wi = 0; wi < (widths[1] < width ? 2 : 1); wi++) {
+        size_t n = widths[wi];
+        for (int big = 0; big < (n > 1 ? 2 : 1); big++) {
+            uint8_t pat[8], rep[8];
+            for (size_t i = 0; i < n; i++)
+                pat[big ? n - 1 - i : i] = a[i];
+            for (int r = 0; r < 3; r++) {
+                for (size_t i = 0; i < n; i++)
+                    rep[big ? n - 1 - i : i] = (uint8_t)(reps[r] >> (8 * i));
+                if (i2s_replace(c, pat, rep, n) < 0)
+                    return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/*
+ * Run input idx once with every comparison probed, then try making each
+ * comparison come out the other way: wherever one side's bytes appear in
+ * the input, put the other side's there (RedQueen's input-to-state).
+ * This finds magic values the program loads into registers or compares
+ * with memcmp, which static extraction cannot see.
+ */
+static int cmplog_stage(worker_t *w, size_t idx, uint8_t *buf)
+{
+    const fathom_input_t *inp = &w->corpus.inputs[idx];
+    size_t len = inp->len < g_max_input ? inp->len : g_max_input;
+    uint8_t *in = malloc(len ? len : 1);
+    if (!in)
+        return -1;
+    memcpy(in, inp->data, len);
+
+    fathom_exec_result_t res;
+    fathom_exec_arm_cmp(&w->ex, true);
+    w->stats.total_execs++;
+    int rc = fathom_exec_run(&w->ex, &w->cov, in, len, &res);
+    fathom_exec_arm_cmp(&w->ex, false);
+    const fathom_cmp_entry_t *log;
+    size_t n = fathom_exec_cmp_log(&w->ex, &log);
+    fathom_cmp_entry_t *entries = rc == 0 && n ? malloc(n * sizeof(*entries)) : NULL;
+    if (entries)
+        memcpy(entries, log, n * sizeof(*entries));   /* the next run resets the log */
+
+    i2s_t c = { w, in, len, buf, 0, {0} };
+    for (size_t i = 0; entries && i < n && rc == 0; i++) {
+        const fathom_cmp_entry_t *e = &entries[i];
+        if (e->bytes) {
+            /* The input holds a prefix of one side: write the other side there. */
+            size_t k = e->len < 4 ? e->len : 4;
+            uint8_t rep[FATHOM_CMP_MAX_BYTES];
+            for (int dir = 0; dir < 2 && rc == 0; dir++) {
+                const uint8_t *from = dir ? e->b : e->a, *to = dir ? e->a : e->b;
+                for (size_t p = 0; p + k <= len && rc == 0; p++) {
+                    if (memcmp(in + p, from, k) != 0)
+                        continue;
+                    size_t m = e->len < len - p ? e->len : len - p;
+                    memcpy(rep, to, m);
+                    rc = i2s_replace(&c, in + p, rep, m);
+                    break;
+                }
+            }
+        } else {
+            rc = i2s_values(&c, e->a, e->b, e->len);
+            if (rc == 0)
+                rc = i2s_values(&c, e->b, e->a, e->len);
+        }
+    }
+    free(entries);
+    free(in);
+    return rc;
 }
 
 /*
@@ -974,6 +1132,14 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     }
     w->stats.instrumented = w->ex.bp_count;
 
+    fathom_cmp_site_t *sites = NULL;
+    long nsites = opts->no_cmplog ? 0
+                : fathom_cmp_sites(&session->bin, &session->dis, &session->cfg_graph,
+                                   session->ana.cov_blocks, session->ana.cov_count, &sites);
+    for (long i = 0; i < nsites; i++)
+        w->n_cmp_sites += fathom_exec_add_cmp_site(&w->ex, &sites[i]) >= 0;
+    free(sites);
+
     if (w->corpus.resumed)
         fprintf(stderr, "%s%sresuming %s: %zu queue entries, %zu unique crashes\n",
                 w->prefix ? w->prefix : "", w->prefix ? " " : "  ", cfg->output_dir,
@@ -1022,6 +1188,11 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         fathom_input_t *inp = fathom_corpus_next(&w->corpus);
         size_t idx = (size_t)(inp - w->corpus.inputs);
         if (opts->trim && !inp->trimmed && trim_input(w, idx, buf) < 0) {
+            fprintf(stderr, "fathom: target execution failed\n");
+            goto cleanup;
+        }
+        if (w->n_cmp_sites && w->corpus.inputs[idx].fuzz_count == 0 &&
+            cmplog_stage(w, idx, buf) < 0) {
             fprintf(stderr, "fathom: target execution failed\n");
             goto cleanup;
         }
@@ -1301,6 +1472,7 @@ int main(int argc, char *argv[])
         {"max-execs", required_argument, NULL, 'E'},
         {"max-input", required_argument, NULL, 'I'},
         {"fail-on-crash", no_argument,  NULL, 'F'},
+        {"no-cmplog", no_argument,      NULL, 'C'},
         {"version",  no_argument,       NULL, 'V'},
         {"minimize", required_argument, NULL, 'M'},
         {"worker",   required_argument, NULL, 'W'},   /* internal (Windows) */
@@ -1331,6 +1503,7 @@ int main(int argc, char *argv[])
             }
             break;
         case 'F': opts.fail_on_crash = true; break;
+        case 'C': opts.no_cmplog = true; break;
         case 'V':
             printf("fathom %d.%d.%d\n", FATHOM_VERSION_MAJOR, FATHOM_VERSION_MINOR,
                    FATHOM_VERSION_PATCH);

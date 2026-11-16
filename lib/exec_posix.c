@@ -205,6 +205,23 @@ static bool tgt_set_regs(target_t *t, pid_t tid, regs_t *r)
 #define REG_FP(r) ((r).regs[29])
 #endif
 
+static void to_exec_regs(const regs_t *r, exec_regs_t *out)
+{
+    memset(out, 0, sizeof(*out));
+#if defined(__x86_64__)
+    const unsigned long long v[16] = {
+        r->rax, r->rcx, r->rdx, r->rbx, r->rsp, r->rbp, r->rsi, r->rdi,
+        r->r8, r->r9, r->r10, r->r11, r->r12, r->r13, r->r14, r->r15,
+    };
+    for (int i = 0; i < 16; i++)
+        out->r[i] = v[i];
+#else
+    for (int i = 0; i < 31; i++)
+        out->r[i] = r->regs[i];
+    out->r[31] = r->sp;
+#endif
+}
+
 /* Runtime entry point from the aux vector, giving the ASLR slide. */
 static bool tgt_slide(target_t *t, const fathom_exec_t *ex, uint64_t *slide)
 {
@@ -317,6 +334,26 @@ typedef arm_thread_state64_t state_t;
 #define STATE_SET_PC(s, v) arm_thread_state64_set_pc_fptr((s), (void *)(uintptr_t)(v))
 #endif
 
+static void state_regs(const state_t *st, exec_regs_t *out)
+{
+    memset(out, 0, sizeof(*out));
+#if defined(__x86_64__)
+    const uint64_t v[16] = {
+        st->__rax, st->__rcx, st->__rdx, st->__rbx, st->__rsp, st->__rbp, st->__rsi,
+        st->__rdi, st->__r8, st->__r9, st->__r10, st->__r11, st->__r12, st->__r13,
+        st->__r14, st->__r15,
+    };
+    for (int i = 0; i < 16; i++)
+        out->r[i] = v[i];
+#else
+    for (int i = 0; i < 29; i++)
+        out->r[i] = st->__x[i];
+    out->r[29] = (uint64_t)arm_thread_state64_get_fp(*st);
+    out->r[30] = (uint64_t)arm_thread_state64_get_lr(*st);
+    out->r[31] = (uint64_t)arm_thread_state64_get_sp(*st);
+#endif
+}
+
 static int tgt_attach(target_t *t, pid_t pid)
 {
     t->pid = pid;
@@ -376,6 +413,11 @@ static bool task_write(task_t task, uint64_t addr, const void *buf, size_t len)
 static bool tgt_write(target_t *t, uint64_t addr, const void *buf, size_t len)
 {
     return task_write(t->task, addr, buf, len);
+}
+
+static bool task_rd(void *ctx, uint64_t addr, void *buf, size_t len)
+{
+    return task_read(*(task_t *)ctx, addr, buf, len);
 }
 
 static bool thread_regs(thread_act_t th, regs_t *r)
@@ -575,9 +617,15 @@ static kern_return_t exc_handle(const exc_request_t *rq, exc_reply_t *rp)
     fathom_exec_t *ex = g_exc.ex;
     if (ex) {
         exec_write_t w[2];
+        uint32_t probe;
         uint64_t bp = STATE_PC(st) - ex->os->pc_adjust;
         size_t nw = rq->exception == EXC_BREAKPOINT
-                  ? exec_bp_hit(ex, g_exc.cov, bp, w) : 0;
+                  ? exec_bp_hit(ex, g_exc.cov, bp, w, &probe) : 0;
+        if (nw && probe != UINT32_MAX) {
+            exec_regs_t regs;
+            state_regs(&st, &regs);
+            exec_probe_log(ex, probe, &regs, task_rd, &task);
+        }
         if (nw) {
             bool ok = true;
             for (size_t i = 0; i < nw; i++)
@@ -1196,7 +1244,17 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
             uint64_t pc = have ? r.pc : 0;
 #endif
             uint64_t bp = pc - os->pc_adjust;
-            if (have && (nw = exec_bp_hit(ex, cov, bp, w)) > 0) {
+            uint32_t probe = UINT32_MAX;
+            if (have && (nw = exec_bp_hit(ex, cov, bp, w, &probe)) > 0) {
+                if (probe != UINT32_MAX) {
+                    exec_regs_t regs;
+#if defined(__linux__)
+                    to_exec_regs(&r, &regs);
+#else
+                    state_regs(&r.st, &regs);
+#endif
+                    exec_probe_log(ex, probe, &regs, rd_mem, &t);
+                }
                 bool restored = true;
                 for (size_t i = 0; i < nw; i++)
                     restored = restored && tgt_write(&t, w[i].addr, w[i].bytes, w[i].len);
