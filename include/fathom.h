@@ -117,6 +117,8 @@ typedef struct {
      * pointer.  Loads from code sections read data and are not code roots.
      */
     bool               ref_is_addr;
+    /* x86 `jmp [table + index*8]`: the table of absolute targets, else 0. */
+    uint64_t           jt_table;
     int64_t            cmp_imm;        /* constant compared against, if has_cmp_imm */
     bool               has_cmp_imm;
     bool               is_conditional;
