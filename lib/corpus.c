@@ -45,25 +45,42 @@ static uint64_t sanitize_hash(uint64_t h)
     return h == 0 ? 1 : h;
 }
 
+static int hashset_grow(fathom_hashset_t *hs)
+{
+    size_t cap = hs->capacity * 2;
+    uint64_t *slots = calloc(cap, sizeof(uint64_t));
+    if (!slots)
+        return -1;
+    for (size_t i = 0; i < hs->capacity; i++) {
+        uint64_t h = hs->slots[i];
+        if (!h)
+            continue;
+        size_t idx = (size_t)(h % cap);
+        while (slots[idx])
+            idx = (idx + 1) % cap;
+        slots[idx] = h;
+    }
+    free(hs->slots);
+    hs->slots    = slots;
+    hs->capacity = cap;
+    return 0;
+}
+
 int fathom_hashset_insert(fathom_hashset_t *hs, uint64_t hash)
 {
+    if (fathom_hashset_contains(hs, hash))
+        return 0;   /* already present */
+
+    if (hs->count + 1 > hs->capacity * 3 / 4 && hashset_grow(hs) < 0)
+        return -1;
+
     hash = sanitize_hash(hash);
-
-    if (hs->count >= hs->capacity * 3 / 4)
-        return -1;  /* too full */
-
     size_t idx = (size_t)(hash % hs->capacity);
-    for (size_t i = 0; i < hs->capacity; i++) {
-        size_t slot = (idx + i) % hs->capacity;
-        if (hs->slots[slot] == 0) {
-            hs->slots[slot] = hash;
-            hs->count++;
-            return 1;   /* newly inserted */
-        }
-        if (hs->slots[slot] == hash)
-            return 0;   /* already present */
-    }
-    return -1;  /* should not reach here if load < 75% */
+    while (hs->slots[idx])
+        idx = (idx + 1) % hs->capacity;
+    hs->slots[idx] = hash;
+    hs->count++;
+    return 1;
 }
 
 bool fathom_hashset_contains(const fathom_hashset_t *hs, uint64_t hash)

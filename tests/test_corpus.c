@@ -260,6 +260,32 @@ static void test_crash_dedup_same_hash(void)
     PASS("crash_dedup_same_hash");
 }
 
+/* ── Test: crash dedup past the initial table size ──────────────────── */
+
+static void test_crash_dedup_many(void)
+{
+    make_tmpdir();
+    char outdir[512];
+    snprintf(outdir, sizeof(outdir), "%s/out", g_tmpdir);
+
+    fathom_corpus_t corpus;
+    assert(fathom_corpus_init(&corpus, NULL, outdir) == 0);
+
+    const uint8_t data[] = "X";
+    const size_t n = 5000;
+    for (size_t i = 0; i < n; i++)
+        assert(fathom_corpus_save_crash(&corpus, data, 1, 0x1000 + i) == 1);
+    assert(corpus.unique_crashes == n);
+
+    /* A known crash stays a duplicate, not an error, once the set is large. */
+    assert(fathom_corpus_save_crash(&corpus, data, 1, 0x1000) == 0);
+    assert(corpus.unique_crashes == n);
+
+    fathom_corpus_destroy(&corpus);
+    rmrf(g_tmpdir);
+    PASS("crash_dedup_many");
+}
+
 /* ── Test: crash dedup — different hashes ───────────────────────────── */
 
 static void test_crash_dedup_diff_hash(void)
@@ -395,6 +421,7 @@ int main(void)
     test_next_empty();
     test_crash_dedup_same_hash();
     test_crash_dedup_diff_hash();
+    test_crash_dedup_many();
     test_crash_hash_zero();
     test_crash_file_contents();
     test_destroy();
