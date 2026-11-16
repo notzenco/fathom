@@ -508,6 +508,16 @@ int fathom_mutate(fathom_mutator_t *mut, uint8_t *buf, size_t *len,
     if (!mut || !buf || !len)
         return -1;
 
+    /* Every strategy edits existing bytes, so an empty input would never change. */
+    if (*len == 0 && max_len > 0) {
+        size_t n = 1 + rand_below(&mut->rng, 8);
+        if (n > max_len)
+            n = max_len;
+        for (size_t i = 0; i < n; i++)
+            buf[i] = (uint8_t)rand_below(&mut->rng, 256);
+        *len = n;
+    }
+
     bool have_splice = (splice != NULL && splice_len > 0);
     bool have_dict   = (mut->dict != NULL && mut->dict->count > 0) ||
                        (mut->frontier != NULL && mut->frontier->count > 0);
