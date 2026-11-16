@@ -49,6 +49,40 @@ static int hash_grow(struct fathom_exec_os *os)
 
 /* ── Init / Destroy ─────────────────────────────────────────────────── */
 
+/* Copy of argv with every "@@" replaced by path, NULL-terminated. */
+static char **substitute_input(char *const *argv, const char *path)
+{
+    size_t argc = 0;
+    while (argv[argc])
+        argc++;
+    char **out = calloc(argc + 1, sizeof(*out));
+    if (!out)
+        return NULL;
+    for (size_t i = 0; i < argc; i++) {
+        size_t n = 0;
+        for (const char *p = argv[i]; (p = strstr(p, "@@")); p += 2)
+            n++;
+        size_t len = strlen(argv[i]) + n * strlen(path) + 1;
+        if (!(out[i] = malloc(len))) {
+            for (size_t k = 0; k < i; k++)
+                free(out[k]);
+            free(out);
+            return NULL;
+        }
+        char *d = out[i];
+        for (const char *p = argv[i]; *p;) {
+            if (p[0] == '@' && p[1] == '@') {
+                d += sprintf(d, "%s", path);
+                p += 2;
+            } else {
+                *d++ = *p++;
+            }
+        }
+        *d = '\0';
+    }
+    return out;
+}
+
 int fathom_exec_init(fathom_exec_t *ex, const fathom_config_t *cfg,
                      const fathom_binary_t *bin)
 {
@@ -110,8 +144,15 @@ int fathom_exec_init(fathom_exec_t *ex, const fathom_config_t *cfg,
         os->pc_adjust = 1;           /* PC is reported after the int3 */
     }
 
+    for (size_t i = 0; cfg->target_argv[i]; i++)
+        os->input_by_path |= strstr(cfg->target_argv[i], "@@") != NULL;
     if (exec_os_init(ex) < 0)
         goto fail;
+    if (os->input_by_path) {
+        if (!(os->argv = substitute_input(cfg->target_argv, os->input_path)))
+            goto fail;
+        ex->target_argv = os->argv;
+    }
     return 0;
 
 fail:
@@ -134,6 +175,9 @@ void fathom_exec_destroy(fathom_exec_t *ex)
         free(ex->os->follow_off);
         free(ex->os->bp_follow);
         free(ex->os->disarmed);
+        for (size_t i = 0; ex->os->argv && ex->os->argv[i]; i++)
+            free(ex->os->argv[i]);
+        free(ex->os->argv);
         free(ex->os);
     }
     free(ex->bp_addrs);

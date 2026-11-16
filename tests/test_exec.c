@@ -300,6 +300,26 @@ static void test_disarm(void)
     END();
 }
 
+/* `@@` in the arguments becomes the input file's path; stdin is empty. */
+static void test_file_input(void)
+{
+    BEGIN("input_file_argument");
+    target_t t;
+    fathom_exec_result_t res;
+    memset(&t, 0, sizeof(t));
+    char *argv[] = { (char *)TARGET("file_input"), "--in=@@", NULL };
+    fathom_config_t cfg = { .target_path = argv[0], .target_argv = argv, .timeout_ms = 2000 };
+    CHECK(fathom_binary_open(&t.bin, argv[0]) == 0 &&
+          fathom_exec_init(&t.ex, &cfg, &t.bin) == 0, "load failed");
+    CHECK(fathom_exec_run(&t.ex, NULL, (const uint8_t *)"A", 1, &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_OK, "the target did not get a readable file");
+    CHECK(fathom_exec_run(&t.ex, NULL, (const uint8_t *)"C", 1, &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_CRASH, "the file did not hold the input");
+    fathom_exec_destroy(&t.ex);
+    fathom_binary_close(&t.bin);
+    END();
+}
+
 /* Trimming drops bytes that do not change the path. */
 static void test_trim(void)
 {
@@ -414,6 +434,7 @@ int main(void)
     test_trim();
     test_loop_counts();
     test_disarm();
+    test_file_input();
 #ifndef _WIN32
     test_reexec();
     test_forked_children();

@@ -754,7 +754,10 @@ int exec_os_init(fathom_exec_t *ex)
         perror("fathom: mkstemp");
         return -1;
     }
-    unlink(path);
+    if (os->input_by_path)
+        snprintf(os->input_path, sizeof(os->input_path), "%s", path);
+    else
+        unlink(path);
     fcntl(os->input_fd, F_SETFD, FD_CLOEXEC);
 
     struct sigaction sa;
@@ -770,6 +773,8 @@ void exec_os_destroy(fathom_exec_t *ex)
     if (ex->os->input_fd > 0)
         close(ex->os->input_fd);
     ex->os->input_fd = -1;
+    if (ex->os->input_path[0])
+        unlink(ex->os->input_path);
 }
 
 int exec_os_write_input(fathom_exec_t *ex, const uint8_t *data, size_t len)
@@ -793,8 +798,8 @@ static void child_exec(fathom_exec_t *ex)
     /* Own process group: Ctrl-C and group signals aimed at fathom miss the target. */
     setpgid(0, 0);
 
-    int fd = ex->os->input_fd;
-    if (dup2(fd, STDIN_FILENO) < 0 || lseek(STDIN_FILENO, 0, SEEK_SET) < 0)
+    int fd = ex->os->input_by_path ? open("/dev/null", O_RDONLY) : ex->os->input_fd;
+    if (fd < 0 || dup2(fd, STDIN_FILENO) < 0 || lseek(STDIN_FILENO, 0, SEEK_SET) < 0)
         _exit(127);
     int devnull = open("/dev/null", O_WRONLY);
     if (devnull >= 0) {

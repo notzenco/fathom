@@ -156,13 +156,22 @@ int exec_os_init(fathom_exec_t *ex)
         fprintf(stderr, "fathom: GetTempFileName failed (%lu)\n", GetLastError());
         return -1;
     }
+    /*
+     * A target opening the file by path (@@) would not pass
+     * FILE_SHARE_DELETE, which delete-on-close requires; that file is
+     * deleted in exec_os_destroy instead.
+     */
     os->input = CreateFileA(path, GENERIC_READ | GENERIC_WRITE,
                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                             &sa, CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
-    os->devnull = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            FILE_ATTRIBUTE_TEMPORARY |
+                            (os->input_by_path ? 0 : FILE_FLAG_DELETE_ON_CLOSE), NULL);
+    if (os->input_by_path)
+        snprintf(os->input_path, sizeof(os->input_path), "%s", path);
+    os->devnull = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
                               &sa, OPEN_EXISTING, 0, NULL);
-    os->cmdline = fathom_win_cmdline(ex->target_argv);
+    os->cmdline = NULL;   /* built at the first run, once argv has its input path */
     os->job = CreateJobObjectA(NULL, NULL);
     if (os->job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION lim;
@@ -171,8 +180,7 @@ int exec_os_init(fathom_exec_t *ex)
         SetInformationJobObject(os->job, JobObjectExtendedLimitInformation,
                                 &lim, sizeof(lim));
     }
-    if (os->input == INVALID_HANDLE_VALUE || os->devnull == INVALID_HANDLE_VALUE ||
-        !os->cmdline) {
+    if (os->input == INVALID_HANDLE_VALUE || os->devnull == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "fathom: cannot set up target I/O (%lu)\n", GetLastError());
         return -1;
     }
@@ -189,6 +197,8 @@ void exec_os_destroy(fathom_exec_t *ex)
     if (os->job)
         CloseHandle(os->job);
     free(os->cmdline);
+    if (os->input_path[0])
+        DeleteFileA(os->input_path);
     os->job = NULL;
     os->input = os->devnull = NULL;
     os->cmdline = NULL;
@@ -324,10 +334,12 @@ int exec_os_run(fathom_exec_t *ex, fathom_coverage_t *cov,
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = os->input;
+    si.hStdInput = os->input_by_path ? os->devnull : os->input;
     si.hStdOutput = os->devnull;
     si.hStdError = os->devnull;
 
+    if (!os->cmdline && !(os->cmdline = fathom_win_cmdline(ex->target_argv)))
+        return -1;
     /* CreateProcess may modify the command line buffer. */
     char *cmd = _strdup(os->cmdline);
     if (!cmd)
