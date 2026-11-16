@@ -124,6 +124,10 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
   blocks whose branch still has an uncovered side, favouring blocks
   reached most recently. This keeps a statically linked runtime's
   comparisons from drowning out the target's.
+- **Jump tables**: the indirect jump of a dense `switch` gets an edge to
+  every case, decoded from the table for x86-64 (PIC relative and no-PIE
+  absolute) and arm64 (scaled byte, halfword and word entries). Without
+  this, case blocks would be unreachable and uninstrumented.
 - **CFG** with back-edge (loop) detection and immediate dominators.
 
 ## Fuzzing
@@ -302,8 +306,9 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
 - **Inputs arrive on stdin only.** File-path (`@@`) delivery is not
   implemented.
 - **64-bit only.** 32-bit x86/ARM and big-endian targets are rejected.
-- Linear-sweep disassembly can miss code reached only through indirect
-  jumps; those blocks are left uninstrumented.
+- Code reached only through indirect jumps other than recognised jump
+  tables (function pointers stored in data, computed gotos) is left
+  uninstrumented.
 - Descendants that leave the target's process group (`setsid`) are not
   killed at the end of a run. On Linux, forked children are not covered.
 

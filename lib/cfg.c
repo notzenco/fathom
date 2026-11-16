@@ -43,6 +43,194 @@ static bool is_padding(const fathom_insn_t *insn)
     return strcmp(insn->mnemonic, "nop") == 0 || strcmp(insn->mnemonic, "int3") == 0;
 }
 
+/* ── Step 0: Jump tables ─────────────────────────────────────────────── */
+
+/*
+ * A switch compiles to an indirect jump through a table of targets.
+ * The shapes recognised, in the few instructions before the jump:
+ *
+ *   x86-64, PIC     lea T; movsxd r, [T + i*4]; add r, T; jmp r
+ *                   (int32 entries relative to T)
+ *   x86-64, no-PIE  jmp [T + i*8]                 (absolute entries)
+ *   arm64           adrp+add T; ldr{b,h,,sb,sh,sw} e, [T, i];
+ *                   adr L; add r, L, e, lsl #2; br r
+ *                   (entries are instruction counts from L)
+ *
+ * The entry count comes from the bounds check (`cmp i, #N`) just before.
+ * Every target must be a decoded instruction; entries are read up to the
+ * bound, or until the first that is not, and at least two are needed.
+ */
+#define JT_LOOKBACK   12     /* instructions before the jump holding the table setup */
+#define JT_BOUND_BACK 24     /* instructions before the jump to find the bounds check */
+#define JT_MAX        1024   /* entries read from one table */
+
+typedef struct {
+    size_t    insn;          /* index of the indirect jump */
+    uint64_t *targets;
+    size_t    n;
+} jtab_t;
+
+typedef struct {
+    jtab_t *v;
+    size_t  n;
+    size_t  total;           /* targets over all tables */
+} jtabs_t;
+
+static bool read_va(const fathom_binary_t *bin, uint64_t addr, void *out, size_t n)
+{
+    for (size_t i = 0; i < bin->section_count; i++) {
+        const fathom_section_t *s = &bin->sections[i];
+        if (addr >= s->addr && addr - s->addr <= s->size && n <= s->size - (addr - s->addr) &&
+            s->offset + (addr - s->addr) + n <= bin->image_len) {
+            memcpy(out, bin->image + s->offset + (addr - s->addr), n);
+            return true;
+        }
+    }
+    return false;
+}
+
+static int64_t read_entry(const uint8_t *p, size_t width, bool sign)
+{
+    uint64_t v = 0;
+    for (size_t i = 0; i < width; i++)
+        v |= (uint64_t)p[i] << (8 * i);
+    if (sign && width < 8 && (v >> (8 * width - 1)) & 1)
+        v |= ~0ULL << (8 * width);
+    return (int64_t)v;
+}
+
+static bool has_prefix(const char *s, const char *p)
+{
+    return strncmp(s, p, strlen(p)) == 0;
+}
+
+/* Read up to max entries; returns how many lead to decoded instructions. */
+static size_t read_table(const fathom_disasm_t *dis, const fathom_binary_t *bin,
+                         uint64_t table, size_t width, bool sign, uint64_t base,
+                         unsigned shift, bool absolute, size_t max, uint64_t *out)
+{
+    size_t n = 0;
+    for (; n < max; n++) {
+        uint8_t raw[8];
+        if (!read_va(bin, table + n * width, raw, width))
+            break;
+        int64_t e = read_entry(raw, width, sign);
+        uint64_t t = absolute ? (uint64_t)e : base + (uint64_t)(e * ((int64_t)1 << shift));
+        if (fathom_disasm_find(dis, t) == (size_t)-1)
+            break;
+        out[n] = t;
+    }
+    return n;
+}
+
+static size_t decode_table(const fathom_disasm_t *dis, const fathom_binary_t *bin,
+                           size_t j, uint64_t *out)
+{
+    const fathom_insn_t *jmp = &dis->insns[j];
+    size_t max = JT_MAX;
+    for (size_t k = 1; k <= JT_BOUND_BACK && k <= j; k++) {
+        const fathom_insn_t *c = &dis->insns[j - k];
+        if (c->has_cmp_imm && strcmp(c->mnemonic, "cmp") == 0) {
+            if (c->cmp_imm >= 1 && c->cmp_imm < JT_MAX)
+                max = (size_t)c->cmp_imm + 1;
+            break;
+        }
+    }
+
+    if (jmp->jt_table)
+        return read_table(dis, bin, jmp->jt_table, 8, false, 0, 0, true, max, out);
+
+    uint64_t table = 0, label = 0;
+    const char *load = NULL;
+    for (size_t k = 1; k <= JT_LOOKBACK && k <= j; k++) {
+        const fathom_insn_t *p = &dis->insns[j - k];
+        if (p->kind != FATHOM_INSN_OTHER)
+            break;
+        if (p->ref_is_addr && strcmp(p->mnemonic, "adr") == 0 && !label)
+            label = p->ref_target;
+        else if (p->ref_is_addr && !table)
+            table = p->ref_target;
+        else if (!load && (has_prefix(p->mnemonic, "ldr") || has_prefix(p->mnemonic, "movs")))
+            load = p->mnemonic;
+    }
+    if (!table || !load)
+        return 0;
+
+    if (dis->arch == FATHOM_ARCH_X86_64)
+        return read_table(dis, bin, table, 4, true, table, 0, false, max, out);
+    if (!label)
+        return 0;
+
+    size_t width = strstr(load, "b") ? 1 : strstr(load, "h") ? 2 : 4;
+    bool sign = has_prefix(load, "ldrs");
+    size_t n = read_table(dis, bin, table, width, sign, label, 2, false, max, out);
+    if (!sign && width < 4 && n < max) {
+        /* gcc sign-extends byte and halfword entries when it adds them. */
+        uint64_t *alt = malloc(max * sizeof(*alt));
+        size_t m = alt ? read_table(dis, bin, table, width, true, label, 2, false, max, alt) : 0;
+        if (m > n) {
+            memcpy(out, alt, m * sizeof(*out));
+            n = m;
+        }
+        free(alt);
+    }
+    return n;
+}
+
+static int cmp_u64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void free_jtabs(jtabs_t *jt)
+{
+    for (size_t i = 0; i < jt->n; i++)
+        free(jt->v[i].targets);
+    free(jt->v);
+    memset(jt, 0, sizeof(*jt));
+}
+
+static int find_jtabs(const fathom_disasm_t *dis, const fathom_binary_t *bin, jtabs_t *jt)
+{
+    memset(jt, 0, sizeof(*jt));
+    if (!bin)
+        return 0;
+    uint64_t *buf = malloc(JT_MAX * sizeof(*buf));
+    if (!buf)
+        return -1;
+    for (size_t j = 0; j < dis->count; j++) {
+        const fathom_insn_t *insn = &dis->insns[j];
+        if (insn->kind != FATHOM_INSN_BRANCH || insn->is_conditional || insn->branch_target)
+            continue;
+        size_t n = decode_table(dis, bin, j, buf);
+        if (n < 2)
+            continue;
+
+        /* Unused values all lead to the default case: keep each target once. */
+        qsort(buf, n, sizeof(*buf), cmp_u64);
+        size_t u = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (u == 0 || buf[i] != buf[u - 1])
+                buf[u++] = buf[i];
+        }
+        jtab_t *v = realloc(jt->v, (jt->n + 1) * sizeof(*v));
+        if (v)
+            jt->v = v;
+        uint64_t *t = malloc(u * sizeof(*t));
+        if (!v || !t) {
+            free(t);
+            free(buf);
+            return -1;   /* the caller frees jt */
+        }
+        memcpy(t, buf, u * sizeof(*t));
+        jt->v[jt->n++] = (jtab_t){ j, t, u };
+        jt->total += u;
+    }
+    free(buf);
+    return 0;
+}
+
 /* ── Step 1: Identify block leaders ──────────────────────────────────── */
 
 /*
@@ -56,6 +244,7 @@ static bool is_padding(const fathom_insn_t *insn)
  *   - The first instruction after inter-function padding
  *   - The entry point, function symbols and code addresses taken by
  *     lea/adr, which analysis uses as reachability roots
+ *   - Jump table targets
  *
  * We collect leader indices in a sorted, deduplicated boolean array.
  */
@@ -68,7 +257,7 @@ static void mark_root(const fathom_disasm_t *dis, bool *is_leader, bool *is_targ
 }
 
 static bool *mark_leaders(const fathom_disasm_t *dis, const fathom_binary_t *bin,
-                          size_t *n_leaders)
+                          const jtabs_t *jt, size_t *n_leaders)
 {
     bool *is_leader = calloc(dis->count, sizeof(bool));
     bool *is_target = calloc(dis->count, sizeof(bool));
@@ -80,6 +269,11 @@ static bool *mark_leaders(const fathom_disasm_t *dis, const fathom_binary_t *bin
 
     /* First instruction is always a leader */
     is_leader[0] = true;
+
+    for (size_t t = 0; t < jt->n; t++) {
+        for (size_t k = 0; k < jt->v[t].n; k++)
+            mark_root(dis, is_leader, is_target, jt->v[t].targets[k]);
+    }
 
     /* Analysis roots must start blocks, or no block is found to instrument. */
     if (bin) {
@@ -207,13 +401,14 @@ static bool falls_into_next(const fathom_cfg_t *cfg, size_t i)
 
 /* ── Step 3: Build edges ─────────────────────────────────────────────── */
 
-static int build_edges(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
+static int build_edges(fathom_cfg_t *cfg, const fathom_disasm_t *dis, const jtabs_t *jt)
 {
     /*
-     * Worst case: each block can have at most 2 successor edges
-     * (conditional branch: fall-through + taken).
+     * At most 2 successor edges per block (conditional branch:
+     * fall-through + taken), plus one per jump table target.
      */
-    size_t max_edges = cfg->block_count * 2;
+    size_t max_edges = cfg->block_count * 2 + jt->total;
+    size_t next_jt = 0;
     cfg->edges = calloc(max_edges, sizeof(fathom_edge_t));
     if (!cfg->edges)
         return -1;
@@ -253,7 +448,20 @@ static int build_edges(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
                         edge_idx++;
                     }
                 }
-                /* indirect jmp with target==0: no edges (can't resolve) */
+                /* Indirect: edges only through a decoded jump table. */
+                size_t at = b->insn_start + b->insn_count - 1;
+                while (next_jt < jt->n && jt->v[next_jt].insn < at)
+                    next_jt++;
+                if (next_jt < jt->n && jt->v[next_jt].insn == at) {
+                    for (size_t k = 0; k < jt->v[next_jt].n; k++) {
+                        uint32_t target = find_block_by_addr(cfg, jt->v[next_jt].targets[k]);
+                        if (target != (uint32_t)-1) {
+                            cfg->edges[edge_idx].from = b->id;
+                            cfg->edges[edge_idx].to   = target;
+                            edge_idx++;
+                        }
+                    }
+                }
             }
             break;
 
@@ -673,20 +881,26 @@ int fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis,
         return -1;
     }
 
+    /* Step 0: Jump tables, whose targets are leaders and successors */
+    jtabs_t jt;
+    if (find_jtabs(dis, bin, &jt) < 0) {
+        free_jtabs(&jt);
+        return -1;
+    }
+
     /* Step 1: Mark leaders */
     size_t n_leaders = 0;
-    bool *is_leader = mark_leaders(dis, bin, &n_leaders);
-    if (!is_leader)
-        return -1;
-
-    if (n_leaders == 0) {
+    bool *is_leader = mark_leaders(dis, bin, &jt, &n_leaders);
+    if (!is_leader || n_leaders == 0) {
         free(is_leader);
+        free_jtabs(&jt);
         return -1;
     }
 
     /* Step 2: Build basic blocks */
     if (build_blocks(cfg, dis, is_leader, n_leaders) != 0) {
         free(is_leader);
+        free_jtabs(&jt);
         fathom_cfg_free(cfg);
         return -1;
     }
@@ -694,7 +908,9 @@ int fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis,
     free(is_leader);
 
     /* Step 3: Build edges */
-    if (build_edges(cfg, dis) != 0) {
+    int rc = build_edges(cfg, dis, &jt);
+    free_jtabs(&jt);
+    if (rc != 0) {
         fathom_cfg_free(cfg);
         return -1;
     }

@@ -96,6 +96,9 @@ targets: $(TARGET_BINS)
 tests/targets/%$(EXE): tests/targets/%.c
 	$(CC) $(TARGET_FLAGS) -o $@ $<
 
+# Optimised, so its switch becomes a jump table.
+tests/targets/switch_table$(EXE): TARGET_FLAGS += -O2
+
 # ── Test runner ──────────────────────────────────────────────────────
 
 test: targets $(TEST_BINS)

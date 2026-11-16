@@ -149,12 +149,57 @@ static void test_no_block_cap(void)
     free(insns);
 }
 
+/*
+ * A dense switch compiles to a jump table: its cases are successors of
+ * the indirect jump, so they are reachable and instrumented.
+ */
+static void test_jump_table(void)
+{
+    printf("=== test_jump_table ===\n");
+#ifdef _WIN32
+    const char *path = "tests/targets/switch_table.exe";
+#else
+    const char *path = "tests/targets/switch_table";
+#endif
+    fathom_binary_t bin;
+    fathom_disasm_t dis;
+    fathom_cfg_t cfg;
+    fathom_analysis_t ana;
+    if (fathom_binary_open(&bin, path) < 0) {
+        CHECK(0, "switch_table not built (run `make targets`)");
+        return;
+    }
+    CHECK(fathom_disasm_open(&dis, &bin) == 0, "disasm");
+    CHECK(fathom_cfg_build(&cfg, &dis, &bin) == 0, "cfg");
+    CHECK(fathom_analyze(&ana, &cfg, &bin, &dis) == 0, "analyze");
+
+    size_t fan = 0;
+    const fathom_block_t *sw = NULL;
+    for (size_t i = 0; i < cfg.block_count; i++) {
+        if (cfg.blocks[i].succ_count > fan) {
+            fan = cfg.blocks[i].succ_count;
+            sw = &cfg.blocks[i];
+        }
+    }
+    CHECK(fan >= 12, "the switch block should have a successor per case");
+    CHECK(sw && sw->score > 0, "fan-out should score");
+    for (size_t k = 0; sw && k < sw->succ_count; k++)
+        CHECK(instrumented(&ana, &cfg, cfg.blocks[sw->succs[k]].start_addr),
+              "every case should be instrumented");
+
+    fathom_analysis_free(&ana);
+    fathom_cfg_free(&cfg);
+    fathom_disasm_close(&dis);
+    fathom_binary_close(&bin);
+}
+
 int main(void)
 {
     test_data_load_not_a_root();
     test_lea_is_a_root();
     test_mid_block_entry();
     test_no_block_cap();
+    test_jump_table();
 
     if (failures) {
         printf("%d check(s) failed\n", failures);

@@ -79,6 +79,10 @@ static void decode_x86(const cs_insn *ci, fathom_insn_t *fi)
         } else if (op->type == X86_OP_IMM &&
             (fi->kind == FATHOM_INSN_BRANCH || fi->kind == FATHOM_INSN_CALL))
             fi->branch_target = (uint64_t)op->imm;
+        else if (op->type == X86_OP_MEM && fi->kind == FATHOM_INSN_BRANCH &&
+                 op->mem.base == X86_REG_INVALID && op->mem.index != X86_REG_INVALID &&
+                 op->mem.scale == 8 && op->mem.disp > 0)
+            fi->jt_table = (uint64_t)op->mem.disp;
         else if (op->type == X86_OP_MEM && op->mem.base == X86_REG_RIP &&
                  op->mem.index == X86_REG_INVALID) {
             fi->ref_target = ci->address + ci->size + (uint64_t)op->mem.disp;
