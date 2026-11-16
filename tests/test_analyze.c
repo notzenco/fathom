@@ -187,6 +187,22 @@ static void test_jump_table(const char *path)
     /* Every case starts by calling its case_N function: wrong targets would not. */
     CHECK(calls >= 12, "jump table targets should be the case blocks");
 
+    /* On failure, show the code before each indirect jump: a shape not decoded yet. */
+    for (size_t j = 0; failures && j < dis.count; j++) {
+        const fathom_insn_t *in = &dis.insns[j];
+        if (in->kind != FATHOM_INSN_BRANCH || in->is_conditional || in->branch_target)
+            continue;
+        printf("  indirect jump at 0x%llx:\n", (unsigned long long)in->addr);
+        for (size_t k = j > 12 ? j - 12 : 0; k <= j; k++) {
+            const fathom_insn_t *p = &dis.insns[k];
+            printf("    0x%llx %-8s ref=0x%llx%s cmp=%lld%s shift=%u%s\n",
+                   (unsigned long long)p->addr, p->mnemonic,
+                   (unsigned long long)p->ref_target, p->ref_is_addr ? "(addr)" : "",
+                   (long long)p->cmp_imm, p->has_cmp_imm ? "" : "(none)",
+                   p->op_shift, p->op_sext ? " sext" : "");
+        }
+    }
+
     fathom_analysis_free(&ana);
     fathom_cfg_free(&cfg);
     fathom_disasm_close(&dis);
