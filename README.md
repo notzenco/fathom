@@ -207,6 +207,10 @@ Options:
   --trim      Shrink queue inputs that keep the same blocks (off by
               default: coverage cannot see loop counts)
   -a          Analysis-only mode (print CFG + scores, no fuzzing)
+  --max-execs <n> Stop after n target runs
+  --max-input <n> Largest input to generate, in bytes (default: 1048576)
+  --fail-on-crash Exit with status 2 if any unique crash was found
+  --version   Show the version
   --replay <f>    Run input f once and report the outcome (exit
                   status 0 ok, 2 crash, 3 hang)
   --minimize <f>  Shrink crashing input f to f.min, keeping the crash
@@ -227,8 +231,11 @@ The output directory holds `queue/`
 (inputs that found new coverage), `crashes/` (one file per unique crash,
 plus a `.txt` report naming the signal or exception, the function it
 happened in and the command that replays it), `hangs/` (inputs that
-timed out, one per distinct path, at most 256) and `fuzzer_stats`
-(executions, coverage, crashes, hangs and time to first crash).
+timed out, one per distinct path, at most 256) and `fuzzer_stats`,
+rewritten every second: executions and their rate, coverage, crashes,
+hangs, time to first crash and to the last coverage gain, and how often
+each mutation strategy ran and found new coverage. `-v` also prints each
+coverage gain as it happens.
 
 To look at a crash again, or shrink it to the bytes that matter:
 

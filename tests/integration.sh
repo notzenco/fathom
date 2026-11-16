@@ -125,6 +125,19 @@ if [ -n "$crash" ]; then
     else
         ok "replay: crash replays, minimises to FUZZ and has a report"
     fi
+
+    set +e
+    "$FATHOM" -i "$out/run/queue" -o "$out/again" -T 30 --until-crash --fail-on-crash \
+        -- "$TARGETS/maze$EXE" 2>/dev/null
+    again_rc=$?
+    set -e
+    if [ "$again_rc" -ne 2 ]; then
+        fail "--fail-on-crash: exit status $again_rc, expected 2"
+    elif [ -z "$(stat_of "$out/again" execs_per_sec)" ]; then
+        fail "fuzzer_stats has no execs_per_sec"
+    else
+        ok "--fail-on-crash exits 2, fuzzer_stats is complete"
+    fi
 fi
 
 # ── Classic memory-safety targets (crash behaviour varies by libc) ───
