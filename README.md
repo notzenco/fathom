@@ -163,8 +163,11 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
 - Hangs are detected per run with a timeout (`-t`). Targets run in their
   own process group, so Ctrl-C and group signals are never miscounted as
   crashes.
-- Parallel mode (`-j`) runs isolated worker processes with sharded output
-  directories.
+- Parallel mode (`-j`) runs worker processes with sharded output
+  directories. Every 10 seconds each worker runs the queue entries its
+  peers added and keeps those that reach something new for it; a crash a
+  peer already saved is not saved again; and with `--until-crash` the
+  first worker to find one stops them all.
 
 ## Quick start
 

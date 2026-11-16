@@ -461,6 +461,11 @@ void fathom_corpus_remove(fathom_corpus_t *corpus, size_t idx);
 uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx);
 int  fathom_corpus_save_crash(fathom_corpus_t *corpus, const uint8_t *data,
                               size_t len, uint64_t hash);
+/*
+ * Remember hash as seen without saving anything (another fuzzer already
+ * saved it).  Returns 1 if it was new to this corpus.
+ */
+int  fathom_corpus_mark_crash(fathom_corpus_t *corpus, uint64_t hash);
 /* Write text as crashes/crash_<hash>.txt, next to the crash's input. */
 int  fathom_corpus_describe_crash(fathom_corpus_t *corpus, uint64_t hash, const char *text);
 /*

@@ -220,6 +220,29 @@ else
     ok "parallel: both workers ran ($w0 + $w1 execs)"
 fi
 
+info "parallel: the first crash stops every worker and is saved once"
+out=$(new_outdir parallel-crash)
+mkdir -p "$out/seeds"
+printf 'AAAA' > "$out/seeds/a"
+start=$SECONDS
+set +e
+"$FATHOM" -i "$out/seeds" -o "$out/run" -t 1000 -T 120 -j 2 -s 1 --until-crash \
+    -- "$TARGETS/maze$EXE" 2>"$out/log"
+rc=$?
+set -e
+took=$((SECONDS - start))
+crashes=$(count_crashes "$out/run")
+if [ "$rc" -ne 0 ]; then
+    fail "parallel-crash: fathom exited with status $rc"
+    tail -5 "$out/log"
+elif [ "$crashes" -ne 1 ]; then
+    fail "parallel-crash: $crashes crash files across workers, expected 1"
+elif [ "$took" -ge 110 ]; then
+    fail "parallel-crash: workers ran on to the time limit (${took}s)"
+else
+    ok "parallel-crash: stopped after ${took}s with one saved crash"
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────
 
 echo

@@ -695,3 +695,9 @@ int fathom_corpus_save_hang(fathom_corpus_t *corpus, const uint8_t *data,
     }
     return 1;
 }
+
+int fathom_corpus_mark_crash(fathom_corpus_t *corpus, uint64_t hash)
+{
+    (void)corpus;
+    return g_crash_hashes_ready ? fathom_hashset_insert(&g_crash_hashes, hash) : -1;
+}
