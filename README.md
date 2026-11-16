@@ -225,6 +225,10 @@ The output directory holds `queue/`
 and `fuzzer_stats` (executions, coverage, crashes, hangs and time to first
 crash). With `-j`, each worker writes to `out/worker-NNN/`.
 
+Running again with the same `-o` resumes: the existing queue replaces the
+seeds from `-i`, new queue entries are numbered after it, and crashes
+already saved are not saved again.
+
 ## Building
 
 Fathom is C11 with one dependency,
