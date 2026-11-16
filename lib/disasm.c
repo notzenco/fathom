@@ -339,3 +339,223 @@ size_t fathom_disasm_find(const fathom_disasm_t *dis, uint64_t addr)
     }
     return (size_t)-1;
 }
+
+/* ── Comparison sites ────────────────────────────────────────────────── */
+
+/* x86-64 register to FATHOM_REG numbering; high-byte registers have none. */
+static uint8_t x86_gpr(unsigned r)
+{
+    static const struct { unsigned r[4]; } map[16] = {
+        {{ X86_REG_RAX, X86_REG_EAX, X86_REG_AX, X86_REG_AL }},
+        {{ X86_REG_RCX, X86_REG_ECX, X86_REG_CX, X86_REG_CL }},
+        {{ X86_REG_RDX, X86_REG_EDX, X86_REG_DX, X86_REG_DL }},
+        {{ X86_REG_RBX, X86_REG_EBX, X86_REG_BX, X86_REG_BL }},
+        {{ X86_REG_RSP, X86_REG_ESP, X86_REG_SP, X86_REG_SPL }},
+        {{ X86_REG_RBP, X86_REG_EBP, X86_REG_BP, X86_REG_BPL }},
+        {{ X86_REG_RSI, X86_REG_ESI, X86_REG_SI, X86_REG_SIL }},
+        {{ X86_REG_RDI, X86_REG_EDI, X86_REG_DI, X86_REG_DIL }},
+        {{ X86_REG_R8,  X86_REG_R8D,  X86_REG_R8W,  X86_REG_R8B }},
+        {{ X86_REG_R9,  X86_REG_R9D,  X86_REG_R9W,  X86_REG_R9B }},
+        {{ X86_REG_R10, X86_REG_R10D, X86_REG_R10W, X86_REG_R10B }},
+        {{ X86_REG_R11, X86_REG_R11D, X86_REG_R11W, X86_REG_R11B }},
+        {{ X86_REG_R12, X86_REG_R12D, X86_REG_R12W, X86_REG_R12B }},
+        {{ X86_REG_R13, X86_REG_R13D, X86_REG_R13W, X86_REG_R13B }},
+        {{ X86_REG_R14, X86_REG_R14D, X86_REG_R14W, X86_REG_R14B }},
+        {{ X86_REG_R15, X86_REG_R15D, X86_REG_R15W, X86_REG_R15B }},
+    };
+    for (uint8_t i = 0; i < 16; i++) {
+        for (int k = 0; k < 4; k++) {
+            if (map[i].r[k] == r)
+                return i;
+        }
+    }
+    return FATHOM_REG_NONE;
+}
+
+static uint8_t arm64_gpr(unsigned r, uint8_t *width)
+{
+    *width = 8;
+    if (r >= ARM64_REG_X0 && r <= ARM64_REG_X28)
+        return (uint8_t)(r - ARM64_REG_X0);
+    if (r == ARM64_REG_X29)
+        return 29;
+    if (r == ARM64_REG_X30)
+        return 30;
+    if (r == ARM64_REG_SP)
+        return 31;
+    if (r == ARM64_REG_XZR)
+        return FATHOM_REG_ZERO;
+    *width = 4;
+    if (r >= ARM64_REG_W0 && r <= ARM64_REG_W30)
+        return (uint8_t)(r - ARM64_REG_W0);
+    if (r == ARM64_REG_WSP)
+        return 31;
+    if (r == ARM64_REG_WZR)
+        return FATHOM_REG_ZERO;
+    return FATHOM_REG_NONE;
+}
+
+static bool x86_operand(const cs_insn *ci, const cs_x86_op *op, fathom_operand_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->index = FATHOM_REG_NONE;
+    if (op->type == X86_OP_REG) {
+        out->reg = x86_gpr(op->reg);
+        return out->reg != FATHOM_REG_NONE;
+    }
+    if (op->type != X86_OP_MEM || op->mem.segment != X86_REG_INVALID)
+        return false;
+    out->mem = true;
+    out->scale = (uint8_t)op->mem.scale;
+    out->disp = op->mem.disp;
+    if (op->mem.base == X86_REG_RIP) {
+        out->pc_rel = true;
+        out->reg = FATHOM_REG_NONE;
+        out->disp = (int64_t)(ci->address + ci->size) + op->mem.disp;
+    } else if (op->mem.base == X86_REG_INVALID) {
+        out->reg = FATHOM_REG_NONE;
+    } else if ((out->reg = x86_gpr(op->mem.base)) == FATHOM_REG_NONE) {
+        return false;
+    }
+    if (op->mem.index != X86_REG_INVALID &&
+        (out->index = x86_gpr(op->mem.index)) == FATHOM_REG_NONE)
+        return false;
+    return !out->pc_rel || out->index == FATHOM_REG_NONE;
+}
+
+/* Decode the two compared operands of a register/memory compare. */
+static bool decode_compare(const cs_insn *ci, fathom_arch_t arch, fathom_cmp_site_t *site)
+{
+    if (arch == FATHOM_ARCH_X86_64) {
+        const cs_x86 *x = &ci->detail->x86;
+        if (strcmp(ci->mnemonic, "cmp") != 0 || x->op_count != 2 ||
+            x->operands[0].type == X86_OP_IMM || x->operands[1].type == X86_OP_IMM)
+            return false;
+        site->width = x->operands[0].size;
+        return site->width > 0 && site->width <= 8 &&
+               x86_operand(ci, &x->operands[0], &site->a) &&
+               x86_operand(ci, &x->operands[1], &site->b);
+    }
+
+    const cs_arm64 *a = A64(ci->detail);
+    const char *m = ci->mnemonic;
+    /* cmn/adds compare against a negation; only the plain forms are logged. */
+    if (strcmp(m, "cmp") != 0 && strcmp(m, "subs") != 0 && strcmp(m, "ccmp") != 0)
+        return false;
+    uint8_t first = strcmp(m, "subs") == 0 ? 1 : 0;   /* subs has a destination */
+    if (a->op_count < first + 2)
+        return false;
+    const cs_arm64_op *o1 = &a->operands[first], *o2 = &a->operands[first + 1];
+    if (o1->type != ARM64_OP_REG || o2->type != ARM64_OP_REG ||
+        o2->shift.type != ARM64_SFT_INVALID || o2->ext != ARM64_EXT_INVALID)
+        return false;
+    uint8_t w1, w2;
+    memset(&site->a, 0, sizeof(site->a));
+    memset(&site->b, 0, sizeof(site->b));
+    site->a.index = site->b.index = FATHOM_REG_NONE;
+    site->a.reg = arm64_gpr(o1->reg, &w1);
+    site->b.reg = arm64_gpr(o2->reg, &w2);
+    site->width = w1;
+    return site->a.reg != FATHOM_REG_NONE && site->b.reg != FATHOM_REG_NONE && w1 == w2;
+}
+
+static const char *const bytes_funcs[][2] = {
+    /* name, whether the third argument is the length */
+    { "memcmp", "n" }, { "bcmp", "n" }, { "strncmp", "n" }, { "strncasecmp", "n" },
+    { "strcmp", "" }, { "strcasecmp", "" }, { "__memcmp_chk", "n" },
+};
+
+static bool decode_bytes_call(const fathom_binary_t *bin, const fathom_disasm_t *dis,
+                              const fathom_insn_t *insn, fathom_cmp_site_t *site)
+{
+    const char *name = fathom_resolve_call(bin, dis, insn);
+    if (!name)
+        return false;
+    for (size_t i = 0; i < sizeof(bytes_funcs) / sizeof(bytes_funcs[0]); i++) {
+        if (strcmp(name, bytes_funcs[i][0]) != 0)
+            continue;
+        /* First three integer arguments by calling convention. */
+        uint8_t args[3] = { 0, 1, 2 };                       /* arm64: x0, x1, x2 */
+        if (bin->arch == FATHOM_ARCH_X86_64 && bin->format == FATHOM_FMT_PE) {
+            args[0] = 1; args[1] = 2; args[2] = 8;           /* Win64: rcx, rdx, r8 */
+        } else if (bin->arch == FATHOM_ARCH_X86_64) {
+            args[0] = 7; args[1] = 6; args[2] = 2;           /* SysV: rdi, rsi, rdx */
+        }
+        memset(site, 0, sizeof(*site));
+        site->kind = FATHOM_CMP_BYTES;
+        site->a.reg = args[0];
+        site->b.reg = args[1];
+        site->a.index = site->b.index = FATHOM_REG_NONE;
+        site->len_reg = bytes_funcs[i][1][0] ? args[2] : FATHOM_REG_NONE;
+        return true;
+    }
+    return false;
+}
+
+static const uint8_t *code_bytes(const fathom_binary_t *bin, uint64_t addr, size_t len)
+{
+    for (size_t i = 0; i < bin->section_count; i++) {
+        const fathom_section_t *s = &bin->sections[i];
+        if ((s->flags & FATHOM_SEC_CODE) && addr >= s->addr && addr - s->addr + len <= s->size)
+            return bin->image + s->offset + (addr - s->addr);
+    }
+    return NULL;
+}
+
+long fathom_cmp_sites(const fathom_binary_t *bin, const fathom_disasm_t *dis,
+                      const fathom_cfg_t *cfg, const uint32_t *blocks, size_t nblocks,
+                      fathom_cmp_site_t **out)
+{
+    *out = NULL;
+    csh handle;
+    cs_arch arch = bin->arch == FATHOM_ARCH_ARM64 ? A64_ARCH : CS_ARCH_X86;
+    cs_mode mode = bin->arch == FATHOM_ARCH_ARM64 ? CS_MODE_LITTLE_ENDIAN : CS_MODE_64;
+    if (cs_open(arch, mode, &handle) != CS_ERR_OK)
+        return -1;
+    cs_option(handle, CS_OPT_DETAIL, CS_OPT_ON);
+    cs_insn *ci = cs_malloc(handle);
+    fathom_cmp_site_t *sites = malloc(FATHOM_MAX_CMP_SITES * sizeof(*sites));
+    long n = 0;
+    if (!ci || !sites) {
+        n = -1;
+        goto done;
+    }
+
+    for (size_t bi = 0; bi < nblocks && n < FATHOM_MAX_CMP_SITES; bi++) {
+        const fathom_block_t *b = &cfg->blocks[blocks[bi]];
+        for (size_t k = 0; k < b->insn_count && n < FATHOM_MAX_CMP_SITES; k++) {
+            const fathom_insn_t *insn = &dis->insns[b->insn_start + k];
+            fathom_cmp_site_t site;
+            memset(&site, 0, sizeof(site));
+            if (insn->kind == FATHOM_INSN_CALL) {
+                if (!decode_bytes_call(bin, dis, insn, &site))
+                    continue;
+            } else {
+                /* decode_compare rejects immediates (already dictionary tokens). */
+                if (strcmp(insn->mnemonic, "cmp") != 0 && strcmp(insn->mnemonic, "subs") != 0 &&
+                    strcmp(insn->mnemonic, "ccmp") != 0)
+                    continue;
+                const uint8_t *code = code_bytes(bin, insn->addr, insn->size);
+                size_t left = insn->size;
+                uint64_t addr = insn->addr;
+                if (!code || !cs_disasm_iter(handle, &code, &left, &addr, ci) ||
+                    !decode_compare(ci, bin->arch, &site))
+                    continue;
+                site.kind = FATHOM_CMP_VALUES;
+            }
+            site.addr = insn->addr;
+            sites[n++] = site;
+        }
+    }
+
+done:
+    if (ci)
+        cs_free(ci, 1);
+    cs_close(&handle);
+    if (n <= 0) {
+        free(sites);
+        return n;
+    }
+    *out = sites;
+    return n;
+}

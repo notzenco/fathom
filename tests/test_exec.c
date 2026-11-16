@@ -347,6 +347,58 @@ static void test_minimize(void)
     END();
 }
 
+/* Probe every comparison in t's instrumented blocks; returns the site count. */
+static long add_cmp_probes(target_t *t)
+{
+    fathom_cmp_site_t *sites;
+    long n = fathom_cmp_sites(&t->bin, &t->dis, &t->cfg, t->ana.cov_blocks,
+                              t->ana.cov_count, &sites);
+    for (long i = 0; i < n; i++)
+        fathom_exec_add_cmp_site(&t->ex, &sites[i]);
+    free(sites);
+    return n;
+}
+
+static bool log_has(const fathom_exec_t *ex, const void *needle, size_t len)
+{
+    const fathom_cmp_entry_t *log;
+    size_t n = fathom_exec_cmp_log(ex, &log);
+    for (size_t i = 0; i < n; i++) {
+        for (size_t off = 0; off + len <= log[i].len; off++) {
+            if (!memcmp(log[i].a + off, needle, len) || !memcmp(log[i].b + off, needle, len))
+                return true;
+        }
+    }
+    return false;
+}
+
+/* Comparison probes see the value an -O2 compare holds in a register, and memcmp's bytes. */
+static void test_cmp_log(void)
+{
+    BEGIN("comparison_logging");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    const uint8_t magic[4] = { 0xef, 0xbe, 0xad, 0xde };
+
+    CHECK(load_cov(&t, &cov, TARGET("o2_compare")) == 0, "load failed");
+    CHECK(add_cmp_probes(&t) > 0, "no comparison sites found");
+    CHECK(run_cov(&t, &cov, "AAAAAAAA", &res) == 0, "exec failed");
+    CHECK(!log_has(&t.ex, magic, 4), "probes log only while armed");
+    fathom_exec_arm_cmp(&t.ex, true);
+    CHECK(run_cov(&t, &cov, "AAAAAAAA", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    CHECK(log_has(&t.ex, magic, 4), "0xdeadbeef not seen at the comparison");
+    unload(&t, &cov);
+
+    CHECK(load_cov(&t, &cov, TARGET("magic_memcmp")) == 0, "load failed");
+    CHECK(add_cmp_probes(&t) > 0, "no comparison sites found");
+    fathom_exec_arm_cmp(&t.ex, true);
+    CHECK(run_cov(&t, &cov, "MAAAAAAAAAAA", &res) == 0, "exec failed");
+    CHECK(log_has(&t.ex, "SESAME", 6), "memcmp's operand not seen");
+    unload(&t, &cov);
+    END();
+}
+
 /* Trimming drops bytes that do not change the path. */
 static void test_trim(void)
 {
@@ -463,6 +515,7 @@ int main(void)
     test_disarm();
     test_file_input();
     test_minimize();
+    test_cmp_log();
 #ifndef _WIN32
     test_reexec();
     test_forked_children();

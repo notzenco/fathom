@@ -176,6 +176,11 @@ void fathom_exec_destroy(fathom_exec_t *ex)
         free(ex->os->follow_off);
         free(ex->os->bp_follow);
         free(ex->os->disarmed);
+        free(ex->os->probes);
+        free(ex->os->probe_off);
+        free(ex->os->probe_own);
+        free(ex->os->slot_probe);
+        free(ex->os->cmp_log);
         for (size_t i = 0; ex->os->argv && ex->os->argv[i]; i++)
             free(ex->os->argv[i]);
         free(ex->os->argv);
@@ -188,6 +193,8 @@ void fathom_exec_destroy(fathom_exec_t *ex)
 /* ── Breakpoints ────────────────────────────────────────────────────── */
 
 #define FOLLOW_BIT  0x80000000u   /* hash value is a follow index, not a slot */
+#define PROBE_BIT   0x40000000u   /* hash value is a probe index, not a slot */
+#define KIND_BITS   (FOLLOW_BIT | PROBE_BIT)
 
 /* Hash value for addr, or false if there is none. */
 static bool hash_get(const struct fathom_exec_os *os, uint64_t addr, uint32_t *val)
@@ -219,7 +226,7 @@ static int hash_put(struct fathom_exec_os *os, size_t entries, uint64_t addr, ui
 int exec_bp_lookup(const fathom_exec_t *ex, uint64_t addr)
 {
     uint32_t v;
-    if (!hash_get(ex->os, addr, &v) || (v & FOLLOW_BIT))
+    if (!hash_get(ex->os, addr, &v) || (v & KIND_BITS))
         return -1;
     return (int)v;
 }
@@ -238,9 +245,11 @@ static void invalidate_patch(struct fathom_exec_os *os)
     free(os->patched);
     free(os->bp_off);
     free(os->follow_off);
+    free(os->probe_off);
     os->clusters = NULL;
     os->orig = os->patched = NULL;
     os->bp_off = os->follow_off = NULL;
+    os->probe_off = NULL;
     os->n_clusters = 0;
     os->patch_ready = false;
     os->patch_stale = true;
@@ -254,7 +263,7 @@ int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
 
     uint32_t v;
     if (hash_get(os, addr, &v))
-        return v & FOLLOW_BIT ? -1 : (int)v;
+        return v & KIND_BITS ? -1 : (int)v;
 
     if (ex->bp_count >= ex->bp_capacity) {
         size_t cap = ex->bp_capacity * 2;
@@ -265,7 +274,8 @@ int fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr)
         ex->bp_capacity = cap;
     }
 
-    if (hash_put(os, ex->bp_count + os->n_follow, addr, (uint32_t)ex->bp_count) < 0)
+    if (hash_put(os, ex->bp_count + os->n_follow + os->n_probes, addr,
+                 (uint32_t)ex->bp_count) < 0)
         return -1;
     int slot = (int)ex->bp_count++;
     ex->bp_addrs[slot] = addr;
@@ -290,6 +300,60 @@ void fathom_exec_arm(fathom_exec_t *ex, int slot, bool armed)
         os->disarmed[slot] = !armed;
         os->patch_stale = true;
     }
+}
+
+int fathom_exec_add_cmp_site(fathom_exec_t *ex, const fathom_cmp_site_t *site)
+{
+    struct fathom_exec_os *os = ex->os;
+    uint32_t v;
+    bool on_slot = hash_get(os, site->addr, &v);
+    if (on_slot && (v & KIND_BITS))
+        return -1;   /* a loop-count or probe breakpoint already */
+
+    size_t k = os->n_probes;
+    fathom_cmp_site_t *p = realloc(os->probes, (k + 1) * sizeof(*p));
+    if (p)
+        os->probes = p;
+    bool *own = realloc(os->probe_own, (k + 1) * sizeof(*own));
+    if (own)
+        os->probe_own = own;
+    if (!p || !own)
+        return -1;
+
+    if (on_slot) {
+        if (os->slot_probe_len < ex->bp_count) {
+            uint32_t *sp = realloc(os->slot_probe, ex->bp_count * sizeof(*sp));
+            if (!sp)
+                return -1;
+            for (size_t i = os->slot_probe_len; i < ex->bp_count; i++)
+                sp[i] = UINT32_MAX;
+            os->slot_probe = sp;
+            os->slot_probe_len = ex->bp_count;
+        }
+        os->slot_probe[v] = (uint32_t)k;
+    } else if (hash_put(os, ex->bp_count + os->n_follow + k, site->addr,
+                        PROBE_BIT | (uint32_t)k) < 0) {
+        return -1;
+    }
+    os->probes[k] = *site;
+    os->probe_own[k] = !on_slot;
+    os->n_probes++;
+    invalidate_patch(os);
+    return (int)k;
+}
+
+void fathom_exec_arm_cmp(fathom_exec_t *ex, bool armed)
+{
+    if (ex->os->probes_armed != armed) {
+        ex->os->probes_armed = armed;
+        ex->os->patch_stale = true;
+    }
+}
+
+size_t fathom_exec_cmp_log(const fathom_exec_t *ex, const fathom_cmp_entry_t **log)
+{
+    *log = ex->os->cmp_log;
+    return ex->os->cmp_count;
 }
 
 int fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn)
@@ -319,7 +383,8 @@ int fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn)
     uint32_t *f = realloc(os->follow_slot, (k + 1) * sizeof(*f));
     if (f)
         os->follow_slot = f;
-    if (!a || !f || hash_put(os, ex->bp_count + k, next_insn, FOLLOW_BIT | (uint32_t)k) < 0)
+    if (!a || !f || hash_put(os, ex->bp_count + k + os->n_probes, next_insn,
+                             FOLLOW_BIT | (uint32_t)k) < 0)
         return -1;
     os->follow_addrs[k] = next_insn;
     os->follow_slot[k] = (uint32_t)slot;
@@ -346,20 +411,23 @@ static int cmp_slot_addr(const void *a, const void *b)
 static int build_clusters(fathom_exec_t *ex)
 {
     struct fathom_exec_os *os = ex->os;
-    size_t nb = ex->bp_count, n = nb + os->n_follow;
+    size_t nb = ex->bp_count, nf = os->n_follow, n = nb + nf + os->n_probes;
     uint64_t *addrs = malloc(n * sizeof(*addrs));
     uint32_t *order = malloc(n * sizeof(*order));
     os->clusters = malloc(n * sizeof(*os->clusters));
     os->bp_off = malloc(nb * sizeof(*os->bp_off));
-    os->follow_off = malloc((os->n_follow ? os->n_follow : 1) * sizeof(*os->follow_off));
-    if (!addrs || !order || !os->clusters || !os->bp_off || !os->follow_off) {
+    os->follow_off = malloc((nf ? nf : 1) * sizeof(*os->follow_off));
+    os->probe_off = malloc((os->n_probes ? os->n_probes : 1) * sizeof(*os->probe_off));
+    if (!addrs || !order || !os->clusters || !os->bp_off || !os->follow_off || !os->probe_off) {
         free(addrs);
         free(order);
         return -1;
     }
     memcpy(addrs, ex->bp_addrs, nb * sizeof(*addrs));
-    if (os->n_follow)
-        memcpy(addrs + nb, os->follow_addrs, os->n_follow * sizeof(*addrs));
+    if (nf)
+        memcpy(addrs + nb, os->follow_addrs, nf * sizeof(*addrs));
+    for (size_t i = 0; i < os->n_probes; i++)   /* a probe on a slot shares its bytes */
+        addrs[nb + nf + i] = os->probe_own[i] ? os->probes[i].addr : ex->bp_addrs[0];
     for (size_t i = 0; i < n; i++)
         order[i] = (uint32_t)i;
     g_sort_addrs = addrs;
@@ -383,8 +451,10 @@ static int build_clusters(fathom_exec_t *ex)
         size_t off = c->off + (size_t)(addr - c->lo);
         if (order[i] < nb)
             os->bp_off[order[i]] = off;
-        else
+        else if (order[i] < nb + nf)
             os->follow_off[order[i] - nb] = off;
+        else
+            os->probe_off[order[i] - nb - nf] = off;
         prev = addr;
     }
     total += (size_t)(c->hi - c->lo);
@@ -431,8 +501,15 @@ int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr
         memcpy(os->patched, os->orig, last->off + (size_t)(last->hi - last->lo));
         for (size_t i = 0; i < ex->bp_count; i++) {
             bool off = i < os->disarmed_len && os->disarmed[i];
+            if (off && os->probes_armed && i < os->slot_probe_len &&
+                os->slot_probe[i] != UINT32_MAX)
+                off = false;   /* its probe needs the trap */
             if (!off && !is_trap(os, os->bp_off[i]))
                 memcpy(os->patched + os->bp_off[i], os->bp_insn, os->bp_len);
+        }
+        for (size_t i = 0; os->probes_armed && i < os->n_probes; i++) {
+            if (os->probe_own[i] && !is_trap(os, os->probe_off[i]))
+                memcpy(os->patched + os->probe_off[i], os->bp_insn, os->bp_len);
         }
         os->patch_stale = false;
     }
@@ -449,13 +526,23 @@ int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr
 }
 
 size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
-                   exec_write_t w[2])
+                   exec_write_t w[2], uint32_t *probe)
 {
     struct fathom_exec_os *os = ex->os;
     uint64_t addr = pc_bp - os->slide;
     uint32_t v;
+    *probe = UINT32_MAX;
     if (os->foreign_image || !os->patch_ready || !hash_get(os, addr, &v))
         return 0;
+
+    if (v & PROBE_BIT) {
+        uint32_t k = v & ~KIND_BITS;
+        if (!os->probes_armed || is_trap(os, os->probe_off[k]))
+            return 0;
+        *probe = k;
+        w[0] = (exec_write_t){ pc_bp, os->orig + os->probe_off[k], os->bp_len };
+        return 1;
+    }
 
     if (v & FOLLOW_BIT) {
         /* The counted block's first instruction has run: re-arm it. */
@@ -467,6 +554,8 @@ size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
 
     if (is_trap(os, os->bp_off[v]))
         return 0;
+    if (os->probes_armed && v < os->slot_probe_len)
+        *probe = os->slot_probe[v];
     uint8_t hits = 1;
     if (cov && v < cov->size) {
         if (cov->local[v] < 255)
@@ -481,6 +570,90 @@ size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
         return 2;
     }
     return 1;
+}
+
+/* ── Comparison logging ─────────────────────────────────────────────── */
+
+static uint64_t reg_value(const exec_regs_t *regs, uint8_t r)
+{
+    return r < FATHOM_REG_COUNT ? regs->r[r] : 0;
+}
+
+static bool operand_bytes(const struct fathom_exec_os *os, const fathom_operand_t *op,
+                          size_t width, const exec_regs_t *regs, exec_read_fn rd,
+                          void *ctx, uint8_t *out)
+{
+    uint64_t v;
+    if (!op->mem) {
+        v = reg_value(regs, op->reg);
+    } else {
+        uint64_t addr = op->pc_rel ? (uint64_t)op->disp + os->slide
+                      : reg_value(regs, op->reg) + (uint64_t)op->disp +
+                        (op->index == FATHOM_REG_NONE ? 0
+                         : reg_value(regs, op->index) * op->scale);
+        if (!op->pc_rel && op->reg == FATHOM_REG_NONE && op->index == FATHOM_REG_NONE)
+            addr = (uint64_t)op->disp;
+        uint8_t raw[8] = {0};
+        if (!rd(ctx, addr, raw, width))
+            return false;
+        memcpy(out, raw, width);
+        return true;
+    }
+    for (size_t i = 0; i < width; i++)
+        out[i] = (uint8_t)(v >> (8 * i));
+    return true;
+}
+
+/* Read up to max bytes at addr, as many as are readable. */
+static size_t read_some(exec_read_fn rd, void *ctx, uint64_t addr, uint8_t *out, size_t max)
+{
+    if (rd(ctx, addr, out, max))
+        return max;
+    size_t n = 0;
+    while (n < max && rd(ctx, addr + n, out + n, 1))
+        n++;
+    return n;
+}
+
+void exec_probe_log(fathom_exec_t *ex, uint32_t probe, const exec_regs_t *regs,
+                    exec_read_fn rd, void *ctx)
+{
+    struct fathom_exec_os *os = ex->os;
+    if (probe >= os->n_probes || os->cmp_count >= FATHOM_CMP_LOG_MAX)
+        return;
+    if (!os->cmp_log &&
+        !(os->cmp_log = malloc(FATHOM_CMP_LOG_MAX * sizeof(*os->cmp_log))))
+        return;
+
+    const fathom_cmp_site_t *s = &os->probes[probe];
+    fathom_cmp_entry_t *e = &os->cmp_log[os->cmp_count];
+    memset(e, 0, sizeof(*e));
+    e->site = probe;
+    if (s->kind == FATHOM_CMP_VALUES) {
+        e->len = s->width;
+        if (!operand_bytes(os, &s->a, s->width, regs, rd, ctx, e->a) ||
+            !operand_bytes(os, &s->b, s->width, regs, rd, ctx, e->b) ||
+            !memcmp(e->a, e->b, e->len))
+            return;   /* unreadable, or equal: nothing to learn */
+    } else {
+        size_t max = FATHOM_CMP_MAX_BYTES;
+        if (s->len_reg != FATHOM_REG_NONE && reg_value(regs, s->len_reg) < max)
+            max = (size_t)reg_value(regs, s->len_reg);
+        size_t na = read_some(rd, ctx, reg_value(regs, s->a.reg), e->a, max);
+        size_t nb = read_some(rd, ctx, reg_value(regs, s->b.reg), e->b, max);
+        size_t n = na < nb ? na : nb;
+        if (s->len_reg == FATHOM_REG_NONE) {   /* C strings: up to the first NUL */
+            size_t la = strnlen((const char *)e->a, n), lb = strnlen((const char *)e->b, n);
+            n = la > lb ? la : lb;
+            if (n < FATHOM_CMP_MAX_BYTES)
+                n++;
+        }
+        e->bytes = true;
+        e->len = (uint8_t)n;
+        if (n < 2 || !memcmp(e->a, e->b, n))
+            return;
+    }
+    os->cmp_count++;
 }
 
 /* ── Crash hashing ──────────────────────────────────────────────────── */
@@ -549,6 +722,7 @@ int fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
                     fathom_exec_result_t *result)
 {
     memset(result, 0, sizeof(*result));
+    ex->os->cmp_count = 0;
     if (cov)
         fathom_coverage_reset_local(cov);
 

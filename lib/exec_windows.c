@@ -125,6 +125,23 @@ static bool module_key(void *ctx, uint64_t addr, uint64_t *key)
 #define CTX_FP(c) ((c).Rbp)
 #endif
 
+static void ctx_regs(const CONTEXT *c, exec_regs_t *out)
+{
+    memset(out, 0, sizeof(*out));
+#if defined(_M_ARM64) || defined(__aarch64__)
+    for (int i = 0; i < 31; i++)
+        out->r[i] = c->X[i];
+    out->r[31] = c->Sp;
+#else
+    const DWORD64 v[16] = {
+        c->Rax, c->Rcx, c->Rdx, c->Rbx, c->Rsp, c->Rbp, c->Rsi, c->Rdi,
+        c->R8, c->R9, c->R10, c->R11, c->R12, c->R13, c->R14, c->R15,
+    };
+    for (int i = 0; i < 16; i++)
+        out->r[i] = v[i];
+#endif
+}
+
 static HANDLE open_thread(DWORD tid, CONTEXT *ctx)
 {
     HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT |
@@ -271,7 +288,13 @@ static DWORD on_exception(run_t *r, const DEBUG_EVENT *ev, bool *kill_now)
             return DBG_CONTINUE;
         }
         DWORD cont = DBG_CONTINUE;
-        if ((nw = exec_bp_hit(r->ex, r->cov, addr, w)) > 0) {
+        uint32_t probe;
+        if ((nw = exec_bp_hit(r->ex, r->cov, addr, w, &probe)) > 0) {
+            if (probe != UINT32_MAX) {
+                exec_regs_t regs;
+                ctx_regs(&ctx, &regs);
+                exec_probe_log(r->ex, probe, &regs, rd_mem, r->proc);
+            }
             bool ok = true;
             for (size_t i = 0; i < nw; i++)
                 ok = ok && write_code(r->proc, w[i].addr, w[i].bytes, w[i].len);

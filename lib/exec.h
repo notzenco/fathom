@@ -81,6 +81,21 @@ struct fathom_exec_os {
     bool     *disarmed;      /* slot -> left out of the patch */
     size_t    disarmed_len;
 
+    /*
+     * Comparison probes: one-shot breakpoints on compare sites, armed
+     * only for a comparison-logging run.  A site on a block start shares
+     * that slot's breakpoint (slot_probe); others have their own.
+     */
+    fathom_cmp_site_t  *probes;
+    size_t             *probe_off;      /* own breakpoints: offset in orig */
+    bool               *probe_own;
+    size_t              n_probes;
+    uint32_t           *slot_probe;     /* slot -> probe, or UINT32_MAX */
+    size_t              slot_probe_len;
+    bool                probes_armed;
+    fathom_cmp_entry_t *cmp_log;
+    size_t              cmp_count;
+
     uint8_t   bp_insn[4];
     size_t    bp_len;
     /* How far past the breakpoint the PC is reported when it fires. */
@@ -117,6 +132,8 @@ int exec_bp_lookup(const fathom_exec_t *ex, uint64_t addr);
 /* Whether link-time address addr holds any of our breakpoints. */
 bool exec_is_ours(const fathom_exec_t *ex, uint64_t addr);
 
+typedef bool (*exec_read_fn)(void *ctx, uint64_t addr, void *buf, size_t len);
+
 /* A write into the target at a runtime address. */
 typedef struct {
     uint64_t       addr;
@@ -131,10 +148,21 @@ typedef struct {
  * and for counted blocks the breakpoint that comes next.  Returns the
  * number of writes, or 0 if pc_bp is not one of ours, including a block
  * whose own first instruction is a trap: that one was never patched and
- * belongs to the target.
+ * belongs to the target.  *probe is a comparison probe to log with
+ * exec_probe_log (the stopped thread's registers are needed), or
+ * UINT32_MAX.
  */
 size_t exec_bp_hit(fathom_exec_t *ex, fathom_coverage_t *cov, uint64_t pc_bp,
-                   exec_write_t w[2]);
+                   exec_write_t w[2], uint32_t *probe);
+
+/* Registers of a stopped thread, numbered as FATHOM_REG_* describes. */
+typedef struct {
+    uint64_t r[FATHOM_REG_COUNT];
+} exec_regs_t;
+
+/* Record what probe's comparison sees, reading memory through rd. */
+void exec_probe_log(fathom_exec_t *ex, uint32_t probe, const exec_regs_t *regs,
+                    exec_read_fn rd, void *ctx);
 
 /*
  * Hash a crash from its PC and frame-pointer chain, so the same bug
@@ -159,7 +187,6 @@ uint64_t exec_module_key(const char *path, uint64_t offset);
  * bytes first unless they are cached for the current slide.  Prints the
  * failing address and returns -1 on error.
  */
-typedef bool (*exec_read_fn)(void *ctx, uint64_t addr, void *buf, size_t len);
 typedef bool (*exec_write_fn)(void *ctx, uint64_t addr, const void *buf, size_t len);
 int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr,
                             void *ctx);
