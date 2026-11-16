@@ -78,6 +78,7 @@ struct fathom_exec_os {
     bool      patch_ready;
     uint64_t  patch_slide;
     bool      patch_stale;   /* patched needs rebuilding from orig (arming changed) */
+    uint64_t  patch_gen;     /* bumped whenever patched changes */
     bool     *disarmed;      /* slot -> left out of the patch */
     size_t    disarmed_len;
 
@@ -116,6 +117,17 @@ struct fathom_exec_os {
      * image any more: breakpoints and link-time crash PCs no longer apply.
      */
     bool      foreign_image;
+
+#if defined(__linux__)
+    /* Fork server: the stopped template every run is forked from. */
+    bool      fs_wanted;
+    bool      fs_failed;
+    pid_t     fs_pid;
+    int       fs_mem;
+    uint64_t  fs_entry;          /* runtime entry point, where code is injected */
+    uint64_t  fs_patch_gen;      /* patch generation last written to the template */
+    unsigned char fs_regs[1024]; /* registers at the entry point (user_regs_struct) */
+#endif
 
 #ifdef _WIN32
     HANDLE    input;

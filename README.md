@@ -172,6 +172,15 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
 - Hangs are detected per run with a timeout (`-t`). Targets run in their
   own process group, so Ctrl-C and group signals are never miscounted as
   crashes.
+- **Fork server** (`--fork-server`, Linux). The target starts once and
+  stops at its entry point, after the dynamic loader. Each run injects a
+  `fork` into that template, so execve and dynamic linking are paid once;
+  the child starts from the entry point with the template's registers,
+  breakpoints and file descriptors. It helps most where startup is
+  expensive: a target linked against libcapstone ran 2.6x faster (3,455
+  against 1,304 runs a second), while for a trivial target the extra
+  ptrace round trips cost about as much as they save. It falls back to a
+  fresh process per run if the template cannot be set up.
 - Parallel mode (`-j`) runs worker processes with sharded output
   directories. Every 10 seconds each worker runs the queue entries its
   peers added and keeps those that reach something new for it; a crash a
@@ -223,6 +232,8 @@ Options:
   --max-input <n> Largest input to generate, in bytes (default: 1048576)
   --fail-on-crash Exit with status 2 if any unique crash was found
   --no-cmplog Skip comparison logging (input-to-state) on new inputs
+  --fork-server   Linux: fork each run from the target stopped at its
+                  entry point instead of starting it afresh
   --version   Show the version
   --replay <f>    Run input f once and report the outcome (exit
                   status 0 ok, 2 crash, 3 hang)
@@ -356,10 +367,10 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
 - **Block coverage, not edge coverage.** One-shot breakpoints record
   which blocks ran, not in which order. Only loop headers count how often
   they ran, up to 8 times per run.
-- **One process launch per input.** There is no fork server or persistent
-  mode, so throughput is bounded by process creation, which is slowest on
-  Windows. On macOS, `task_for_pid()` adds roughly 10 ms per run unless
-  fathom runs as root.
+- **One process launch per input**, except with `--fork-server` on Linux.
+  There is no persistent mode, so throughput is bounded by process
+  creation, which is slowest on Windows. On macOS, `task_for_pid()` adds
+  roughly 10 ms per run unless fathom runs as root.
 - **64-bit only.** 32-bit x86/ARM and big-endian targets are rejected.
 - Code reached only through indirect jumps other than recognised jump
   tables (function pointers stored in data, computed gotos) is left

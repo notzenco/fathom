@@ -147,6 +147,10 @@ int fathom_exec_init(fathom_exec_t *ex, const fathom_config_t *cfg,
 
     for (size_t i = 0; cfg->target_argv[i]; i++)
         os->input_by_path |= strstr(cfg->target_argv[i], "@@") != NULL;
+#if defined(__linux__)
+    os->fs_wanted = cfg->fork_server;
+    os->fs_mem = -1;
+#endif
     if (exec_os_init(ex) < 0)
         goto fail;
     if (os->input_by_path) {
@@ -507,6 +511,7 @@ int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr
             if (!off && !is_trap(os, os->bp_off[i]))
                 memcpy(os->patched + os->bp_off[i], os->bp_insn, os->bp_len);
         }
+        os->patch_gen++;
         for (size_t i = 0; os->probes_armed && i < os->n_probes; i++) {
             if (os->probe_own[i] && !is_trap(os, os->probe_off[i]))
                 memcpy(os->patched + os->probe_off[i], os->bp_insn, os->bp_len);
