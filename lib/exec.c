@@ -72,7 +72,8 @@ static char **substitute_input(char *const *argv, const char *path)
         char *d = out[i];
         for (const char *p = argv[i]; *p;) {
             if (p[0] == '@' && p[1] == '@') {
-                d += sprintf(d, "%s", path);
+                memcpy(d, path, strlen(path));
+                d += strlen(path);
                 p += 2;
             } else {
                 *d++ = *p++;
