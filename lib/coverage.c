@@ -13,11 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-int fathom_coverage_init(fathom_coverage_t *cov)
+int fathom_coverage_init(fathom_coverage_t *cov, size_t size)
 {
     memset(cov, 0, sizeof(*cov));
-    cov->local  = calloc(1, FATHOM_MAP_SIZE);
-    cov->global = calloc(1, FATHOM_MAP_SIZE);
+    cov->size   = size ? size : 1;
+    cov->local  = calloc(1, cov->size);
+    cov->global = calloc(1, cov->size);
     if (!cov->local || !cov->global) {
         fathom_coverage_destroy(cov);
         return -1;
@@ -31,11 +32,12 @@ void fathom_coverage_destroy(fathom_coverage_t *cov)
     free(cov->global);
     cov->local  = NULL;
     cov->global = NULL;
+    cov->size   = 0;
 }
 
 void fathom_coverage_reset_local(fathom_coverage_t *cov)
 {
-    memset(cov->local, 0, FATHOM_MAP_SIZE);
+    memset(cov->local, 0, cov->size);
 }
 
 /*
@@ -44,7 +46,7 @@ void fathom_coverage_reset_local(fathom_coverage_t *cov)
  */
 bool fathom_coverage_has_new(fathom_coverage_t *cov)
 {
-    for (size_t i = 0; i < FATHOM_MAP_SIZE; i++) {
+    for (size_t i = 0; i < cov->size; i++) {
         if (cov->local[i] &&
             (fathom_classify_count(cov->local[i]) & ~cov->global[i]))
             return true;
@@ -57,7 +59,7 @@ void fathom_coverage_merge(fathom_coverage_t *cov)
 {
     size_t fresh = 0;
 
-    for (size_t i = 0; i < FATHOM_MAP_SIZE; i++) {
+    for (size_t i = 0; i < cov->size; i++) {
         if (cov->local[i] == 0)
             continue;
         if (cov->global[i] == 0) {

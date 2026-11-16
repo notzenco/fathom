@@ -5,6 +5,7 @@
 #include "fathom.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures = 0;
@@ -123,11 +124,37 @@ static void test_mid_block_entry(void)
     fathom_cfg_free(&cfg);
 }
 
+/* Real binaries can have more blocks than any fixed map; none may be dropped. */
+static void test_no_block_cap(void)
+{
+    printf("=== test_no_block_cap ===\n");
+    const size_t n = 70000;
+    fathom_insn_t *insns = calloc(n, sizeof(*insns));
+    for (size_t i = 0; i < n; i++) {
+        insns[i] = (fathom_insn_t)INSN(0x100000 + 2 * i, 2, FATHOM_INSN_BRANCH, "je");
+        insns[i].is_conditional = true;
+        insns[i].branch_target = 0x100000 + 2 * (i + 1);
+    }
+    insns[n - 1] = (fathom_insn_t)INSN(0x100000 + 2 * (n - 1), 1, FATHOM_INSN_RET, "ret");
+
+    fathom_section_t text = { .addr = 0x100000, .size = 2 * n, .flags = FATHOM_SEC_CODE };
+    fathom_binary_t bin = make_bin(0x100000);
+    bin.sections = &text;
+    fathom_cfg_t cfg;
+    fathom_analysis_t ana;
+    CHECK(analyze(insns, n, &bin, &cfg, &ana) == 0, "analyze");
+    CHECK(ana.cov_count == n, "every reachable block instrumentable");
+    fathom_analysis_free(&ana);
+    fathom_cfg_free(&cfg);
+    free(insns);
+}
+
 int main(void)
 {
     test_data_load_not_a_root();
     test_lea_is_a_root();
     test_mid_block_entry();
+    test_no_block_cap();
 
     if (failures) {
         printf("%d check(s) failed\n", failures);

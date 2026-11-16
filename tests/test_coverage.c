@@ -8,15 +8,17 @@
 #include <stdlib.h>
 #include <assert.h>
 
+#define MAP 1024
+
 #define PASS(name) fprintf(stderr, "  PASS  %s\n", (name))
 
 static void test_init_zeroed(void)
 {
     fathom_coverage_t cov;
-    assert(fathom_coverage_init(&cov) == 0);
+    assert(fathom_coverage_init(&cov, MAP) == 0);
 
     /* Both maps should be entirely zero after init. */
-    for (size_t i = 0; i < FATHOM_MAP_SIZE; i++) {
+    for (size_t i = 0; i < MAP; i++) {
         assert(cov.local[i] == 0);
         assert(cov.global[i] == 0);
     }
@@ -30,7 +32,7 @@ static void test_init_zeroed(void)
 static void test_has_new_detects_new(void)
 {
     fathom_coverage_t cov;
-    assert(fathom_coverage_init(&cov) == 0);
+    assert(fathom_coverage_init(&cov, MAP) == 0);
 
     /* Simulate a block hit at slot 42. */
     cov.local[42] = 1;
@@ -44,7 +46,7 @@ static void test_has_new_detects_new(void)
 static void test_merge_updates_global(void)
 {
     fathom_coverage_t cov;
-    assert(fathom_coverage_init(&cov) == 0);
+    assert(fathom_coverage_init(&cov, MAP) == 0);
 
     cov.local[100] = 1;
     cov.local[200] = 3;
@@ -64,14 +66,14 @@ static void test_merge_updates_global(void)
 static void test_reset_local(void)
 {
     fathom_coverage_t cov;
-    assert(fathom_coverage_init(&cov) == 0);
+    assert(fathom_coverage_init(&cov, MAP) == 0);
 
     cov.local[100] = 1;
     cov.local[200] = 3;
 
     fathom_coverage_reset_local(&cov);
 
-    for (size_t i = 0; i < FATHOM_MAP_SIZE; i++)
+    for (size_t i = 0; i < MAP; i++)
         assert(cov.local[i] == 0);
 
     fathom_coverage_destroy(&cov);
@@ -81,7 +83,7 @@ static void test_reset_local(void)
 static void test_same_pattern_not_new(void)
 {
     fathom_coverage_t cov;
-    assert(fathom_coverage_init(&cov) == 0);
+    assert(fathom_coverage_init(&cov, MAP) == 0);
 
     /* First execution: hit blocks at slots 10 and 20. */
     cov.local[10] = 1;
@@ -112,7 +114,7 @@ static void test_same_pattern_not_new(void)
 static void test_new_pattern_is_new(void)
 {
     fathom_coverage_t cov;
-    assert(fathom_coverage_init(&cov) == 0);
+    assert(fathom_coverage_init(&cov, MAP) == 0);
 
     /* First execution. */
     cov.local[10] = 1;
@@ -136,7 +138,7 @@ static void test_new_pattern_is_new(void)
 static void test_destroy_is_clean(void)
 {
     fathom_coverage_t cov;
-    assert(fathom_coverage_init(&cov) == 0);
+    assert(fathom_coverage_init(&cov, MAP) == 0);
 
     fathom_coverage_destroy(&cov);
 

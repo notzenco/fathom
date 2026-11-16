@@ -78,7 +78,7 @@ static int load(target_t *t, const char *path, uint32_t timeout_ms)
 static size_t covered(void)
 {
     size_t n = 0;
-    for (size_t i = 0; i < FATHOM_MAP_SIZE; i++)
+    for (size_t i = 0; i < g_cov.size; i++)
         n += g_cov.local[i] != 0;
     return n;
 }
@@ -108,15 +108,16 @@ static void test_coverage_is_deterministic(target_t *maze)
 {
     BEGIN("coverage_is_deterministic");
     fathom_exec_result_t res;
-    uint8_t first[FATHOM_MAP_SIZE];
+    uint8_t *first = malloc(g_cov.size);
 
     CHECK(run(maze, "FUA", &res) == 0, "exec failed");
-    memcpy(first, g_cov.local, sizeof(first));
+    memcpy(first, g_cov.local, g_cov.size);
     for (int i = 0; i < 20; i++) {
         CHECK(run(maze, "FUA", &res) == 0, "exec failed");
-        CHECK(memcmp(first, g_cov.local, sizeof(first)) == 0,
+        CHECK(memcmp(first, g_cov.local, g_cov.size) == 0,
               "same input gave different coverage");
     }
+    free(first);
     END();
 }
 
@@ -151,6 +152,25 @@ static void test_detects_hang(target_t *hang)
     END();
 }
 
+/* The breakpoint table has no fixed size; slots stay stable as it grows. */
+static void test_many_breakpoints(void)
+{
+    BEGIN("breakpoint_table_grows");
+    target_t t;
+    CHECK(load(&t, TARGET("maze"), 2000) == 0, "load failed");
+    size_t base = t.ex.bp_count;
+    const size_t extra = 100000;
+    for (size_t i = 0; i < extra; i++) {
+        int slot = fathom_exec_add_breakpoint(&t.ex, 0x7f0000000000ull + 4 * i);
+        CHECK(slot == (int)(base + i), "new address got an unexpected slot");
+    }
+    CHECK(fathom_exec_add_breakpoint(&t.ex, 0x7f0000000000ull) == (int)base,
+          "a known address must keep its slot");
+    CHECK(t.ex.bp_count == base + extra, "breakpoint count");
+    fathom_exec_destroy(&t.ex);
+    END();
+}
+
 static void test_reaps_targets(target_t *maze)
 {
     BEGIN("leaves_no_unreaped_targets");
@@ -172,9 +192,10 @@ int main(void)
     target_t maze, hang;
 
     printf("=== test_exec ===\n");
-    if (fathom_coverage_init(&g_cov) < 0 ||
-        load(&maze, TARGET("maze"), 2000) < 0 ||
-        load(&hang, TARGET("hang"), 300) < 0) {
+    if (load(&maze, TARGET("maze"), 2000) < 0 ||
+        load(&hang, TARGET("hang"), 300) < 0 ||
+        fathom_coverage_init(&g_cov, maze.ex.bp_count > hang.ex.bp_count
+                                     ? maze.ex.bp_count : hang.ex.bp_count) < 0) {
         printf("setup failed (did `make targets` run?)\n");
         return 1;
     }
@@ -184,6 +205,7 @@ int main(void)
     test_detects_crash(&maze);
     test_detects_hang(&hang);
     test_reaps_targets(&maze);
+    test_many_breakpoints();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
