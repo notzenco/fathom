@@ -41,6 +41,30 @@ jobs:
       - name: Integration tests
         run: ${{ runner.os == 'macOS' && 'sudo' || '' }} bash tests/integration.sh
 
+  # Memory errors in fathom itself, and a check that `make install` works.
+  linux-asan:
+    name: linux-x86_64-asan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libcapstone-dev pkg-config
+
+      - name: Unit tests (AddressSanitizer + UBSan)
+        run: ASAN=1 make test
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+
+      - name: Install
+        run: |
+          make clean && make
+          make install PREFIX="$RUNNER_TEMP/prefix"
+          "$RUNNER_TEMP/prefix/bin/fathom" --version
+          test -f "$RUNNER_TEMP/prefix/lib/libfathom.a"
+          test -f "$RUNNER_TEMP/prefix/include/fathom.h"
+
   windows:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

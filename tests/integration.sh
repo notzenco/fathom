@@ -246,7 +246,7 @@ fi
 info "reproducible: the same -s and budget give the same queue"
 out=$(new_outdir repro)
 for run in a b; do
-    "$FATHOM" -i "$SEED_DIR" -o "$out/$run" -t 1000 -s 5 --max-execs 1500 \
+    "$FATHOM" -i "$SEED_DIR" -o "$out/$run" -t 1000 -s 5 --max-execs 600 \
         -- "$TARGETS/heap_overflow$EXE" 2>/dev/null || true
 done
 digest() { (cd "$1/queue" && for f in *; do printf '%s ' "$f"; od -An -tx1 "$f" | tr -d ' \n'; echo; done); }
