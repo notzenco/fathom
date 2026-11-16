@@ -118,6 +118,16 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
 
 ## Fuzzing
 
+- Seeds are run unmutated first: their coverage seeds the map, and seeds
+  that crash (saved as crashes) or time out are dropped.
+- AFL-style scheduling: each block's smallest, fastest input is
+  *favored*, and a greedy subset of favored inputs covering every reached
+  block gets nearly all the fuzzing. Each pick gets a number of mutated
+  runs (its energy) that grows with speed, coverage, static score and
+  freshness.
+- `--trim` shrinks queue inputs while they reach the same blocks. It is
+  off by default because breakpoints cannot see loop counts, so trimming
+  would cut inputs below the length an overflow needs.
 - Seven mutation strategies (bitflip, byteflip, arithmetic, interesting
   values, dictionary, havoc, splice) with adaptive weights: a strategy that
   finds new coverage is boosted 2x, and all weights decay by 0.95x.
@@ -171,6 +181,8 @@ Options:
   -T <secs>   Stop after this many seconds (default: run until Ctrl-C)
   -s <seed>   Random seed, for reproducible runs
   --until-crash  Stop after the first unique crash
+  --trim      Shrink queue inputs that keep the same blocks (off by
+              default: coverage cannot see loop counts)
   -a          Analysis-only mode (print CFG + scores, no fuzzing)
   -v          Verbose output
   --dict <f>  Extra dictionary file

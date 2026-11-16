@@ -18,6 +18,13 @@
 #define FATHOM_CORPUS_GROW      2
 
 /*
+ * Mutated executions per pick before fathom_corpus_energy scales them,
+ * and the most it allows.
+ */
+#define FATHOM_ENERGY_BASE        16
+#define FATHOM_ENERGY_MAX         512
+
+/*
  * Initial slot count of the crash dedup hash set; it doubles as it fills.
  */
 #define FATHOM_CRASH_HASHSET_CAP  4096

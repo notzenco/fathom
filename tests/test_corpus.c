@@ -407,6 +407,71 @@ static void test_destroy(void)
     PASS("destroy");
 }
 
+/* ── Scheduling: favored inputs, energy, removal ────────────────────── */
+
+static void set_local(fathom_coverage_t *cov, const size_t *slots, size_t n)
+{
+    memset(cov->local, 0, cov->size);
+    for (size_t i = 0; i < n; i++)
+        cov->local[slots[i]] = 1;
+}
+
+/* Of two inputs reaching the same blocks, the smaller and faster is favored. */
+static void test_favored(void)
+{
+    make_tmpdir();
+    char outdir[512];
+    snprintf(outdir, sizeof(outdir), "%s/out", g_tmpdir);
+
+    fathom_corpus_t corpus;
+    fathom_coverage_t cov;
+    assert(fathom_corpus_init(&corpus, NULL, outdir) == 0);
+    assert(fathom_coverage_init(&cov, 16) == 0);
+    fathom_corpus_seed(&corpus, 1);
+
+    const size_t ab[] = { 1, 2 }, c[] = { 3 };
+    fathom_corpus_add(&corpus, (const uint8_t *)"slow-and-long", 13, 2, 0);
+    fathom_corpus_add(&corpus, (const uint8_t *)"quick", 5, 2, 0);
+    fathom_corpus_add(&corpus, (const uint8_t *)"other", 5, 1, 0);
+    set_local(&cov, ab, 2);
+    assert(fathom_corpus_record(&corpus, 0, &cov, 900) == 0);
+    assert(fathom_corpus_record(&corpus, 1, &cov, 100) == 0);
+    set_local(&cov, c, 1);
+    assert(fathom_corpus_record(&corpus, 2, &cov, 100) == 0);
+    assert(corpus.inputs[0].slot_count == 2 && corpus.inputs[0].slots[1] == 2);
+
+    /* Drain the first pass, then count picks in steady state. */
+    for (int i = 0; i < 3; i++)
+        fathom_corpus_next(&corpus);
+    assert(!corpus.inputs[0].favored);
+    assert(corpus.inputs[1].favored && corpus.inputs[2].favored);
+
+    int slow = 0;
+    for (int i = 0; i < 1000; i++)
+        slow += fathom_corpus_next(&corpus) == &corpus.inputs[0];
+    assert(slow < 100);
+
+    /* Faster inputs get more mutations per pick. */
+    assert(fathom_corpus_energy(&corpus, 1) > fathom_corpus_energy(&corpus, 0));
+
+    /* Removing an input deletes its queue file. */
+    char qpath[PATH_MAX_T];
+    snprintf(qpath, sizeof(qpath), "%s/queue", outdir);
+    assert(count_files(qpath) == 3);
+    fathom_corpus_remove(&corpus, 0);
+    assert(corpus.count == 2 && count_files(qpath) == 2);
+
+    /* Trimming rewrites the queue file in place. */
+    assert(fathom_corpus_update(&corpus, 0, (const uint8_t *)"q", 1) == 0);
+    assert(corpus.inputs[0].len == 1 && corpus.inputs[0].trimmed);
+    assert(count_files(qpath) == 2);
+
+    fathom_coverage_destroy(&cov);
+    fathom_corpus_destroy(&corpus);
+    rmrf(g_tmpdir);
+    PASS("favored");
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -425,6 +490,7 @@ int main(void)
     test_crash_hash_zero();
     test_crash_file_contents();
     test_destroy();
+    test_favored();
 
     fprintf(stderr, "All corpus tests passed.\n");
     return 0;
