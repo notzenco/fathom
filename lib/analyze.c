@@ -212,7 +212,8 @@ static int cmp_u32(const void *a, const void *b)
  * code, so instead of trusting every block, walk the CFG from known
  * code: the entry point, function symbols, direct call targets, and
  * code addresses the program takes (e.g. `lea rdi, [rip+main]`, which is
- * how _start reaches main in a stripped binary).
+ * how _start reaches main in a stripped binary).  Loads through a
+ * PC-relative operand are not roots: they read data, even from .text.
  */
 static int find_cov_blocks(fathom_analysis_t *ana, const fathom_cfg_t *cfg,
                            const fathom_binary_t *bin, const fathom_disasm_t *dis)
@@ -253,7 +254,7 @@ static int find_cov_blocks(fathom_analysis_t *ana, const fathom_cfg_t *cfg,
             const fathom_insn_t *insn = &dis->insns[b->insn_start + ii];
             if (insn->kind == FATHOM_INSN_CALL && insn->branch_target)
                 PUSH_ADDR(insn->branch_target);
-            if (insn->ref_target && in_code(bin, insn->ref_target))
+            if (insn->ref_is_addr && in_code(bin, insn->ref_target))
                 PUSH_ADDR(insn->ref_target);
         }
     }

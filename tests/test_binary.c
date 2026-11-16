@@ -123,7 +123,7 @@ static void test_fixture(const fixture_t *fx)
     CHECK(saw_malloc, "a call resolves to malloc");
     CHECK(saw_copy, "a call resolves to %s", fx->copy_name);
 
-    CHECK(fathom_cfg_build(&cfg, &dis) == 0, "cfg");
+    CHECK(fathom_cfg_build(&cfg, &dis, &bin) == 0, "cfg");
     CHECK(fathom_analyze(&ana, &cfg, &bin, &dis) == 0, "analyze");
 
     CHECK(dict_has(&ana.dict, "FIXTURE-MAGIC", 13), "rodata string in dictionary");

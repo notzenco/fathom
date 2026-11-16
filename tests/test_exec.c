@@ -62,7 +62,7 @@ static int load(target_t *t, const char *path, uint32_t timeout_ms)
 
     if (fathom_binary_open(&t->bin, path) < 0 ||
         fathom_disasm_open(&t->dis, &t->bin) < 0 ||
-        fathom_cfg_build(&t->cfg, &t->dis) < 0 ||
+        fathom_cfg_build(&t->cfg, &t->dis, &t->bin) < 0 ||
         fathom_analyze(&t->ana, &t->cfg, &t->bin, &t->dis) < 0 ||
         fathom_exec_init(&t->ex, &cfg, &t->bin) < 0)
         return -1;

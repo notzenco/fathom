@@ -69,6 +69,7 @@ static void decode_x86(const cs_insn *ci, fathom_insn_t *fi)
     fi->is_conditional = cond;
 
     bool is_cmp = strcmp(ci->mnemonic, "cmp") == 0;
+    bool is_lea = strcmp(ci->mnemonic, "lea") == 0;
 
     for (uint8_t i = 0; i < x->op_count; i++) {
         const cs_x86_op *op = &x->operands[i];
@@ -79,8 +80,10 @@ static void decode_x86(const cs_insn *ci, fathom_insn_t *fi)
             (fi->kind == FATHOM_INSN_BRANCH || fi->kind == FATHOM_INSN_CALL))
             fi->branch_target = (uint64_t)op->imm;
         else if (op->type == X86_OP_MEM && op->mem.base == X86_REG_RIP &&
-                 op->mem.index == X86_REG_INVALID)
+                 op->mem.index == X86_REG_INVALID) {
             fi->ref_target = ci->address + ci->size + (uint64_t)op->mem.disp;
+            fi->ref_is_addr = is_lea;
+        }
     }
 }
 
@@ -195,11 +198,15 @@ static void decode_arm64(const cs_insn *ci, fathom_insn_t *fi,
     }
 
     adrp_slot_t *s = NULL;
-    if (strcmp(ci->mnemonic, "add") == 0 && a->op_count == 3 &&
+    if (strcmp(ci->mnemonic, "adr") == 0 && src->type == ARM64_OP_IMM) {
+        fi->ref_target = (uint64_t)src->imm;
+        fi->ref_is_addr = true;
+    } else if (strcmp(ci->mnemonic, "add") == 0 && a->op_count == 3 &&
         src->type == ARM64_OP_REG && a->operands[2].type == ARM64_OP_IMM &&
-        (s = adrp_find(st, src->reg, idx)))
+        (s = adrp_find(st, src->reg, idx))) {
         fi->ref_target = s->page + (uint64_t)a->operands[2].imm;
-    else if (has_prefix(ci->mnemonic, "ldr") && src->type == ARM64_OP_MEM &&
+        fi->ref_is_addr = true;
+    } else if (has_prefix(ci->mnemonic, "ldr") && src->type == ARM64_OP_MEM &&
              (s = adrp_find(st, src->mem.base, idx)))
         fi->ref_target = s->page + (uint64_t)(int64_t)src->mem.disp;
 

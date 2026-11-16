@@ -117,7 +117,7 @@ static void test_synthetic_cfg(void)
     };
 
     fathom_cfg_t cfg;
-    int rc = fathom_cfg_build(&cfg, &dis);
+    int rc = fathom_cfg_build(&cfg, &dis, NULL);
     CHECK(rc == 0, "fathom_cfg_build should succeed");
     if (rc != 0) {
         fprintf(stderr, "Cannot build CFG — aborting synthetic test\n");
@@ -251,7 +251,7 @@ static void test_real_binary_cfg(const char *path)
     printf("  disassembled %zu instructions from %s\n", dis.count, path);
 
     fathom_cfg_t cfg;
-    rc = fathom_cfg_build(&cfg, &dis);
+    rc = fathom_cfg_build(&cfg, &dis, NULL);
     CHECK(rc == 0, "fathom_cfg_build should succeed on real binary");
     if (rc != 0) {
         fathom_disasm_close(&dis);
@@ -340,7 +340,7 @@ static void test_single_instruction(void)
     fathom_disasm_t dis = { .insns = &insn, .count = 1 };
     fathom_cfg_t cfg;
 
-    int rc = fathom_cfg_build(&cfg, &dis);
+    int rc = fathom_cfg_build(&cfg, &dis, NULL);
     CHECK(rc == 0, "cfg_build should succeed with single instruction");
     if (rc == 0) {
         CHECK(cfg.block_count == 1, "single ret -> 1 block");
@@ -359,7 +359,7 @@ static void test_empty_disasm(void)
     fathom_disasm_t dis = { .insns = NULL, .count = 0 };
     fathom_cfg_t cfg;
 
-    int rc = fathom_cfg_build(&cfg, &dis);
+    int rc = fathom_cfg_build(&cfg, &dis, NULL);
     CHECK(rc == -1, "cfg_build should fail on empty disasm");
 
     printf("  empty disasm test done.\n\n");

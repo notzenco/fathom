@@ -54,10 +54,21 @@ static bool is_padding(const fathom_insn_t *insn)
  *   - Any instruction not contiguous with the previous one (a section
  *     boundary or bytes the disassembler skipped)
  *   - The first instruction after inter-function padding
+ *   - The entry point, function symbols and code addresses taken by
+ *     lea/adr, which analysis uses as reachability roots
  *
  * We collect leader indices in a sorted, deduplicated boolean array.
  */
-static bool *mark_leaders(const fathom_disasm_t *dis, size_t *n_leaders)
+static void mark_root(const fathom_disasm_t *dis, bool *is_leader, bool *is_target,
+                      uint64_t addr)
+{
+    size_t idx = fathom_disasm_find(dis, addr);
+    if (idx != (size_t)-1)
+        is_leader[idx] = is_target[idx] = true;
+}
+
+static bool *mark_leaders(const fathom_disasm_t *dis, const fathom_binary_t *bin,
+                          size_t *n_leaders)
 {
     bool *is_leader = calloc(dis->count, sizeof(bool));
     bool *is_target = calloc(dis->count, sizeof(bool));
@@ -70,11 +81,23 @@ static bool *mark_leaders(const fathom_disasm_t *dis, size_t *n_leaders)
     /* First instruction is always a leader */
     is_leader[0] = true;
 
+    /* Analysis roots must start blocks, or no block is found to instrument. */
+    if (bin) {
+        mark_root(dis, is_leader, is_target, bin->entry);
+        for (size_t i = 0; i < bin->symbol_count; i++) {
+            if (bin->symbols[i].type == FATHOM_SYM_FUNC)
+                mark_root(dis, is_leader, is_target, bin->symbols[i].addr);
+        }
+    }
+
     for (size_t i = 0; i < dis->count; i++) {
         const fathom_insn_t *insn = &dis->insns[i];
 
         if (i > 0 && !contiguous(dis, i - 1, i))
             is_leader[i] = true;
+
+        if (insn->ref_is_addr)
+            mark_root(dis, is_leader, is_target, insn->ref_target);
 
         if (insn->kind == FATHOM_INSN_BRANCH ||
             insn->kind == FATHOM_INSN_RET) {
@@ -640,7 +663,8 @@ static int compute_dominators(fathom_cfg_t *cfg)
 
 /* ── Public API ──────────────────────────────────────────────────────── */
 
-int fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
+int fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis,
+                     const fathom_binary_t *bin)
 {
     memset(cfg, 0, sizeof(*cfg));
 
@@ -651,7 +675,7 @@ int fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis)
 
     /* Step 1: Mark leaders */
     size_t n_leaders = 0;
-    bool *is_leader = mark_leaders(dis, &n_leaders);
+    bool *is_leader = mark_leaders(dis, bin, &n_leaders);
     if (!is_leader)
         return -1;
 

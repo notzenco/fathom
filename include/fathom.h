@@ -116,6 +116,12 @@ typedef struct {
      * stubs and to find functions referenced only by address.
      */
     uint64_t           ref_target;
+    /*
+     * The instruction computes ref_target as a value (lea, adr, adrp+add)
+     * instead of loading from or storing to it, so it may be a code
+     * pointer.  Loads from code sections read data and are not code roots.
+     */
+    bool               ref_is_addr;
     int64_t            cmp_imm;        /* constant compared against, if has_cmp_imm */
     bool               has_cmp_imm;
     bool               is_conditional;
@@ -314,7 +320,9 @@ void fathom_disasm_close(fathom_disasm_t *dis);
 size_t fathom_disasm_find(const fathom_disasm_t *dis, uint64_t addr);
 
 /* CFG */
-int  fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis);
+/* bin may be NULL; when given, its entry point and function symbols start blocks. */
+int  fathom_cfg_build(fathom_cfg_t *cfg, const fathom_disasm_t *dis,
+                      const fathom_binary_t *bin);
 void fathom_cfg_free(fathom_cfg_t *cfg);
 
 /* Analysis */
