@@ -53,7 +53,31 @@ struct fathom_exec_os {
     uint32_t *hash_vals;
     size_t    hash_cap;
 
-    /* Breakpoint clusters, link-time [lo, hi), at off in orig/patched. */
+    /*
+     * Modules: 0 is the target, the rest libraries from
+     * fathom_exec_add_module.  Breakpoint addresses carry their module
+     * in the top byte (FATHOM_MODULE_ADDR); runtime = low bits + slide.
+     */
+    struct exec_module {
+        char    *path;
+        uint64_t base, size;     /* link-time image */
+        uint64_t slide;
+        bool     loaded;         /* mapped in this run, slide known */
+        bool     read;           /* orig holds its bytes, read at read_slide */
+        uint64_t read_slide;
+#ifdef _WIN32
+        DWORD    volume, index_hi, index_lo;   /* file identity */
+#else
+        uint64_t dev, ino;
+#endif
+    } *mods;
+    size_t    n_mods;
+    /* Libraries are found when the target reaches its entry point. */
+    bool      checkpoint;        /* a breakpoint at the entry point is pending */
+    bool      checkpoint_own;    /* placed only for that: restore entry_orig */
+    uint8_t   entry_orig[4];
+
+    /* Breakpoint clusters, tagged link-time [lo, hi), at off in orig/patched. */
     struct exec_cluster { uint64_t lo, hi; size_t off; } *clusters;
     size_t    n_clusters;
     uint8_t  *orig;          /* launch-time bytes of every cluster */
@@ -145,6 +169,7 @@ int exec_bp_lookup(const fathom_exec_t *ex, uint64_t addr);
 bool exec_is_ours(const fathom_exec_t *ex, uint64_t addr);
 
 typedef bool (*exec_read_fn)(void *ctx, uint64_t addr, void *buf, size_t len);
+typedef bool (*exec_write_fn)(void *ctx, uint64_t addr, const void *buf, size_t len);
 
 /* A write into the target at a runtime address. */
 typedef struct {
@@ -194,12 +219,39 @@ uint64_t exec_link_addr(const fathom_exec_t *ex, uint64_t runtime);
 /* Key for a module-relative address: path hash mixed with the offset. */
 uint64_t exec_module_key(const char *path, uint64_t offset);
 
+/* Runtime address of a tagged link-time address. */
+uint64_t exec_runtime(const struct fathom_exec_os *os, uint64_t tagged);
+
 /*
- * Write every breakpoint into the stopped target, reading the original
- * bytes first unless they are cached for the current slide.  Prints the
- * failing address and returns -1 on error.
+ * Libraries: the backend finds where the file at path is mapped
+ * (*base: the runtime address of its link-time image_base) ...
  */
-typedef bool (*exec_write_fn)(void *ctx, uint64_t addr, const void *buf, size_t len);
+typedef bool (*exec_find_module_fn)(void *ctx, const struct exec_module *m, uint64_t *base);
+
+/* Mark module m mapped with the given slide, and write its breakpoints. */
+int exec_module_loaded(fathom_exec_t *ex, size_t m, uint64_t slide, exec_read_fn rd,
+                       exec_write_fn wr, void *ctx);
+
+/*
+ * ... and at the entry point checkpoint, every library is looked up and
+ * instrumented.  Returns -1 if pc_bp is not the checkpoint; 0 if it was
+ * and the trap is also a slot's (let exec_bp_hit handle it); 1 if w[0]
+ * restores the entry point and the PC should be rewound.
+ */
+int exec_checkpoint(fathom_exec_t *ex, uint64_t pc_bp, exec_find_module_fn find,
+                    exec_read_fn rd, exec_write_fn wr, void *ctx, exec_write_t *w);
+
+/*
+ * Start of a run in a freshly started target: write the target's
+ * breakpoints and, when there are libraries, the entry point checkpoint.
+ */
+int exec_begin_run(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr, void *ctx);
+
+/*
+ * Write every loaded module's breakpoints into the stopped target,
+ * reading the original bytes first unless they are cached for the
+ * current slide.  Prints the failing address and returns -1 on error.
+ */
 int exec_insert_breakpoints(fathom_exec_t *ex, exec_read_fn rd, exec_write_fn wr,
                             void *ctx);
 

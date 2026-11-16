@@ -11,6 +11,7 @@ tests/test_*
 !tests/test_*.h
 tests/targets/*
 !tests/targets/*.c
+!tests/targets/lib/
 
 # Fuzz output
 fathom-out/

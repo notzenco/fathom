@@ -400,6 +400,65 @@ static void test_cmp_log(void)
     END();
 }
 
+#if defined(_WIN32)
+#define TEST_LIB "tests/targets/libmaze.dll"
+#elif defined(__APPLE__)
+#define TEST_LIB "tests/targets/libmaze.dylib"
+#else
+#define TEST_LIB "tests/targets/libmaze.so"
+#endif
+
+static size_t covered_from(const fathom_coverage_t *cov, size_t first)
+{
+    size_t n = 0;
+    for (size_t i = first; i < cov->size; i++)
+        n += cov->local[i] != 0;
+    return n;
+}
+
+/* Blocks of an instrumented shared library are coverage like the target's own. */
+static void test_library_coverage(bool fork_server)
+{
+    BEGIN(fork_server ? "shared_library_coverage_fork_server" : "shared_library_coverage");
+    target_t t, lib;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    memset(&lib, 0, sizeof(lib));
+    CHECK(load(&t, TARGET("lib_user"), 2000) == 0, "load failed");
+#if defined(__linux__)
+    t.ex.os->fs_wanted = fork_server;
+#endif
+    CHECK(fathom_binary_open(&lib.bin, TEST_LIB) == 0 &&
+          fathom_disasm_open(&lib.dis, &lib.bin) == 0 &&
+          fathom_cfg_build(&lib.cfg, &lib.dis, &lib.bin) == 0 &&
+          fathom_analyze(&lib.ana, &lib.cfg, &lib.bin, &lib.dis) == 0, "library analysis failed");
+    int m = fathom_exec_add_module(&t.ex, TEST_LIB, lib.bin.image_base, lib.bin.image_size);
+    CHECK(m > 0, "add_module failed");
+    size_t first = t.ex.bp_count;
+    for (size_t i = 0; i < lib.ana.cov_count; i++) {
+        uint64_t addr = lib.cfg.blocks[lib.ana.cov_blocks[i]].start_addr;
+        CHECK(fathom_exec_add_breakpoint(&t.ex, FATHOM_MODULE_ADDR(m, addr)) >= 0,
+              "library breakpoint");
+    }
+    CHECK(t.ex.bp_count > first, "no library blocks");
+    CHECK(fathom_coverage_init(&cov, t.ex.bp_count) == 0, "coverage init");
+
+    CHECK(run_cov(&t, &cov, "AAAA", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    size_t shallow = covered_from(&cov, first);
+    CHECK(shallow > 0, "library blocks not covered");
+    CHECK(run_cov(&t, &cov, "LIA", &res) == 0 && res.status == FATHOM_EXIT_OK, "exec failed");
+    CHECK(run_cov(&t, &cov, "LIBA", &res) == 0, "exec failed");
+    CHECK(covered_from(&cov, first) > shallow, "deeper library input covered no more");
+    CHECK(run_cov(&t, &cov, "LIB!", &res) == 0 && res.status == FATHOM_EXIT_CRASH,
+          "crash in the library not detected");
+    CHECK(run_cov(&t, &cov, "AAAA", &res) == 0 && covered_from(&cov, first) == shallow,
+          "library coverage is not repeatable");
+
+    free_target(&lib);
+    unload(&t, &cov);
+    END();
+}
+
 /* Trimming drops bytes that do not change the path. */
 static void test_trim(void)
 {
@@ -575,6 +634,10 @@ int main(void)
     test_file_input();
     test_minimize();
     test_cmp_log();
+    test_library_coverage(false);
+#if defined(__linux__)
+    test_library_coverage(true);
+#endif
 #if defined(__linux__)
     test_fork_server();
 #endif

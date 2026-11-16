@@ -480,6 +480,22 @@ int  fathom_exec_run(fathom_exec_t *ex, fathom_coverage_t *cov,
 /* Returns the coverage map slot for addr, or -1 on failure. */
 int  fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr);
 /*
+ * Shared libraries: instrument the library at path (a binary whose
+ * link-time image starts at image_base and spans image_size bytes) once
+ * the target has loaded it.  Returns a module number for
+ * FATHOM_MODULE_ADDR, or -1.  Libraries the target loads at startup are
+ * found (on Linux and macOS when it reaches its entry point, on Windows
+ * when the DLL is mapped); ones it dlopens later are not.
+ */
+int  fathom_exec_add_module(fathom_exec_t *ex, const char *path, uint64_t image_base,
+                            uint64_t image_size);
+/*
+ * The address a breakpoint, hit counter or comparison site takes for a
+ * link-time address in module m (0 is the target itself).
+ */
+#define FATHOM_MODULE_SHIFT 56
+#define FATHOM_MODULE_ADDR(m, addr) ((uint64_t)(addr) | ((uint64_t)(m) << FATHOM_MODULE_SHIFT))
+/*
  * Count how often slot's block runs, up to FATHOM_HIT_LIMIT per run, by
  * re-arming its breakpoint each time.  next_insn is the address of the
  * block's second instruction, where a temporary breakpoint re-arms the

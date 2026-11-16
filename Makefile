@@ -11,14 +11,17 @@ UNAME_S := $(shell uname -s)
 ifneq (,$(findstring MINGW,$(UNAME_S))$(findstring MSYS,$(UNAME_S)))
   PLATFORM     := windows
   EXE          := .exe
+  LIB_EXT      := .dll
   TARGET_FLAGS := -O0 -g -fno-stack-protector -fno-omit-frame-pointer
 else ifeq ($(UNAME_S),Darwin)
   PLATFORM     := macos
   EXE          :=
+  LIB_EXT      := .dylib
   TARGET_FLAGS := -O0 -g -fno-stack-protector -fno-omit-frame-pointer
 else
   PLATFORM     := linux
   EXE          :=
+  LIB_EXT      := .so
   TARGET_FLAGS := -O0 -g -fno-stack-protector -fno-omit-frame-pointer \
                   -no-pie -z execstack
 endif
@@ -96,6 +99,27 @@ targets: $(TARGET_BINS)
 tests/targets/%$(EXE): tests/targets/%.c
 	$(CC) $(TARGET_FLAGS) -o $@ $<
 
+# A shared library and the program using it, for library coverage.
+TEST_LIB := tests/targets/libmaze$(LIB_EXT)
+ifeq ($(PLATFORM),windows)
+  LIB_LDFLAGS := -shared -Wl,--out-implib,tests/targets/libmaze.dll.a
+  USER_LDFLAGS :=
+else ifeq ($(PLATFORM),macos)
+  LIB_LDFLAGS := -dynamiclib -install_name @rpath/libmaze.dylib
+  USER_LDFLAGS := -Wl,-rpath,@loader_path
+else
+  LIB_LDFLAGS := -shared
+  USER_LDFLAGS := -Wl,-rpath,'$$ORIGIN'
+endif
+
+targets: $(TEST_LIB)
+
+$(TEST_LIB): tests/targets/lib/libmaze.c
+	$(CC) -O0 -g -fPIC $(LIB_LDFLAGS) -o $@ $<
+
+tests/targets/lib_user$(EXE): tests/targets/lib_user.c $(TEST_LIB)
+	$(CC) $(TARGET_FLAGS) $(USER_LDFLAGS) -o $@ $< -Ltests/targets -lmaze
+
 # Optimised: the switch becomes a jump table, the comparison a register one.
 tests/targets/switch_table$(EXE): TARGET_FLAGS += -O2
 tests/targets/o2_compare$(EXE): TARGET_FLAGS += -O2
@@ -131,4 +155,4 @@ install: fathom$(EXE) libfathom.a
 clean:
 	rm -f fathom$(EXE) libfathom.a
 	rm -f $(LIB_OBJS) $(CLI_OBJS)
-	rm -f $(TEST_BINS) $(TARGET_BINS)
+	rm -f $(TEST_BINS) $(TARGET_BINS) $(TEST_LIB) tests/targets/libmaze.dll.a
