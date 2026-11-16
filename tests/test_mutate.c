@@ -442,6 +442,28 @@ static void test_dict_constant(void)
     fathom_dict_destroy(&dict);
 }
 
+/* The deterministic stage visits every edit once, each different from the input. */
+static void test_det(void)
+{
+    const uint8_t in[4] = { 'A', 'B', 'C', 'D' };
+    uint8_t out[4];
+    fathom_det_t d;
+    memset(&d, 0, sizeof(d));
+    size_t n = 0, same = 0;
+    bool flip0 = false, be7fff = false;
+    while (fathom_det_next(&d, in, sizeof(in), out)) {
+        n++;
+        same += memcmp(in, out, sizeof(in)) == 0;
+        flip0 |= n == 1 && out[0] == ('A' ^ 1) && !memcmp(in + 1, out + 1, 3);
+        be7fff |= out[0] == 0x7f && out[1] == 0xff;
+    }
+    CHECK(flip0, "first candidate flips bit 0");
+    CHECK(be7fff, "big-endian 16-bit interesting values");
+    /* 32 bit flips, 4 x 32 arith, 4 x 5 interesting8, 3 x 9 x 2 i16, 1 x 13 x 2 i32 */
+    CHECK(n == 32 + 128 + 20 + 54 + 26, "candidate count");
+    CHECK(same < n / 4, "most candidates differ from the input");
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -462,6 +484,7 @@ int main(void)
     test_resize_strategies();
     test_interesting_widths();
     test_dict_constant();
+    test_det();
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;

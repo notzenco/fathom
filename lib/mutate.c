@@ -682,3 +682,68 @@ int fathom_dict_add_constant(fathom_dict_t *dict, int64_t v)
     }
     return added;
 }
+
+/* ── Deterministic stage ─────────────────────────────────────────────── */
+
+#define DET_ARITH 16
+
+enum { DET_BITFLIP, DET_ARITH8, DET_INT8, DET_INT16, DET_INT32, DET_DONE };
+
+bool fathom_det_next(fathom_det_t *d, const uint8_t *in, size_t len, uint8_t *out)
+{
+    for (;;) {
+        memcpy(out, in, len);
+        switch (d->stage) {
+        case DET_BITFLIP:
+            if (d->pos < len * 8) {
+                out[d->pos / 8] ^= (uint8_t)(1u << (d->pos % 8));
+                d->pos++;
+                return true;
+            }
+            break;
+        case DET_ARITH8:
+            if (d->pos < len) {
+                /* k: 0..15 add 1..16, 16..31 subtract 1..16 */
+                int delta = d->k < DET_ARITH ? (int)d->k + 1 : -(int)(d->k - DET_ARITH + 1);
+                out[d->pos] = (uint8_t)(out[d->pos] + delta);
+                if (++d->k == 2 * DET_ARITH) {
+                    d->k = 0;
+                    d->pos++;
+                }
+                return true;
+            }
+            break;
+        case DET_INT8:
+            if (d->pos < len) {
+                out[d->pos] = (uint8_t)interesting_8[d->k];
+                if (++d->k == ARRAY_LEN(interesting_8)) {
+                    d->k = 0;
+                    d->pos++;
+                }
+                return true;
+            }
+            break;
+        case DET_INT16:
+        case DET_INT32: {
+            size_t w = d->stage == DET_INT16 ? 2 : 4;
+            size_t nv = w == 2 ? ARRAY_LEN(interesting_16) : ARRAY_LEN(interesting_32);
+            if (len >= w && d->pos <= len - w) {
+                uint64_t v = w == 2 ? (uint64_t)(uint16_t)interesting_16[d->k / 2]
+                                    : (uint64_t)(uint32_t)interesting_32[d->k / 2];
+                put_int(out + d->pos, v, w, d->k % 2);   /* each value in both orders */
+                if (++d->k == 2 * nv) {
+                    d->k = 0;
+                    d->pos++;
+                }
+                return true;
+            }
+            break;
+        }
+        default:
+            return false;
+        }
+        d->stage++;
+        d->pos = 0;
+        d->k = 0;
+    }
+}

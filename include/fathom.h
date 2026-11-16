@@ -576,4 +576,17 @@ int  fathom_dict_load(fathom_dict_t *dict, const char *path);
  * Returns 1 if added, 0 if skipped (duplicate or trivial), -1 on error. */
 int  fathom_dict_add_constant(fathom_dict_t *dict, int64_t v);
 
+/*
+ * Deterministic stage (AFL's): every single-bit flip, byte +-1..16, and
+ * interesting 8-, 16- and 32-bit values in both byte orders at every
+ * position.  Start with a zeroed fathom_det_t; each call writes the next
+ * candidate (len bytes) to out and returns false when there are no more.
+ */
+typedef struct {
+    uint32_t stage;
+    size_t   pos;
+    uint32_t k;
+} fathom_det_t;
+bool fathom_det_next(fathom_det_t *d, const uint8_t *in, size_t len, uint8_t *out);
+
 #endif /* FATHOM_H */

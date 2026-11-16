@@ -154,6 +154,12 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
   (and its neighbours +-1) is written there and run. This finds magic
   values that `-O2` code loads into a register, which static extraction
   cannot see. `--no-cmplog` turns it off.
+- `--det` adds AFL's deterministic stage: the first time an input of up
+  to 256 bytes is fuzzed, every single-bit flip, byte +-1..16 and
+  interesting 8/16/32-bit value (both byte orders) at every position is
+  tried. It is off by default: with frontier tokens and comparison
+  logging, random mutation usually gets there in fewer runs (the maze
+  took 3-4x as many with it).
 - `--trim` shrinks queue inputs while they reach the same blocks. It is
   off by default because breakpoints cannot see loop counts, so trimming
   would cut inputs below the length an overflow needs.
@@ -235,6 +241,8 @@ Options:
   --max-input <n> Largest input to generate, in bytes (default: 1048576)
   --fail-on-crash Exit with status 2 if any unique crash was found
   --no-cmplog Skip comparison logging (input-to-state) on new inputs
+  --det       Try every deterministic edit (bit flips, small arithmetic,
+              interesting values) of each new input up to 256 bytes
   --fork-server   Linux: fork each run from the target stopped at its
                   entry point instead of starting it afresh
   --version   Show the version
