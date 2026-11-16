@@ -10,9 +10,11 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
 #include <sys/wait.h>
+#include <unistd.h>
 #endif
 
 static int tests_run;
@@ -171,6 +173,117 @@ static void test_many_breakpoints(void)
     END();
 }
 
+/* Load path with its own coverage map sized to its breakpoints. */
+static int load_cov(target_t *t, fathom_coverage_t *cov, const char *path)
+{
+    if (load(t, path, 2000) < 0)
+        return -1;
+    return fathom_coverage_init(cov, t->ex.bp_count);
+}
+
+static void unload(target_t *t, fathom_coverage_t *cov)
+{
+    fathom_exec_destroy(&t->ex);
+    fathom_analysis_free(&t->ana);
+    fathom_cfg_free(&t->cfg);
+    fathom_disasm_close(&t->dis);
+    fathom_binary_close(&t->bin);
+    fathom_coverage_destroy(cov);
+}
+
+static int run_cov(target_t *t, fathom_coverage_t *cov, const char *input,
+                   fathom_exec_result_t *res)
+{
+    return fathom_exec_run(&t->ex, cov, (const uint8_t *)input, strlen(input), res);
+}
+
+/*
+ * A block that itself starts with the breakpoint instruction is the
+ * target's own trap: it must kill the target, not loop until timeout.
+ */
+static void test_original_trap(void)
+{
+    BEGIN("target_trap_is_not_a_breakpoint");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("trap_block")) == 0, "load failed");
+    CHECK(run_cov(&t, &cov, "A", &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_OK, "clean input should exit normally");
+    CHECK(run_cov(&t, &cov, "T", &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_CRASH, "an executed trap should be a crash");
+    unload(&t, &cov);
+    END();
+}
+
+/* A fault the target's own handler recovers from is not a crash. */
+static void test_recovered_fault(void)
+{
+    BEGIN("recovered_fault_is_not_a_crash");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("sig_recover")) == 0, "load failed");
+    CHECK(run_cov(&t, &cov, "A", &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_OK, "a recovered fault should exit normally");
+    CHECK(run_cov(&t, &cov, "C", &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_CRASH, "an unhandled fault should be a crash");
+    CHECK(res.crash_pc != 0, "crash PC should be inside the image");
+    unload(&t, &cov);
+    END();
+}
+
+#ifndef _WIN32
+/* Coverage and crash attribution continue after the target re-executes itself. */
+static void test_reexec(void)
+{
+    BEGIN("coverage_survives_reexec");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("reexec")) == 0, "load failed");
+    CHECK(run_cov(&t, &cov, "A", &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_OK, "clean input should exit normally");
+    uint8_t *clean = malloc(cov.size);
+    memcpy(clean, cov.local, cov.size);
+    CHECK(run_cov(&t, &cov, "C", &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_CRASH, "crash after re-exec not detected");
+    bool fresh = false;
+    for (size_t i = 0; i < cov.size; i++)
+        fresh |= cov.local[i] && !clean[i];
+    free(clean);
+    CHECK(fresh, "blocks after the exec were not covered");
+    unload(&t, &cov);
+    END();
+}
+
+static bool process_named(const char *name)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "pgrep -x %s >/dev/null 2>&1", name);
+    return system(cmd) == 0;
+}
+
+/* Children run the same code, and none outlive the run. */
+static void test_forked_children(void)
+{
+    BEGIN("forked_children_run_and_are_killed");
+    target_t t;
+    fathom_coverage_t cov;
+    fathom_exec_result_t res;
+    CHECK(load_cov(&t, &cov, TARGET("fork_child")) == 0, "load failed");
+    CHECK(run_cov(&t, &cov, "A", &res) == 0, "exec failed");
+    CHECK(res.status == FATHOM_EXIT_OK, "the child died running instrumented code");
+    CHECK(run_cov(&t, &cov, "S", &res) == 0, "exec failed");
+    bool alive = true;
+    for (int i = 0; i < 20 && (alive = process_named("fork_child")); i++)
+        usleep(50 * 1000);
+    unload(&t, &cov);
+    CHECK(!alive, "a child process outlived the run");
+    END();
+}
+#endif
+
 static void test_reaps_targets(target_t *maze)
 {
     BEGIN("leaves_no_unreaped_targets");
@@ -206,6 +319,12 @@ int main(void)
     test_detects_hang(&hang);
     test_reaps_targets(&maze);
     test_many_breakpoints();
+    test_original_trap();
+    test_recovered_fault();
+#ifndef _WIN32
+    test_reexec();
+    test_forked_children();
+#endif
 
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
