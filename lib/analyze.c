@@ -542,33 +542,27 @@ void fathom_steer(const fathom_cfg_t *cfg, const bool *covered, double *val)
 
 void fathom_frontier(fathom_dict_t *out, const fathom_cfg_t *cfg, const fathom_disasm_t *dis,
                      const uint8_t *global, size_t slots, const uint32_t *slot_block,
-                     const int32_t *block_slot, const uint32_t *epoch, uint32_t now)
+                     const int32_t *block_slot, const uint32_t *epoch, uint32_t now,
+                     bool recent)
 {
-    for (int pass = 0; pass < 2; pass++) {
-        fathom_dict_destroy(out);
-        fathom_dict_init(out);
-        uint32_t since = pass == 0 && now > FRONTIER_RECENT ? now - FRONTIER_RECENT + 1 : 1;
+    uint32_t since = recent && now > FRONTIER_RECENT ? now - FRONTIER_RECENT + 1 : 1;
+    for (size_t slot = 0; slot < slots && out->count < FRONTIER_MAX; slot++) {
+        if (!global[slot] || epoch[slot] < since)
+            continue;
+        const fathom_block_t *b = &cfg->blocks[slot_block[slot]];
+        const fathom_insn_t *insns = &dis->insns[b->insn_start];
+        const fathom_insn_t *last = &insns[b->insn_count - 1];
+        if (last->kind != FATHOM_INSN_BRANCH || !last->is_conditional)
+            continue;
 
-        for (size_t slot = 0; slot < slots && out->count < FRONTIER_MAX; slot++) {
-            if (!global[slot] || epoch[slot] < since)
-                continue;
-            const fathom_block_t *b = &cfg->blocks[slot_block[slot]];
-            const fathom_insn_t *insns = &dis->insns[b->insn_start];
-            const fathom_insn_t *last = &insns[b->insn_count - 1];
-            if (last->kind != FATHOM_INSN_BRANCH || !last->is_conditional)
-                continue;
-
-            bool open = false;
-            for (size_t i = 0; i < b->succ_count; i++) {
-                int32_t succ = block_slot[b->succs[i]];
-                open |= succ < 0 || !global[succ];
-            }
-            for (size_t i = 0; open && i < b->insn_count; i++) {
-                if (insns[i].has_cmp_imm)
-                    fathom_dict_add_constant(out, insns[i].cmp_imm);
-            }
+        bool open = false;
+        for (size_t i = 0; i < b->succ_count; i++) {
+            int32_t succ = block_slot[b->succs[i]];
+            open |= succ < 0 || !global[succ];
         }
-        if (out->count > 0)
-            return;
+        for (size_t i = 0; open && i < b->insn_count; i++) {
+            if (insns[i].has_cmp_imm)
+                fathom_dict_add_constant(out, insns[i].cmp_imm);
+        }
     }
 }
