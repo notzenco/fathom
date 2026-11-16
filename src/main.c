@@ -10,6 +10,7 @@
 #include "fathom.h"
 #include "osdep.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
@@ -35,6 +36,7 @@
 #define STATS_INTERVAL_US   1000000     /* status line refresh rate */
 #define FATHOM_PATH_MAX     4096
 #define STATS_FILE          "fuzzer_stats"
+#define SYNC_INTERVAL_US    10000000    /* how often parallel workers import peers' finds */
 #ifdef _WIN32
 #define MAX_WORKERS         MAXIMUM_WAIT_OBJECTS
 #else
@@ -584,6 +586,11 @@ typedef struct {
     uint64_t               deadline;
     uint64_t               last_status;
     bool                   done;        /* --until-crash satisfied */
+
+    /* Parallel mode: peers are base_out/worker-NNN for every other id. */
+    int                    id;
+    uint64_t               last_sync;
+    size_t                *peer_next;   /* per peer: first queue id not imported yet */
 } worker_t;
 
 static bool out_of_time(worker_t *w)
@@ -659,12 +666,35 @@ static void update_steer(worker_t *w)
     }
 }
 
+/* Whether another worker already saved this crash. */
+static bool peer_has_crash(const worker_t *w, uint64_t hash)
+{
+    for (uint32_t i = 0; w->multi && i < w->opts->cfg.jobs; i++) {
+        char path[FATHOM_PATH_MAX + 64], dir[FATHOM_PATH_MAX];
+        struct stat st;
+        if ((int)i == w->id || worker_dir(dir, sizeof(dir), w->opts->cfg.output_dir, i) < 0)
+            continue;
+        snprintf(path, sizeof(path), "%s/crashes/crash_%016" PRIx64, dir, hash);
+        if (stat(path, &st) == 0)
+            return true;
+    }
+    return false;
+}
+
 /* Returns -1 on a fatal error, 1 if this was a new unique crash, else 0. */
 static int note_crash(worker_t *w, const uint8_t *buf, size_t len,
                       const fathom_exec_result_t *res)
 {
     fathom_corpus_t *corpus = &w->corpus;
     w->stats.crashes++;
+    if (peer_has_crash(w, res->crash_hash)) {
+        /* A peer found it first: remember it, but it is not ours to save. */
+        if (fathom_corpus_mark_crash(corpus, res->crash_hash) < 0)
+            return -1;
+        if (w->opts->until_crash)
+            w->done = true;
+        return 0;
+    }
     size_t prev = corpus->unique_crashes;
     if (fathom_corpus_save_crash(corpus, buf, len, res->crash_hash) < 0) {
         fprintf(stderr, "fathom: failed to save crash\n");
@@ -838,6 +868,65 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
     return 0;
 }
 
+/*
+ * Parallel mode: run the queue entries peers added since the last sync
+ * and keep those that reach something new here, as AFL's -M/-S do.
+ */
+static int sync_peers(worker_t *w, uint8_t *buf)
+{
+    for (uint32_t p = 0; p < w->opts->cfg.jobs; p++) {
+        char dir[FATHOM_PATH_MAX], qdir[FATHOM_PATH_MAX + 16];
+        if ((int)p == w->id || worker_dir(dir, sizeof(dir), w->opts->cfg.output_dir, p) < 0)
+            continue;
+        snprintf(qdir, sizeof(qdir), "%s/queue", dir);
+        DIR *d = opendir(qdir);
+        if (!d)
+            continue;
+        size_t next = w->peer_next[p];
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL && !stop_requested()) {
+            size_t id, cov;
+            if (sscanf(ent->d_name, "id_%zu_cov_%zu", &id, &cov) != 2 || id < w->peer_next[p])
+                continue;
+            if (id >= next)
+                next = id + 1;
+
+            char path[FATHOM_PATH_MAX + 300];
+            snprintf(path, sizeof(path), "%s/%s", qdir, ent->d_name);
+            FILE *fp = fopen(path, "rb");
+            if (!fp)
+                continue;
+            size_t len = fread(buf, 1, g_max_input, fp);
+            fclose(fp);
+
+            fathom_exec_result_t res;
+            arm_all(w);
+            w->stats.total_execs++;
+            int rc = fathom_exec_run(&w->ex, &w->cov, buf, len, &res);
+            disarm_covered(w);
+            if (rc < 0) {
+                closedir(d);
+                return -1;
+            }
+            if (res.status == FATHOM_EXIT_OK && fathom_coverage_has_new(&w->cov)) {
+                double score = take_coverage(w);
+                if (fathom_corpus_add(&w->corpus, buf, len, w->cov.new_blocks, score) < 0 ||
+                    fathom_corpus_record(&w->corpus, w->corpus.count - 1, &w->cov,
+                                         res.exec_us) < 0) {
+                    closedir(d);
+                    return -1;
+                }
+                disarm_covered(w);
+                update_steer(w);
+            }
+        }
+        closedir(d);
+        w->peer_next[p] = next;
+    }
+    w->stats.corpus_size = w->corpus.count;
+    return 0;
+}
+
 static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
                       fathom_session_t *session, int worker_id, bool multi)
 {
@@ -852,6 +941,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     w->cfg = cfg;
     w->session = session;
     w->multi = multi;
+    w->id = worker_id;
     fathom_dict_init(&w->frontier);
     if (multi) {
         snprintf(prefix_buf, sizeof(prefix_buf), "[w%03d]", worker_id);
@@ -914,10 +1004,11 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
         w->block_slot[bid] = slot;
     }
     /* Loop headers count their iterations, so a different trip count is new coverage. */
+    w->peer_next = calloc(opts->cfg.jobs + 1, sizeof(*w->peer_next));
     w->counted = calloc(session->ana.cov_count + 1, sizeof(*w->counted));
     w->block_covered = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_covered));
     w->block_steer = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_steer));
-    if (!w->counted || !w->block_covered || !w->block_steer)
+    if (!w->counted || !w->block_covered || !w->block_steer || !w->peer_next)
         goto cleanup;
     for (size_t i = 0; i < session->ana.cov_count; i++) {
         const fathom_block_t *b = &session->cfg_graph.blocks[session->ana.cov_blocks[i]];
@@ -963,7 +1054,15 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     disarm_covered(w);
     update_steer(w);
 
+    w->last_sync = fathom_now_us();
     while (!out_of_time(w)) {
+        if (multi && fathom_now_us() - w->last_sync >= SYNC_INTERVAL_US) {
+            if (sync_peers(w, buf) < 0) {
+                fprintf(stderr, "fathom: target execution failed\n");
+                goto cleanup;
+            }
+            w->last_sync = fathom_now_us();
+        }
         fathom_input_t *inp = fathom_corpus_next(&w->corpus);
         size_t idx = (size_t)(inp - w->corpus.inputs);
         if (opts->trim && !inp->trimmed && trim_input(w, idx, buf) < 0) {
@@ -1003,6 +1102,7 @@ cleanup:
     free(w->block_slot);
     free(w->epoch);
     free(w->counted);
+    free(w->peer_next);
     free(w->block_covered);
     free(w->block_steer);
     fathom_dict_destroy(&w->frontier);
@@ -1071,9 +1171,9 @@ static bool supervise(const fathom_opts_t *opts, int argc, char **argv, uint32_t
     if ((uint32_t)launched < jobs)
         failed = true;
 
-    bool signalled = false;
+    bool signalled = false, first_done = false;
     for (int alive = launched; alive > 0;) {
-        if ((stop_requested() || failed) && !signalled) {
+        if ((stop_requested() || failed || first_done) && !signalled) {
             SetEvent(g_stop_event);
             signalled = true;
         }
@@ -1082,6 +1182,7 @@ static bool supervise(const fathom_opts_t *opts, int argc, char **argv, uint32_t
             DWORD idx = w - WAIT_OBJECT_0, code = 1;
             GetExitCodeProcess(procs[idx], &code);
             failed |= code != 0;
+            first_done |= opts->until_crash;   /* one finished worker stops all */
             CloseHandle(procs[idx]);
             procs[idx] = procs[--launched];
             alive--;
@@ -1119,8 +1220,9 @@ static bool supervise(const fathom_opts_t *opts, const fathom_config_t *cfg,
         pids[launched++] = pid;
     }
 
+    bool first_done = false;   /* with --until-crash, one finished worker stops all */
     for (alive = launched; alive > 0;) {
-        if ((g_stop || failed) && !forwarded) {
+        if ((g_stop || failed || first_done) && !forwarded) {
             int sig = g_stop_signal ? (int)g_stop_signal : SIGTERM;
             for (uint32_t i = 0; i < launched; i++) {
                 if (pids[i] > 0)
@@ -1141,6 +1243,7 @@ static bool supervise(const fathom_opts_t *opts, const fathom_config_t *cfg,
                 pids[i] = -1;
                 alive--;
                 failed |= !WIFEXITED(status) || WEXITSTATUS(status) != 0;
+                first_done |= opts->until_crash;
             }
         }
     }
