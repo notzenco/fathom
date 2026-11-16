@@ -16,7 +16,7 @@
 /* ── Version ─────────────────────────────────────────────────────────── */
 
 #define FATHOM_VERSION_MAJOR 0
-#define FATHOM_VERSION_MINOR 2
+#define FATHOM_VERSION_MINOR 3
 #define FATHOM_VERSION_PATCH 0
 
 /* ── Binary image types ──────────────────────────────────────────────── */
@@ -436,14 +436,15 @@ void fathom_analysis_free(fathom_analysis_t *ana);
  * to unlock new code.  Statically linked runtimes (MinGW, musl) bury the
  * target's own comparisons among hundreds of library ones whose startup
  * branches stay open forever, so blocks first reached in the latest two
- * coverage gains (epoch[slot] vs now) come first, and the whole frontier
- * only when those offer nothing.  global is the cumulative coverage map;
- * slot_block and block_slot map slots to CFG blocks and back (-1: none).
+ * coverage gains (epoch[slot] vs now) are the frontier with recent set;
+ * callers fall back to the whole frontier when that is empty.  global is
+ * the cumulative coverage map; slot_block and block_slot map slots to CFG
+ * blocks and back (-1: none).  Tokens are added to out.
  */
 void fathom_frontier(fathom_dict_t *out, const fathom_cfg_t *cfg,
                      const fathom_disasm_t *dis, const uint8_t *global, size_t slots,
                      const uint32_t *slot_block, const int32_t *block_slot,
-                     const uint32_t *epoch, uint32_t now);
+                     const uint32_t *epoch, uint32_t now, bool recent);
 void fathom_steer(const fathom_cfg_t *cfg, const bool *covered, double *val);
 void fathom_analysis_print(const fathom_analysis_t *ana,
                            const fathom_binary_t *bin,

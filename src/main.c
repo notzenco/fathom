@@ -448,8 +448,8 @@ static void usage(const char *prog)
 /*
  * One breakpoint per instrumentable block of the target, then of each
  * library: slots 0..n-1 are the target's cov_blocks in order, the
- * libraries' follow.  slot_block maps a target slot to its CFG block
- * (UINT32_MAX for library slots), slot_score gives every slot its
+ * libraries' follow.  slot_block maps a slot to its block in its own
+ * module's CFG, slot_score gives every slot its
  * block's static score and counted marks loop headers counting their
  * iterations; each may be NULL.
  */
@@ -473,7 +473,7 @@ static int instrument(fathom_exec_t *ex, const fathom_session_t *s, uint32_t *sl
                 return -1;
             }
             if (slot_block)
-                slot_block[slot] = li == 0 ? b->ana.cov_blocks[i] : UINT32_MAX;
+                slot_block[slot] = b->ana.cov_blocks[i];
             if (slot_score)
                 slot_score[slot] = blk->score;
         }
@@ -644,8 +644,8 @@ typedef struct {
     fathom_dict_t          frontier;
     fathom_stats_t         stats;
 
-    uint32_t              *slot_block;  /* target slots only; UINT32_MAX for libraries */
-    int32_t               *block_slot;
+    uint32_t              *slot_block;  /* slot -> block in its module's CFG */
+    int32_t              **block_slot;  /* per module: block -> slot - first slot, or -1 */
     double                *slot_score;
     uint32_t              *epoch;       /* coverage gain in which each slot was first hit */
     bool                  *counted;     /* slot counts loop iterations, so stays armed */
@@ -694,9 +694,22 @@ static double take_coverage(worker_t *w)
     fathom_coverage_merge(&w->cov);
     w->stats.covered = w->cov.total_blocks;
     w->stats.last_gain_us = fathom_now_us();
-    fathom_frontier(&w->frontier, &w->session->cfg_graph, &w->session->dis, w->cov.global,
-                    w->session->ana.cov_count, w->slot_block, w->block_slot, w->epoch,
-                    w->gains);
+    /*
+     * Frontier tokens from every module, a library's own checks included:
+     * the latest gains' first, the whole frontier only if those have none.
+     */
+    fathom_dict_destroy(&w->frontier);
+    fathom_dict_init(&w->frontier);
+    for (int recent = 1; recent >= 0 && w->frontier.count == 0; recent--) {
+        size_t first = 0;
+        for (size_t m = 0; m <= w->session->n_libs; m++) {
+            const fathom_session_t *b = m == 0 ? w->session : &w->session->libs[m - 1];
+            fathom_frontier(&w->frontier, &b->cfg_graph, &b->dis, w->cov.global + first,
+                            b->ana.cov_count, w->slot_block + first, w->block_slot[m],
+                            w->epoch + first, w->gains, recent);
+            first += b->ana.cov_count;
+        }
+    }
     return score;
 }
 
@@ -722,7 +735,7 @@ static void update_steer(worker_t *w)
 {
     const fathom_cfg_t *cfg = &w->session->cfg_graph;
     for (size_t b = 0; b < cfg->block_count; b++) {
-        int32_t s = w->block_slot[b];
+        int32_t s = w->block_slot[0][b];
         w->block_covered[b] = s >= 0 && w->cov.global[s];
     }
     fathom_steer(cfg, w->block_covered, w->block_steer);
@@ -730,8 +743,9 @@ static void update_steer(worker_t *w)
         fathom_input_t *inp = &w->corpus.inputs[i];
         inp->steer = 0;
         for (size_t k = 0; k < inp->slot_count; k++) {
-            uint32_t blk = w->slot_block[inp->slots[k]];
-            double v = blk == UINT32_MAX ? 0 : w->block_steer[blk];
+            /* Steering follows the target's CFG; library slots come after its own. */
+            uint32_t slot = inp->slots[k];
+            double v = slot < w->session->ana.cov_count ? w->block_steer[w->slot_block[slot]] : 0;
             if (v > inp->steer)
                 inp->steer = v;
         }
@@ -1239,7 +1253,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     /* One breakpoint per instrumentable block of the target and its libraries. */
     w->slot_block = malloc((nslots + 1) * sizeof(*w->slot_block));
     w->slot_score = calloc(nslots + 1, sizeof(*w->slot_score));
-    w->block_slot = malloc((session->cfg_graph.block_count + 1) * sizeof(*w->block_slot));
+    w->block_slot = calloc(session->n_libs + 1, sizeof(*w->block_slot));
     w->epoch = calloc(nslots + 1, sizeof(*w->epoch));
     w->peer_next = calloc(opts->cfg.jobs + 1, sizeof(*w->peer_next));
     w->counted = calloc(nslots + 1, sizeof(*w->counted));
@@ -1254,10 +1268,16 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     if (instrument(&w->ex, session, w->slot_block, w->slot_score, w->counted,
                    !opts->no_cmplog, &w->n_cmp_sites) < 0)
         goto cleanup;
-    for (size_t i = 0; i < session->cfg_graph.block_count; i++)
-        w->block_slot[i] = -1;
-    for (size_t i = 0; i < session->ana.cov_count; i++)
-        w->block_slot[w->slot_block[i]] = (int32_t)i;
+    for (size_t m = 0, first = 0; m <= session->n_libs; m++) {
+        const fathom_session_t *b = m == 0 ? session : &session->libs[m - 1];
+        if (!(w->block_slot[m] = malloc((b->cfg_graph.block_count + 1) * sizeof(int32_t))))
+            goto cleanup;
+        for (size_t i = 0; i < b->cfg_graph.block_count; i++)
+            w->block_slot[m][i] = -1;
+        for (size_t i = 0; i < b->ana.cov_count; i++)
+            w->block_slot[m][w->slot_block[first + i]] = (int32_t)i;
+        first += b->ana.cov_count;
+    }
     w->stats.instrumented = w->ex.bp_count;
 
     if (w->corpus.resumed)
@@ -1351,6 +1371,8 @@ cleanup:
     free(buf);
     free(w->slot_block);
     free(w->slot_score);
+    for (size_t m = 0; w->block_slot && m <= session->n_libs; m++)
+        free(w->block_slot[m]);
     free(w->block_slot);
     free(w->epoch);
     free(w->counted);

@@ -272,13 +272,15 @@ static void test_frontier(void)
     uint8_t global[3] = { 1, 1, 0 };
     fathom_dict_t out;
     fathom_dict_init(&out);
-    fathom_frontier(&out, &cfg, &dis, global, 3, slot_block, block_slot, epoch, 1);
+    fathom_frontier(&out, &cfg, &dis, global, 3, slot_block, block_slot, epoch, 1, true);
     CHECK(out.count == 1 && out.entries[0].len == 1 && out.entries[0].data[0] == 0x46,
           "the open comparison's constant is a token");
 
     global[2] = 1;
     epoch[2] = 2;
-    fathom_frontier(&out, &cfg, &dis, global, 3, slot_block, block_slot, epoch, 2);
+    fathom_dict_destroy(&out);
+    fathom_dict_init(&out);
+    fathom_frontier(&out, &cfg, &dis, global, 3, slot_block, block_slot, epoch, 2, false);
     CHECK(out.count == 0, "a branch with both sides covered gives no token");
     fathom_dict_destroy(&out);
     fathom_analysis_free(&ana);
