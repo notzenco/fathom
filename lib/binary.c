@@ -260,9 +260,13 @@ int fathom_binary_open(fathom_binary_t *bin, const char *path)
         return -1;
     }
 
-    qsort(bin->sections, bin->section_count, sizeof(*bin->sections), cmp_section);
-    qsort(bin->symbols, bin->symbol_count, sizeof(*bin->symbols), cmp_symbol);
-    qsort(bin->imports, bin->import_count, sizeof(*bin->imports), cmp_import);
+    /* qsort's array must not be NULL, even when empty. */
+    if (bin->section_count > 1)
+        qsort(bin->sections, bin->section_count, sizeof(*bin->sections), cmp_section);
+    if (bin->symbol_count > 1)
+        qsort(bin->symbols, bin->symbol_count, sizeof(*bin->symbols), cmp_symbol);
+    if (bin->import_count > 1)
+        qsort(bin->imports, bin->import_count, sizeof(*bin->imports), cmp_import);
     return 0;
 }
 

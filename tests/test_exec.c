@@ -77,6 +77,15 @@ static int load(target_t *t, const char *path, uint32_t timeout_ms)
     return 0;
 }
 
+static void free_target(target_t *t)
+{
+    fathom_exec_destroy(&t->ex);
+    fathom_analysis_free(&t->ana);
+    fathom_cfg_free(&t->cfg);
+    fathom_disasm_close(&t->dis);
+    fathom_binary_close(&t->bin);
+}
+
 static size_t covered(void)
 {
     size_t n = 0;
@@ -169,7 +178,7 @@ static void test_many_breakpoints(void)
     CHECK(fathom_exec_add_breakpoint(&t.ex, 0x7f0000000000ull) == (int)base,
           "a known address must keep its slot");
     CHECK(t.ex.bp_count == base + extra, "breakpoint count");
-    fathom_exec_destroy(&t.ex);
+    free_target(&t);
     END();
 }
 
@@ -183,11 +192,7 @@ static int load_cov(target_t *t, fathom_coverage_t *cov, const char *path)
 
 static void unload(target_t *t, fathom_coverage_t *cov)
 {
-    fathom_exec_destroy(&t->ex);
-    fathom_analysis_free(&t->ana);
-    fathom_cfg_free(&t->cfg);
-    fathom_disasm_close(&t->dis);
-    fathom_binary_close(&t->bin);
+    free_target(t);
     fathom_coverage_destroy(cov);
 }
 
@@ -463,6 +468,9 @@ int main(void)
     test_forked_children();
 #endif
 
+    free_target(&maze);
+    free_target(&hang);
+    fathom_coverage_destroy(&g_cov);
     printf("\n%d/%d tests passed\n", tests_passed, tests_run);
     return tests_passed == tests_run ? 0 : 1;
 }
