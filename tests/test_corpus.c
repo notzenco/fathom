@@ -454,6 +454,12 @@ static void test_favored(void)
     /* Faster inputs get more mutations per pick. */
     assert(fathom_corpus_energy(&corpus, 1) > fathom_corpus_energy(&corpus, 0));
 
+    /* So do inputs close to uncovered high-scoring blocks. */
+    uint32_t plain = fathom_corpus_energy(&corpus, 2);
+    corpus.inputs[2].steer = 10.0;
+    assert(fathom_corpus_energy(&corpus, 2) > plain);
+    corpus.inputs[2].steer = 0.0;
+
     /* Removing an input deletes its queue file. */
     char qpath[PATH_MAX_T];
     snprintf(qpath, sizeof(qpath), "%s/queue", outdir);

@@ -24,6 +24,9 @@
 #define FATHOM_ENERGY_BASE        16
 #define FATHOM_ENERGY_MAX         512
 
+/* Steer at which an input's energy is tripled; higher values are capped. */
+#define FATHOM_STEER_MAX          20.0
+
 /*
  * Initial slot count of the crash dedup hash set; it doubles as it fills.
  */

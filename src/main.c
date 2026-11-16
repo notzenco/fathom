@@ -388,6 +388,8 @@ typedef struct {
     int32_t               *block_slot;
     uint32_t              *epoch;       /* coverage gain in which each slot was first hit */
     bool                  *counted;     /* slot counts loop iterations, so stays armed */
+    bool                  *block_covered;
+    double                *block_steer;
     uint32_t               gains;
     uint64_t               deadline;
     uint64_t               last_status;
@@ -440,6 +442,26 @@ static void disarm_covered(worker_t *w)
 {
     for (size_t s = 0; s < w->cov.size; s++)
         fathom_exec_arm(&w->ex, (int)s, !w->cov.global[s] || w->counted[s]);
+}
+
+/* Recompute every input's steer after coverage changed (see fathom_steer). */
+static void update_steer(worker_t *w)
+{
+    const fathom_cfg_t *cfg = &w->session->cfg_graph;
+    for (size_t b = 0; b < cfg->block_count; b++) {
+        int32_t s = w->block_slot[b];
+        w->block_covered[b] = s >= 0 && w->cov.global[s];
+    }
+    fathom_steer(cfg, w->block_covered, w->block_steer);
+    for (size_t i = 0; i < w->corpus.count; i++) {
+        fathom_input_t *inp = &w->corpus.inputs[i];
+        inp->steer = 0;
+        for (size_t k = 0; k < inp->slot_count; k++) {
+            double v = w->block_steer[w->slot_block[inp->slots[k]]];
+            if (v > inp->steer)
+                inp->steer = v;
+        }
+    }
 }
 
 /* Returns -1 on a fatal error, 1 if this was a new unique crash, else 0. */
@@ -580,6 +602,7 @@ static int fuzz_one(worker_t *w, size_t idx, uint8_t *buf)
             return -1;
         }
         w->stats.corpus_size = corpus->count;
+        update_steer(w);
         if (strategy >= 0 && strategy < FATHOM_MUT_COUNT)
             fathom_mutator_reward(&w->mut, (fathom_mutation_t)strategy);
     }
@@ -667,7 +690,9 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     }
     /* Loop headers count their iterations, so a different trip count is new coverage. */
     w->counted = calloc(session->ana.cov_count + 1, sizeof(*w->counted));
-    if (!w->counted)
+    w->block_covered = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_covered));
+    w->block_steer = calloc(session->cfg_graph.block_count + 1, sizeof(*w->block_steer));
+    if (!w->counted || !w->block_covered || !w->block_steer)
         goto cleanup;
     for (size_t i = 0; i < session->ana.cov_count; i++) {
         const fathom_block_t *b = &session->cfg_graph.blocks[session->ana.cov_blocks[i]];
@@ -707,6 +732,7 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     }
     w->stats.corpus_size = w->corpus.count;
     disarm_covered(w);
+    update_steer(w);
 
     while (!out_of_time(w)) {
         fathom_input_t *inp = fathom_corpus_next(&w->corpus);
@@ -746,6 +772,8 @@ cleanup:
     free(w->block_slot);
     free(w->epoch);
     free(w->counted);
+    free(w->block_covered);
+    free(w->block_steer);
     fathom_dict_destroy(&w->frontier);
     if (ex_ready)
         fathom_exec_destroy(&w->ex);

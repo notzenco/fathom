@@ -509,6 +509,8 @@ uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx)
     if (bonus > 40)
         bonus = 40;
     e *= 1.0 + bonus / 20.0;
+    double steer = inp->steer > FATHOM_STEER_MAX ? FATHOM_STEER_MAX : inp->steer;
+    e *= 1.0 + steer / (FATHOM_STEER_MAX / 2);
     if (inp->fuzz_count == 0)
         e *= 2;
 

@@ -138,7 +138,10 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
   *favored*, and a greedy subset of favored inputs covering every reached
   block gets nearly all the fuzzing. Each pick gets a number of mutated
   runs (its energy) that grows with speed, coverage, static score and
-  freshness.
+  freshness, and with how close the input gets to uncovered high-scoring
+  blocks: each covered block is worth the score of the best uncovered
+  scored block it can reach, halved per CFG edge (directed fuzzing in the
+  style of AFLGo, using the static scores as targets).
 - `--trim` shrinks queue inputs while they reach the same blocks. It is
   off by default because breakpoints cannot see loop counts, so trimming
   would cut inputs below the length an overflow needs.

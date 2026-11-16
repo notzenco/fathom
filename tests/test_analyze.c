@@ -193,6 +193,42 @@ static void test_jump_table(void)
     fathom_binary_close(&bin);
 }
 
+/* Covered blocks near an uncovered, high-scoring block are worth more. */
+static void test_steer(void)
+{
+    printf("=== test_steer ===\n");
+    /* 0x1000: je 0x1010 / 0x1002: jmp 0x1020 / 0x1010: nop; ret / 0x1020: ret */
+    fathom_insn_t insns[] = {
+        INSN(0x1000, 2, FATHOM_INSN_BRANCH, "je"),
+        INSN(0x1002, 2, FATHOM_INSN_BRANCH, "jmp"),
+        INSN(0x1010, 1, FATHOM_INSN_OTHER,  "nop"),
+        INSN(0x1011, 1, FATHOM_INSN_RET,    "ret"),
+        INSN(0x1020, 1, FATHOM_INSN_RET,    "ret"),
+    };
+    insns[0].is_conditional = true;
+    insns[0].branch_target = 0x1010;
+    insns[1].branch_target = 0x1020;
+    fathom_binary_t bin = make_bin(0x1000);
+    fathom_cfg_t cfg;
+    fathom_analysis_t ana;
+    CHECK(analyze(insns, 5, &bin, &cfg, &ana) == 0, "analyze");
+    CHECK(cfg.block_count == 4, "four blocks");
+    cfg.blocks[2].score = 8.0;          /* the block at 0x1010 */
+
+    bool covered[4] = { true, true, false, true };
+    double val[4];
+    fathom_steer(&cfg, covered, val);
+    CHECK(val[2] == 8.0, "the target keeps its score");
+    CHECK(val[0] == 4.0, "one hop away is worth half");
+    CHECK(val[1] == 0.0 && val[3] == 0.0, "blocks that cannot reach it are worth nothing");
+
+    covered[2] = true;
+    fathom_steer(&cfg, covered, val);
+    CHECK(val[0] == 0.0, "a covered target attracts nothing");
+    fathom_analysis_free(&ana);
+    fathom_cfg_free(&cfg);
+}
+
 int main(void)
 {
     test_data_load_not_a_root();
@@ -200,6 +236,7 @@ int main(void)
     test_mid_block_entry();
     test_no_block_cap();
     test_jump_table();
+    test_steer();
 
     if (failures) {
         printf("%d check(s) failed\n", failures);

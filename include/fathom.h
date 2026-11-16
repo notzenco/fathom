@@ -248,6 +248,7 @@ typedef struct {
     bool      trimmed;
 
     uint32_t  fuzz_count;    /* times picked for fuzzing */
+    double    steer;         /* best fathom_steer value among its blocks */
     /*
      * Smallest and fastest input for some slot no other favored input
      * reaches; the scheduler mostly fuzzes these.  Inputs not yet run
@@ -349,6 +350,14 @@ void fathom_cfg_free(fathom_cfg_t *cfg);
 int  fathom_analyze(fathom_analysis_t *ana, fathom_cfg_t *cfg,
                     const fathom_binary_t *bin, const fathom_disasm_t *dis);
 void fathom_analysis_free(fathom_analysis_t *ana);
+/*
+ * Directed fuzzing: val[b] for every block is the score of the best
+ * uncovered scored block reachable from b, halved per CFG edge between
+ * them (up to FATHOM_STEER_DEPTH edges), else 0.  covered[b] marks
+ * blocks already reached.
+ */
+#define FATHOM_STEER_DEPTH 8
+void fathom_steer(const fathom_cfg_t *cfg, const bool *covered, double *val);
 void fathom_analysis_print(const fathom_analysis_t *ana,
                            const fathom_binary_t *bin,
                            const fathom_disasm_t *dis);
@@ -430,8 +439,9 @@ int  fathom_corpus_update(fathom_corpus_t *corpus, size_t idx,
 void fathom_corpus_remove(fathom_corpus_t *corpus, size_t idx);
 /*
  * Mutated executions to spend on input idx this pick: more for inputs
- * that are fast, reach many blocks, scored high in static analysis or
- * have not been fuzzed yet.
+ * that are fast, reach many blocks, scored high in static analysis, lie
+ * close to uncovered high-scoring blocks (steer) or have not been fuzzed
+ * yet.
  */
 uint32_t fathom_corpus_energy(const fathom_corpus_t *corpus, size_t idx);
 int  fathom_corpus_save_crash(fathom_corpus_t *corpus, const uint8_t *data,
