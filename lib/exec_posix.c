@@ -695,9 +695,10 @@ static kern_return_t exc_handle(const exc_request_t *rq, exc_reply_t *rp)
             if (ok) {
                 STATE_SET_PC(st, bp);
                 ret = KERN_SUCCESS;
-            } else {
+            } else if (task == g_exc.root) {
                 g_exc.failed = true;
             }
+            /* A child's write can fail as it is killed; the trap then ends it. */
         } else if (task == g_exc.root) {
             g_exc.fault_set = true;
             g_exc.fault_exc = rq->exception;
