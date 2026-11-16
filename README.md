@@ -77,7 +77,11 @@ gets block coverage from the unmodified binary instead:
    fires at most once per run, so after warm-up the target runs at native
    speed. On macOS breakpoints are serviced on a Mach exception port
    rather than through ptrace stops.
-5. Loop headers are the exception: a temporary breakpoint on the header's
+5. While fuzzing, blocks that are already covered are left unpatched, so
+   most runs trap only on blocks nothing has reached yet. A run that does
+   reach one is repeated with every breakpoint in place to record its
+   full path.
+6. Loop headers are the exception: a temporary breakpoint on the header's
    second instruction re-arms the header once its first instruction has
    run, up to 8 times per run. The iteration count lands in AFL-style
    buckets (1, 2, 3, 4-7, 8+), so an input that runs a loop a different

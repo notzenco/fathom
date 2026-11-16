@@ -388,6 +388,12 @@ int  fathom_exec_add_breakpoint(fathom_exec_t *ex, uint64_t addr);
  * first; the first instruction must fall through to it.
  */
 #define FATHOM_HIT_LIMIT 8
+/*
+ * Leave slot's breakpoint out of later runs, or put it back.  Disarming
+ * blocks that are already covered saves their traps; such runs report
+ * only blocks still armed.
+ */
+void fathom_exec_arm(fathom_exec_t *ex, int slot, bool armed);
 int  fathom_exec_count_hits(fathom_exec_t *ex, int slot, uint64_t next_insn);
 
 /*
