@@ -158,6 +158,18 @@ static int select_slice(fathom_binary_t *b)
     return 0;
 }
 
+/*
+ * Read the first n bytes of the load command at off, which must fit in
+ * both its own cmdsize and the header's sizeofcmds region.
+ */
+static bool read_cmd(const fathom_binary_t *b, uint64_t off, uint64_t cmds_end,
+                     const macho_lc_t *lc, uint64_t at, void *dst, size_t n)
+{
+    if (at + n > lc->cmdsize || off + lc->cmdsize > cmds_end)
+        return false;
+    return bin_read(b, off + at, dst, n);
+}
+
 static void section_name(const macho_section_t *s, char *out, size_t cap)
 {
     snprintf(out, cap, "%.16s,%.16s", s->segname, s->sectname);
@@ -266,17 +278,25 @@ int fathom_macho_parse(fathom_binary_t *b)
     uint64_t text_vmaddr = 0, entryoff = 0, lo = UINT64_MAX, hi = 0;
     bool have_main = false;
 
+    uint64_t cmds_end = sizeof(mh) + (uint64_t)mh.sizeofcmds;
+
     /* Pass 1: segments, sections and symbol table locations. */
     uint64_t off = sizeof(mh);
     for (uint32_t c = 0; c < mh.ncmds; c++) {
         macho_lc_t lc;
-        if (!bin_read(b, off, &lc, sizeof(lc)) || lc.cmdsize < sizeof(lc))
+        if (!bin_read(b, off, &lc, sizeof(lc)) || lc.cmdsize < sizeof(lc) ||
+            off + lc.cmdsize > cmds_end) {
+            fprintf(stderr, "fathom: Mach-O load command %u is out of bounds\n", c);
             return -1;
+        }
 
         if (lc.cmd == LC_SEGMENT_64) {
             macho_segment_t seg;
-            if (!bin_read(b, off, &seg, sizeof(seg)))
+            if (!read_cmd(b, off, cmds_end, &lc, 0, &seg, sizeof(seg)) ||
+                sizeof(seg) + (uint64_t)seg.nsects * sizeof(macho_section_t) > lc.cmdsize) {
+                fprintf(stderr, "fathom: Mach-O segment command %u is malformed\n", c);
                 return -1;
+            }
             if (strncmp(seg.segname, "__TEXT", 16) == 0)
                 text_vmaddr = seg.vmaddr;
             if (seg.initprot != 0) {   /* skip __PAGEZERO */
@@ -306,18 +326,19 @@ int fathom_macho_parse(fathom_binary_t *b)
                     return -1;
             }
         } else if (lc.cmd == LC_SYMTAB) {
-            tables.have_symtab = bin_read(b, off, &tables.symtab, sizeof(tables.symtab));
+            tables.have_symtab = read_cmd(b, off, cmds_end, &lc, 0, &tables.symtab,
+                                          sizeof(tables.symtab));
         } else if (lc.cmd == LC_DYSYMTAB) {
-            tables.have_dysymtab = bin_read(b, off, &tables.dysymtab,
+            tables.have_dysymtab = read_cmd(b, off, cmds_end, &lc, 0, &tables.dysymtab,
                                             sizeof(tables.dysymtab));
         } else if (lc.cmd == LC_MAIN) {
-            have_main = bin_read(b, off + 8, &entryoff, sizeof(entryoff));
+            have_main = read_cmd(b, off, cmds_end, &lc, 8, &entryoff, sizeof(entryoff));
         } else if (lc.cmd == LC_UNIXTHREAD && !have_main) {
             /* flavor, count, then the register state; pc is at a fixed slot. */
             uint64_t pc = 0;
             uint64_t pc_off = b->arch == FATHOM_ARCH_ARM64 ? 16 + 32 * 8
                                                            : 16 + 16 * 8;
-            if (bin_read(b, off + pc_off, &pc, sizeof(pc)))
+            if (read_cmd(b, off, cmds_end, &lc, pc_off, &pc, sizeof(pc)))
                 b->entry = pc;
         }
         off += lc.cmdsize;
