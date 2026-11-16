@@ -67,12 +67,24 @@ gets block coverage from the unmodified binary instead:
 2. The ASLR slide is read (Linux: `AT_ENTRY` from the aux vector; macOS:
    the executable's Mach-O header in the task; Windows: the image base in
    the process-creation event).
-3. Every instrumentable block start is overwritten in one bulk write with
-   a breakpoint instruction (`int3`, or `brk` on arm64).
+3. Every instrumentable block start is overwritten with a breakpoint
+   instruction (`int3`, or `brk` on arm64), written in clusters of
+   breakpoints at most a page apart so gaps between sections are never
+   touched. A block whose own first instruction is already that trap is
+   left alone: its trap belongs to the target.
 4. When a breakpoint fires, its block is marked in the coverage map, the
    original bytes are restored, and the target resumes. Each breakpoint
    fires at most once per run, so after warm-up the target runs at native
-   speed.
+   speed. On macOS breakpoints are serviced on a Mach exception port
+   rather than through ptrace stops.
+
+Processes the target starts are handled too. On Linux a vfork child is
+traced like a thread, and a forked child gets its original code back and
+runs uninstrumented. On macOS forked children inherit the exception port,
+so their breakpoints are serviced and count as coverage. A target that
+re-executes itself is instrumented again; one that execs another program
+runs it uninstrumented. Every run ends by killing the target's process
+group (a job object on Windows), so nothing it started outlives the run.
 
 Breakpoints overwrite code, so they must land on real instruction
 boundaries. Rather than trust every block found by linear sweep (which can
@@ -111,9 +123,13 @@ addresses the program takes (such as `lea rdi, [rip+main]`, which is how
   finds new coverage is boosted 2x, and all weights decay by 0.95x.
 - Seedable xorshift PRNG (`-s`), so runs are reproducible.
 - Crash deduplication by FNV-1a hash of the crash PC and the frame-pointer
-  return chain, using only link-time addresses inside the main image. The
-  same bug hashes the same way across ASLR runs, and a smashed stack does
-  not turn one bug into hundreds of "unique" crashes.
+  return chain. Main-image addresses count at their link-time value and
+  library addresses as module path plus offset, so the same bug hashes the
+  same way across ASLR runs. Addresses in no module are ignored, so a
+  smashed stack does not turn one bug into hundreds of "unique" crashes.
+- Faults the target recovers from in its own handler (`sigsetjmp`, SEH,
+  vectored handlers) are not crashes. A fault counts if the target dies
+  from it, faults again at the same place, or then exits non-zero.
 - Hangs are detected per run with a timeout (`-t`). Targets run in their
   own process group, so Ctrl-C and group signals are never miscounted as
   crashes.
@@ -218,7 +234,8 @@ bash tests/integration.sh  # end-to-end fuzzing
   program compiled as ELF, Mach-O, universal Mach-O and PE for both
   architectures, plus a stripped gcc PIE), so every format is tested on
   every host. Executor tests run the real debugger backend against the
-  maze and a hanging target.
+  maze, a hanging target, and targets that fork, re-exec themselves,
+  recover from a fault, or start a block with a trap instruction.
 - **Integration tests** fuzz from a seed that contains none of the bytes
   the bugs need. The maze must be solved on every platform. They also check
   that hangs are not reported as crashes and that parallel workers shard
@@ -261,6 +278,8 @@ macos/fathom.entitlements   Debugger entitlement for task_for_pid
 - **64-bit only.** 32-bit x86/ARM and big-endian targets are rejected.
 - Linear-sweep disassembly can miss code reached only through indirect
   jumps; those blocks are left uninstrumented.
+- Descendants that leave the target's process group (`setsid`) are not
+  killed at the end of a run. On Linux, forked children are not covered.
 
 ## License
 
