@@ -705,6 +705,10 @@ static int run_worker(const fathom_opts_t *opts, const fathom_config_t *cfg,
     }
     w->stats.instrumented = w->ex.bp_count;
 
+    if (w->corpus.resumed)
+        fprintf(stderr, "%s%sresuming %s: %zu queue entries, %zu unique crashes\n",
+                w->prefix ? w->prefix : "", w->prefix ? " " : "  ", cfg->output_dir,
+                w->corpus.count, w->corpus.unique_crashes);
     if (!multi)
         fprintf(stderr, "  seeds: %zu, breakpoints: %zu\n\nfuzzing started%s...\n\n",
                 w->corpus.count, w->ex.bp_count,

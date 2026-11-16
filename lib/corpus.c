@@ -170,6 +170,98 @@ static int cmp_input_by_size(const void *a, const void *b)
 static fathom_hashset_t g_crash_hashes;
 static bool             g_crash_hashes_ready;
 
+/* ── Loading ────────────────────────────────────────────────────────── */
+
+static int add_existing(fathom_corpus_t *corpus, const uint8_t *data, size_t len,
+                        const char *path, size_t id, size_t cov)
+{
+    const char *out = corpus->out_dir;
+    corpus->out_dir = NULL;   /* already on disk: do not write it again */
+    int rc = fathom_corpus_add(corpus, data, len, cov, 0);
+    corpus->out_dir = out;
+    if (rc < 0)
+        return -1;
+    fathom_input_t *inp = &corpus->inputs[corpus->count - 1];
+    if (!(inp->path = strdup(path)))
+        return -1;
+    if (id >= corpus->next_id)
+        corpus->next_id = id + 1;
+    return 0;
+}
+
+/*
+ * Read every regular, non-hidden file in dir as an input, smallest
+ * first.  With queue set, dir is our own queue: names carry the id and
+ * coverage, and the files stay where they are.
+ */
+static int load_dir(fathom_corpus_t *corpus, const char *dir_path, bool queue)
+{
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        if (!queue)   /* not fatal: the caller may add seeds itself */
+            fprintf(stderr, "fathom: cannot open input dir '%s': %s\n",
+                    dir_path, strerror(errno));
+        return 0;
+    }
+
+    size_t first = corpus->count;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+        if (ent->d_name[0] == '.')
+            continue;
+        size_t id = 0, cov = 0;
+        if (queue && sscanf(ent->d_name, "id_%zu_cov_%zu", &id, &cov) != 2)
+            continue;
+
+        char filepath[4096];
+        snprintf(filepath, sizeof(filepath), "%s/%s", dir_path, ent->d_name);
+        struct stat st;
+        if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode))
+            continue;
+
+        uint8_t *data = NULL;
+        ssize_t  sz   = read_file(filepath, &data);
+        if (sz < 0)
+            continue;
+        int rc = queue ? add_existing(corpus, data, (size_t)sz, filepath, id, cov)
+                       : fathom_corpus_add(corpus, data, (size_t)sz, 0, 0);
+        free(data);
+        if (rc < 0) {
+            closedir(dir);
+            return -1;
+        }
+    }
+    closedir(dir);
+
+    /* Smaller inputs first: faster to fuzz. */
+    if (corpus->count - first > 1)
+        qsort(corpus->inputs + first, corpus->count - first,
+              sizeof(fathom_input_t), cmp_input_by_size);
+    return 0;
+}
+
+static int load_crash_hashes(fathom_corpus_t *corpus, const char *dir_path)
+{
+    DIR *dir = opendir(dir_path);
+    if (!dir)
+        return 0;
+    struct dirent *ent;
+    int rc = 0;
+    while (rc == 0 && (ent = readdir(dir)) != NULL) {
+        unsigned long long hash;
+        char rest;
+        if (sscanf(ent->d_name, "crash_%16llx%c", &hash, &rest) != 1)
+            continue;   /* sidecars and anything else */
+        int r = fathom_hashset_insert(&g_crash_hashes, (uint64_t)hash);
+        if (r < 0)
+            rc = -1;
+        else if (r == 1)
+            corpus->unique_crashes++;
+    }
+    closedir(dir);
+    return rc;
+}
+
 /* ── Public API ─────────────────────────────────────────────────────── */
 
 int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
@@ -216,46 +308,23 @@ int fathom_corpus_init(fathom_corpus_t *corpus, const char *input_dir,
         g_crash_hashes_ready = true;
     }
 
-    /* If input_dir provided, read all files from it as initial seeds. */
-    if (input_dir) {
-        DIR *dir = opendir(input_dir);
-        if (!dir) {
-            /* Not fatal — caller may add seeds manually. */
-            fprintf(stderr, "fathom: cannot open input dir '%s': %s\n",
-                    input_dir, strerror(errno));
-            return 0;
-        }
-
-        struct dirent *ent;
-        while ((ent = readdir(dir)) != NULL) {
-            /* Skip . and .. and hidden files. */
-            if (ent->d_name[0] == '.')
-                continue;
-
-            char filepath[4096];
-            snprintf(filepath, sizeof(filepath), "%s/%s",
-                     input_dir, ent->d_name);
-
-            struct stat st;
-            if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode))
-                continue;
-
-            uint8_t *data = NULL;
-            ssize_t  sz   = read_file(filepath, &data);
-            if (sz < 0)
-                continue;
-
-            fathom_corpus_add(corpus, data, (size_t)sz, 0, 0);
-            free(data);
-        }
-        closedir(dir);
-
-        /* Sort seeds by size (smaller first — faster to fuzz). */
-        if (corpus->count > 1)
-            qsort(corpus->inputs, corpus->count,
-                  sizeof(fathom_input_t), cmp_input_by_size);
+    /*
+     * An output directory that already has a queue is resumed: its queue
+     * replaces the seeds, numbering continues after it, and crashes
+     * already saved stay known.
+     */
+    if (output_dir) {
+        char path[4096];
+        snprintf(path, sizeof(path), "%s/queue", output_dir);
+        if (load_dir(corpus, path, true) < 0)
+            return -1;
+        corpus->resumed = corpus->count > 0;
+        snprintf(path, sizeof(path), "%s/crashes", output_dir);
+        if (load_crash_hashes(corpus, path) < 0)
+            return -1;
     }
-
+    if (input_dir && !corpus->resumed && load_dir(corpus, input_dir, false) < 0)
+        return -1;
     return 0;
 }
 

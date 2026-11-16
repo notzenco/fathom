@@ -272,6 +272,7 @@ typedef struct {
     size_t          map_size;     /* coverage slots, from fathom_corpus_record */
     bool            cull_dirty;   /* favored set needs recomputing */
     uint64_t        rng;          /* scheduling randomness, see fathom_corpus_seed */
+    bool            resumed;      /* loaded an existing queue instead of the seeds */
 } fathom_corpus_t;
 
 /* ── Executor types ──────────────────────────────────────────────────── */

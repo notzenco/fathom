@@ -5,6 +5,7 @@
 #include "fathom.h"
 
 #include "test_util.h"
+#include "osdep.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -478,6 +479,41 @@ static void test_favored(void)
     PASS("favored");
 }
 
+/* An existing output directory is resumed rather than overwritten. */
+static void test_resume(void)
+{
+    make_tmpdir();
+    char outdir[512], indir[512], path[PATH_MAX_T];
+    snprintf(outdir, sizeof(outdir), "%s/out", g_tmpdir);
+    snprintf(indir, sizeof(indir), "%s/in", g_tmpdir);
+    fathom_mkdir(indir);
+    snprintf(path, sizeof(path), "%s/seed", indir);
+    FILE *f = fopen(path, "wb");
+    fputs("seed", f);
+    fclose(f);
+
+    fathom_corpus_t corpus;
+    assert(fathom_corpus_init(&corpus, indir, outdir) == 0);
+    assert(!corpus.resumed && corpus.count == 1);
+    fathom_corpus_add(&corpus, (const uint8_t *)"found", 5, 3, 0);
+    assert(fathom_corpus_save_crash(&corpus, (const uint8_t *)"boom", 4, 0xabcULL) == 1);
+    fathom_corpus_destroy(&corpus);
+
+    assert(fathom_corpus_init(&corpus, indir, outdir) == 0);
+    assert(corpus.resumed);
+    assert(corpus.count == 2);                    /* the queue, not the seeds again */
+    assert(corpus.unique_crashes == 1);
+    assert(fathom_corpus_save_crash(&corpus, (const uint8_t *)"boom", 4, 0xabcULL) == 0);
+    fathom_corpus_add(&corpus, (const uint8_t *)"more", 4, 1, 0);
+
+    char qpath[PATH_MAX_T];
+    snprintf(qpath, sizeof(qpath), "%s/queue", outdir);
+    assert(count_files(qpath) == 3);              /* numbering continued: nothing overwritten */
+    fathom_corpus_destroy(&corpus);
+    rmrf(g_tmpdir);
+    PASS("resume");
+}
+
 /* ── Main ────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -497,6 +533,7 @@ int main(void)
     test_crash_file_contents();
     test_destroy();
     test_favored();
+    test_resume();
 
     fprintf(stderr, "All corpus tests passed.\n");
     return 0;
